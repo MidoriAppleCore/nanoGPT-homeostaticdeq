@@ -90,6 +90,22 @@ lambda_pauli = 2.0  # Weight for repetition penalty (0.0 = disabled, 2.0 = stron
 # Algorithmic Efficiency Loss (DISABLED - contradicts giving more iterations!)
 lambda_efficiency = 0.0  # Weight for iteration count penalty (DISABLED for stability testing)
 
+# Memory Manifold (Semantic Knowledge Substrate)
+use_memory_manifold = False  # Enable memory-augmented reflexes
+memory_mode = 'hybrid'  # 'hybrid', 'hyperbolic', 'euclidean'
+memory_manifold_path = 'tinystories_memory_manifold.pkl'  # Path for static mode
+memory_k = 16  # Number of semantic neighbors to retrieve
+memory_alpha = 0.1  # Injection strength (gating parameter)
+memory_dim = 384  # Memory embedding dimension
+memory_curvature = 1.0  # Hyperbolic curvature
+# CACHE-STYLE two-tier memory (working = L1 cache, longterm = RAM)
+working_memory_capacity = 20      # TINY - only immediate context (like L1 cache)
+working_memory_decay = 0.80       # AGGRESSIVE - 20% decay per step (forget quickly)
+longterm_memory_capacity = 2000   # LARGE - background knowledge (like RAM)
+longterm_memory_decay = 0.999     # PERSISTENT - slow fade
+memory_promotion_threshold = 0.4  # Lower threshold for easier promotion
+memory_promotion_interval = 50    # More frequent consolidation
+
 # adamw optimizer
 learning_rate = 1e-3 # max learning rate
 max_iters = 1000 # total number of training iterations
@@ -193,6 +209,56 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   num_tunnel_rays=num_tunnel_rays,
                   temperature_schedule=temperature_schedule,
                   T_init=T_init, T_final=T_final)
+
+# Memory Manifold Integration (Semantic Knowledge Substrate)
+if use_memory_manifold:
+    # For HYBRID mode: Memory forms dynamically during training (starts empty!)
+    # For STATIC mode: Load pre-built manifold
+    if memory_mode == 'hybrid':
+        print(f"🧠 Hybrid two-tier memory enabled (dynamic formation)")
+        print(f"  Memory starts EMPTY and grows during training")
+        print(f"  Working: {working_memory_capacity} capacity on GPU")
+        print(f"  Long-term: {longterm_memory_capacity} capacity on CPU")
+        
+        # Pass memory config to model (no manifold path needed!)
+        model_args['use_memory_manifold'] = True
+        model_args['memory_mode'] = memory_mode
+        model_args['memory_dim'] = memory_dim if 'memory_dim' in locals() else n_embd
+        model_args['memory_k'] = memory_k
+        model_args['memory_alpha'] = memory_alpha
+        model_args['memory_curvature'] = memory_curvature if 'memory_curvature' in locals() else 1.0
+        model_args['working_memory_capacity'] = working_memory_capacity
+        model_args['working_memory_decay'] = working_memory_decay
+        model_args['longterm_memory_capacity'] = longterm_memory_capacity
+        model_args['longterm_memory_decay'] = longterm_memory_decay
+        model_args['memory_promotion_threshold'] = memory_promotion_threshold
+        model_args['memory_promotion_interval'] = memory_promotion_interval
+    else:
+        # Legacy static manifold loading
+        print(f"🧠 Loading memory manifold from: {memory_manifold_path}")
+        if not os.path.exists(memory_manifold_path):
+            raise FileNotFoundError(f"Memory manifold not found: {memory_manifold_path}")
+        
+        with open(memory_manifold_path, 'rb') as f:
+            memory_manifold = pickle.load(f)
+        
+        print(f"  ✓ Loaded {memory_manifold['num_chunks']} semantic chunks")
+        print(f"  ✓ Embedding dim: {memory_manifold['embedding_dim']}")
+        print(f"  ✓ HNSW index: {memory_manifold['num_chunks']} nodes")
+        print(f"  ✓ Retrieval: top-k={memory_k}, α={memory_alpha}")
+        
+        # Verify dimensions match
+        if memory_manifold['embedding_dim'] != n_embd:
+            raise ValueError(f"Memory embedding dim ({memory_manifold['embedding_dim']}) must match n_embd ({n_embd})")
+        
+        # Pass memory config to model
+        model_args['use_memory_manifold'] = True
+        model_args['memory_manifold_path'] = memory_manifold_path
+        model_args['memory_k'] = memory_k
+    model_args['memory_alpha'] = memory_alpha
+else:
+    print("🧠 Memory manifold disabled (use_memory_manifold=False)")
+
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new Gray Box DEQ model from scratch")
@@ -214,6 +280,10 @@ elif init_from == 'resume':
         model_args[k] = checkpoint_model_args[k]
     # DEQ-specific params
     for k in ['deq_max_iter', 'deq_tol', 'anderson_accel', 'spectral_norm']:
+        if k in checkpoint_model_args:
+            model_args[k] = checkpoint_model_args[k]
+    # Memory manifold params (preserve from checkpoint if present)
+    for k in ['use_memory_manifold', 'memory_manifold_path', 'memory_k', 'memory_alpha']:
         if k in checkpoint_model_args:
             model_args[k] = checkpoint_model_args[k]
     # create the model
@@ -606,6 +676,12 @@ while True:
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, ckpt_path)
                 
+                # Save MEMORY checkpoint separately (if using hybrid memory)
+                if use_memory_manifold and hasattr(raw_model.reflex, 'save_memory_checkpoint'):
+                    memory_ckpt_path = os.path.join(out_dir, 'memory_ckpt.pkl')
+                    raw_model.reflex.save_memory_checkpoint(memory_ckpt_path)
+                    print(f"  ✓ Saved memory state to {memory_ckpt_path}")
+                
                 # Save checkpoint summary
                 if monitor:
                     monitor.save_checkpoint_summary(iter_num, ckpt_path)
@@ -658,6 +734,15 @@ while True:
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
+    
+    # ══════════════════════════════════════════════════════════════
+    # MEMORY SYSTEM UPDATE (dopamine + aging/decay)
+    # ══════════════════════════════════════════════════════════════
+    if use_memory_manifold and hasattr(raw_model.reflex, 'apply_dopamine_signal'):
+        raw_model.reflex.apply_dopamine_signal(loss)
+    
+    if use_memory_manifold and hasattr(raw_model.reflex, 'memory_step'):
+        raw_model.reflex.memory_step()
 
     # timing and logging
     # make sure GPU work is finished so timings represent wall-clock runtime
@@ -752,8 +837,15 @@ while True:
         # CHAOS BREAKDOWN: Show what's actually driving the chaos score
         chaos_breakdown = f"[σ_iter={stress_iters:.2f}, σ_res={stress_residual:.2f}]"
         
-        # Log line with NOVELTY/EXPLORATION DRIVE (ℂ) and chaos breakdown
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {time_ms:.2f}ms, mfu {running_mfu*100:.2f}%, deq_iters={deq_iters}, lr={lr:.2e}, chaos={chaos_score:.3f}{chaos_breakdown}, res={raw_residual:.2e}, ℂ={novelty_drive:.3e}")
+        # MEMORY STATS: Show two-tier memory state
+        memory_stats_str = ""
+        if use_memory_manifold and hasattr(raw_model.reflex, 'get_memory_stats'):
+            mem_stats = raw_model.reflex.get_memory_stats()
+            if mem_stats:
+                memory_stats_str = f", mem=[W:{mem_stats.get('num_working', 0)}/LT:{mem_stats.get('num_longterm', 0)}]"
+        
+        # Log line with NOVELTY/EXPLORATION DRIVE (ℂ), chaos breakdown, and memory state
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {time_ms:.2f}ms, mfu {running_mfu*100:.2f}%, deq_iters={deq_iters}, lr={lr:.2e}, chaos={chaos_score:.3f}{chaos_breakdown}, res={raw_residual:.2e}, ℂ={novelty_drive:.3e}{memory_stats_str}")
         
         # [PHYSICS PROBE] Inspect Semantic Mass Matrix (every 1000 iters)
         if iter_num % 1000 == 0 and iter_num > 0 and hamiltonian:

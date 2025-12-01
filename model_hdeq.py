@@ -363,28 +363,242 @@ class ReflexBlock(nn.Module):
 
 class ReflexModule(nn.Module):
     """
-    2-3 shallow reflex blocks.
+    2-3 shallow reflex blocks + HYPERBOLIC MEMORY-AUGMENTED FORCING
     
     Outputs a "force intent analogue":
       "push meaning in direction X at token t"
+    
+    Memory retrieval = dopaminergic navigation on hyperbolic manifold
+    Applied BEFORE cortical reasoning (DEQ loop)
+    
+    Components:
+      1. Reflex blocks: local syntax, bigrams, structure
+      2. Hyperbolic memory: navigate Poincaré ball for semantic priming
+      3. Dopamine: prediction error modulates memory plasticity
+      4. Combined: reflex + memory → forcing function u
     
     It is NOT the answer, only the default motion toward it.
     """
     def __init__(self, config):
         super().__init__()
+        self.config = config
+        
+        # Standard reflex blocks
         self.blocks = nn.ModuleList([
             ReflexBlock(config) for _ in range(config.n_reflex)
         ])
         self.ln_f = nn.LayerNorm(config.n_embd, bias=config.bias)
+        
+        # TWO-TIER HYBRID MEMORY SYSTEM: Optional memory-augmented forcing
+        self.use_memory = getattr(config, 'use_memory_manifold', False)
+        self.memory_mode = getattr(config, 'memory_mode', 'hybrid')  # hybrid | hyperbolic | euclidean
+        
+        if self.use_memory:
+            if self.memory_mode == 'hybrid':
+                # NEW: Hybrid two-tier system (working + long-term)
+                from hybrid_memory_system import HybridMemorySystem
+                
+                memory_dim = getattr(config, 'memory_dim', config.n_embd)
+                k_neighbors = getattr(config, 'memory_k', 16)
+                alpha = getattr(config, 'memory_alpha', 0.1)
+                curvature = getattr(config, 'memory_curvature', 1.0)
+                
+                # Two-tier params
+                working_capacity = getattr(config, 'working_memory_capacity', 50)
+                longterm_capacity = getattr(config, 'longterm_memory_capacity', 1000)
+                working_decay = getattr(config, 'working_memory_decay', 0.95)
+                longterm_decay = getattr(config, 'longterm_memory_decay', 0.999)
+                promotion_threshold = getattr(config, 'memory_promotion_threshold', 0.5)
+                promotion_interval = getattr(config, 'memory_promotion_interval', 100)
+                
+                # Device placement (CRITICAL!)
+                working_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                longterm_device = 'cpu'  # Always keep long-term on CPU to save VRAM
+                
+                self.memory_retrieval = HybridMemorySystem(
+                    hidden_dim=config.n_embd,
+                    memory_dim=memory_dim,
+                    k_neighbors=k_neighbors,
+                    curvature=curvature,
+                    alpha=alpha,
+                    working_capacity=working_capacity,
+                    working_device=working_device,
+                    working_decay=working_decay,
+                    longterm_capacity=longterm_capacity,
+                    longterm_device=longterm_device,
+                    longterm_decay=longterm_decay,
+                    promotion_threshold=promotion_threshold,
+                    promotion_interval=promotion_interval
+                )
+                
+                print(f"[Reflex] Hybrid two-tier memory enabled")
+                print(f"  Working:   {working_capacity} on {working_device} (decay={working_decay})")
+                print(f"  Long-term: {longterm_capacity} on {longterm_device} (decay={longterm_decay})")
+                
+            elif self.memory_mode == 'hyperbolic':
+                from hyperbolic_memory import HyperbolicMemoryRetrieval
+                
+                memory_dim = getattr(config, 'memory_dim', config.n_embd)
+                k_neighbors = getattr(config, 'memory_k', 16)
+                alpha = getattr(config, 'memory_alpha', 0.1)
+                curvature = getattr(config, 'memory_curvature', 1.0)
+                learning_mode = getattr(config, 'memory_learning_mode', 'dopaminergic')
+                dopamine_scale = getattr(config, 'memory_dopamine_scale', 0.5)
+                
+                self.memory_retrieval = HyperbolicMemoryRetrieval(
+                    hidden_dim=config.n_embd,
+                    memory_dim=memory_dim,
+                    k_neighbors=k_neighbors,
+                    curvature=curvature,
+                    alpha=alpha,
+                    learning_mode=learning_mode,
+                    dopamine_scale=dopamine_scale
+                )
+                
+                print(f"[Reflex] Hyperbolic memory enabled ({learning_mode} mode)")
+                
+            else:
+                # Fallback to Euclidean memory
+                from memory_retrieval import MemoryRetrieval
+                
+                memory_dim = getattr(config, 'memory_dim', 768)
+                k_neighbors = getattr(config, 'memory_k', 16)
+                alpha_init = getattr(config, 'memory_alpha', 0.1)
+                
+                self.memory_retrieval = MemoryRetrieval(
+                    hidden_dim=config.n_embd,
+                    memory_dim=memory_dim,
+                    k_neighbors=k_neighbors,
+                    alpha_init=alpha_init,
+                    use_attention=True,
+                    dropout=config.dropout
+                )
+                
+                print(f"[Reflex] Euclidean memory enabled")
+            
+            # Load manifold if path provided
+            manifold_path = getattr(config, 'memory_manifold_path', None)
+            if manifold_path:
+                print(f"[Reflex] Loading memory manifold: {manifold_path}")
+                self._load_memory_manifold(manifold_path)
+            else:
+                print("[Reflex] Memory manifold path not provided - will need to load later")
+        else:
+            self.memory_retrieval = None
+            print("[Reflex] Memory-augmented forcing DISABLED")
+    
+    def _load_memory_manifold(self, manifold_path):
+        """Load memory manifold from disk"""
+        import pickle
+        import os
+        
+        if not os.path.exists(manifold_path):
+            raise FileNotFoundError(f"Memory manifold not found: {manifold_path}")
+        
+        with open(manifold_path, 'rb') as f:
+            manifold = pickle.load(f)
+        
+        # Extract embeddings
+        if 'embeddings' in manifold:
+            embeddings = torch.from_numpy(manifold['embeddings']).float()
+        elif 'chunks' in manifold:
+            # Old format
+            import numpy as np
+            embeddings = torch.from_numpy(
+                np.stack([chunk.embedding for chunk in manifold['chunks']])
+            ).float()
+        else:
+            raise ValueError("Invalid manifold format")
+        
+        # Load into retrieval module
+        if self.memory_mode == 'hyperbolic':
+            self.memory_retrieval.load_hyperbolic_manifold(embeddings)
+        else:
+            self.memory_retrieval.load_manifold(manifold_path)
+        
+        print(f"  ✓ Loaded {len(embeddings)} memory vectors")
     
     def forward(self, x, mask=None):
         """
         x: [B, T, C] context embeddings
-        Returns: [B, T, C] reflex suggestions
+        Returns: [B, T, C] reflex + memory forcing
         """
+        # Standard reflex processing (local syntax, structure)
+        reflex = x
         for block in self.blocks:
-            x = block(x, mask)
-        return self.ln_f(x)
+            reflex = block(reflex, mask)
+        reflex = self.ln_f(reflex)
+        
+        # MEMORY-AUGMENTED FORCING (Hybrid/Hyperbolic/Euclidean)
+        if self.use_memory and self.memory_retrieval is not None:
+            # Hybrid system returns tuple (output, info)
+            if self.memory_mode == 'hybrid':
+                reflex, memory_info = self.memory_retrieval(reflex)
+                # Store memory info for logging (optional)
+                if not hasattr(self, '_last_memory_info'):
+                    self._last_memory_info = memory_info
+                else:
+                    self._last_memory_info.update(memory_info)
+            else:
+                # Legacy systems return output only
+                reflex = self.memory_retrieval(reflex)
+        
+        return reflex
+    
+    def apply_dopamine_signal(self, loss):
+        """
+        Apply dopaminergic learning signal to memory.
+        Called after loss computation to modulate memory plasticity.
+        
+        Args:
+            loss: scalar loss value (prediction error)
+        """
+        if not self.use_memory or self.memory_retrieval is None:
+            return
+        
+        # Hybrid two-tier system: Apply dopamine to both tiers
+        if self.memory_mode == 'hybrid' and hasattr(self.memory_retrieval, 'apply_dopamine'):
+            self.memory_retrieval.apply_dopamine(loss)
+        # Legacy hyperbolic memory
+        elif self.memory_mode == 'hyperbolic' and hasattr(self.memory_retrieval, 'apply_dopamine_modulation'):
+            pass  # Dopamine applied via gradient modulation
+    
+    def memory_step(self):
+        """
+        Update memory system (aging, decay, consolidation).
+        Should be called after each training step.
+        """
+        if not self.use_memory or self.memory_retrieval is None:
+            return
+        
+        if self.memory_mode == 'hybrid' and hasattr(self.memory_retrieval, 'step'):
+            self.memory_retrieval.step()
+    
+    def get_memory_stats(self):
+        """Get memory system statistics for logging"""
+        if not self.use_memory or self.memory_retrieval is None:
+            return {}
+        
+        if self.memory_mode == 'hybrid' and hasattr(self.memory_retrieval, 'get_stats'):
+            return self.memory_retrieval.get_stats()
+        
+        return {}
+    
+    def save_memory_checkpoint(self, filepath):
+        """Save memory state separately from model"""
+        if not self.use_memory or self.memory_retrieval is None:
+            return
+        
+        if self.memory_mode == 'hybrid' and hasattr(self.memory_retrieval, 'save_checkpoint'):
+            self.memory_retrieval.save_checkpoint(filepath)
+    
+    def load_memory_checkpoint(self, filepath):
+        """Load memory state from checkpoint"""
+        if not self.use_memory or self.memory_retrieval is None:
+            return
+        
+        if self.memory_mode == 'hybrid' and hasattr(self.memory_retrieval, 'load_checkpoint'):
+            self.memory_retrieval.load_checkpoint(filepath)
 
 
 # -----------------------------------------------------------------------------
@@ -1963,6 +2177,29 @@ class GrayBoxConfig:
     T_init: float = 0.5  # Initial exploration temperature
     T_final: float = 0.01  # Final convergence temperature
     
+    # ═══════════════════════════════════════════════════════════════════════
+    # HYBRID TWO-TIER MEMORY SYSTEM
+    # ═══════════════════════════════════════════════════════════════════════
+    use_memory_manifold: bool = False  # Enable memory system
+    memory_mode: str = 'hybrid'  # 'hybrid', 'hyperbolic', 'euclidean'
+    memory_dim: int = 384  # Memory embedding dimension
+    memory_k: int = 16  # Number of neighbors to retrieve
+    memory_alpha: float = 0.1  # Injection strength
+    memory_curvature: float = 1.0  # Hyperbolic curvature
+    
+    # Working memory tier (VRAM) - L1 CACHE style
+    working_memory_capacity: int = 20      # TINY - immediate context only
+    working_memory_decay: float = 0.80     # AGGRESSIVE - 20% decay per step
+    
+    # Long-term memory tier (CPU) - RAM style
+    longterm_memory_capacity: int = 2000   # LARGE - background knowledge
+    longterm_memory_decay: float = 0.999   # PERSISTENT - slow fade
+    
+    # Consolidation
+    memory_promotion_threshold: float = 0.4  # Lower for easier promotion
+    memory_promotion_interval: int = 50      # More frequent
+    # ═══════════════════════════════════════════════════════════════════════
+    
     def __post_init__(self):
         # Map n_layer to n_reflex for API compatibility with nanoGPT
         if self.n_reflex is None:
@@ -2224,22 +2461,65 @@ class GrayBoxDEQ(nn.Module):
         }
     
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        """AdamW optimizer with weight decay"""
-        # Separate decay and no_decay params
+        """
+        AdamW optimizer with DIFFERENT learning rates for memory tiers.
+        
+        Memory architecture (like biological systems):
+        - Fast tier (working memory): 10x normal LR
+        - Slow tier (long-term memory): 0.1x normal LR
+        - Regular params: 1x normal LR
+        """
+        # Separate params by type
         decay = set()
         no_decay = set()
+        fast_memory = set()  # Dynamic/working memory (high LR)
+        slow_memory = set()  # Static/long-term memory (low LR)
         
         for pn, p in self.named_parameters():
-            if p.dim() >= 2:
+            # Detect memory parameters by name pattern
+            if 'dynamic_memory' in pn or 'working' in pn:
+                fast_memory.add(pn)
+            elif 'static_memory' in pn or 'longterm' in pn or 'memory_manifold' in pn:
+                slow_memory.add(pn)
+            elif p.dim() >= 2:
                 decay.add(pn)
             else:
                 no_decay.add(pn)
         
+        # Remove memory params from decay/no_decay
+        decay = decay - fast_memory - slow_memory
+        no_decay = no_decay - fast_memory - slow_memory
+        
         param_dict = {pn: p for pn, p in self.named_parameters()}
+        
         optim_groups = [
-            {'params': [param_dict[pn] for pn in sorted(decay)], 'weight_decay': weight_decay},
-            {'params': [param_dict[pn] for pn in sorted(no_decay)], 'weight_decay': 0.0},
+            # Standard params with decay
+            {'params': [param_dict[pn] for pn in sorted(decay)], 
+             'weight_decay': weight_decay, 
+             'lr': learning_rate},
+            # Standard params without decay
+            {'params': [param_dict[pn] for pn in sorted(no_decay)], 
+             'weight_decay': 0.0,
+             'lr': learning_rate},
         ]
+        
+        # Add fast memory tier (CACHE-STYLE: 50x LR!) if exists
+        if fast_memory:
+            optim_groups.append({
+                'params': [param_dict[pn] for pn in sorted(fast_memory)],
+                'weight_decay': weight_decay * 0.01,  # Minimal regularization for cache
+                'lr': learning_rate * 50.0  # 50X FASTER! Like L1 cache
+            })
+            print(f"[Optimizer] Fast memory tier (CACHE): {len(fast_memory)} params @ 50x LR")
+        
+        # Add slow memory tier (0.1x LR) if exists
+        if slow_memory:
+            optim_groups.append({
+                'params': [param_dict[pn] for pn in sorted(slow_memory)],
+                'weight_decay': weight_decay,
+                'lr': learning_rate * 0.1  # 10X SLOWER consolidation
+            })
+            print(f"[Optimizer] Slow memory tier: {len(slow_memory)} params @ 0.1x LR")
         
         use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
         extra_args = dict(fused=True) if use_fused else dict()

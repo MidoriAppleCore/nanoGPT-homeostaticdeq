@@ -22,6 +22,9 @@ from torch.distributed import init_process_group, destroy_process_group
 # Import from model_graybox instead of model
 from model_hdeq import GPTConfig, GPT
 
+# Homeostatic monitoring system
+from homeostatic_monitor import HomeostaticMonitor
+
 # For phase space visualization
 try:
     import matplotlib
@@ -494,6 +497,9 @@ if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
+# Initialize Homeostatic Monitor
+monitor = HomeostaticMonitor(out_dir) if master_process else None
+
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
@@ -531,6 +537,10 @@ while True:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         
+        # Log to monitor
+        if monitor:
+            monitor.log_loss(iter_num, losses['train'], losses['val'])
+        
         # Generate samples to see model progress
         generate_samples()
         
@@ -556,8 +566,13 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
+                ckpt_path = os.path.join(out_dir, 'ckpt.pt')
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                torch.save(checkpoint, ckpt_path)
+                
+                # Save checkpoint summary
+                if monitor:
+                    monitor.save_checkpoint_summary(iter_num, ckpt_path)
     if iter_num == 0 and eval_only:
         break
 
@@ -601,6 +616,21 @@ while True:
         'final_residual': metrics.get('final_residual', 0.0)
     }
     
+    # Calculate chaos score components for logging
+    stress_iters = min(1.0, prev_metrics['num_iters'] / deq_max_iter)
+    stress_residual = min(1.0, prev_metrics['final_residual'] * 100.0)
+    chaos_score = max(stress_iters, stress_residual)
+    throttle = 1.0 - max(0, (chaos_score - 0.2) / 0.8)
+    throttle = max(0.1, throttle)
+    
+    # Log to homeostatic monitor
+    if monitor:
+        monitor.log_deq(iter_num, prev_metrics['num_iters'], 
+                       prev_metrics['final_residual'], dt * 1000.0)
+        monitor.log_chaos(iter_num, chaos_score, stress_iters, 
+                         stress_residual, throttle)
+        monitor.log_lr(iter_num, lr, learning_rate)
+    
     if iter_num % log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
@@ -611,12 +641,53 @@ while True:
         deq_iters = metrics.get('num_iters', 0)
         time_ms = dt * 1000.0
         
-        # Calculate chaos score for display
-        stress_iters = min(1.0, deq_iters / deq_max_iter)
-        stress_residual = min(1.0, prev_metrics['final_residual'] * 100.0)
-        chaos_score = max(stress_iters, stress_residual)
+        # Log to homeostatic monitor
+        if monitor:
+            monitor.log_loss(iter_num, lossf)
         
         print(f"iter {iter_num}: loss {lossf:.4f}, time {time_ms:.2f}ms, mfu {running_mfu*100:.2f}%, deq_iters={deq_iters}, lr={lr:.2e}, chaos={chaos_score:.3f}")
+        
+        # [PHYSICS PROBE] Inspect Semantic Mass Matrix (every 1000 iters)
+        if iter_num % 1000 == 0 and iter_num > 0 and hamiltonian:
+            print("\n" + "="*70)
+            print("🔬 [PHYSICS PROBE] Inspecting Semantic Mass Matrix...")
+            print("="*70)
+            
+            # We need the tokenizer to decode
+            meta_path_inspect = os.path.join(data_dir, 'meta.pkl')
+            if os.path.exists(meta_path_inspect):
+                with open(meta_path_inspect, 'rb') as f:
+                    meta_inspect = pickle.load(f)
+                itos = meta_inspect.get('itos', {})
+                
+                mass_data = raw_model.inspect_concept_mass(top_k=10)
+                
+                print("\n  ⚛️  HEAVY Concepts (High Inertia - Content Words):")
+                for idx, val in zip(mass_data['heavy_ids'], mass_data['heavy_vals']):
+                    token = itos.get(idx, f"<{idx}>")
+                    # Clean up token for display
+                    token_display = repr(token)[1:-1]  # Remove outer quotes
+                    print(f"     {token_display:20s}: {val:.4f}")
+                
+                print("\n  💨 LIGHT Concepts (Agile - Function Words):")
+                for idx, val in zip(mass_data['light_ids'], mass_data['light_vals']):
+                    token = itos.get(idx, f"<{idx}>")
+                    token_display = repr(token)[1:-1]
+                    print(f"     {token_display:20s}: {val:.4f}")
+                
+                # Log to monitor
+                if monitor:
+                    monitor.log_mass_stats(iter_num, mass_data['heavy_vals'], 
+                                          mass_data['light_vals'])
+            else:
+                print("  ⚠️  No meta.pkl found - cannot decode tokens")
+            
+            print("="*70 + "\n")
+        
+        # Generate homeostatic dashboard (every 500 iters)
+        if iter_num % 500 == 0 and iter_num > 0 and monitor:
+            monitor.plot_homeostasis(iter_num)
+        
         # append to CSV for later plotting/analysis
         if master_process:
             try:

@@ -1572,15 +1572,17 @@ class GlobalController(nn.Module):
         n_features = 6
         
         # Tiny meta-network (this is control theory, not deep learning)
+        # Upgraded: 2 outputs → 3 outputs (phi, tol, temp)
         self.net = nn.Sequential(
             nn.Linear(n_features, 16, bias=config.bias),
             nn.Tanh(),
-            nn.Linear(16, 2, bias=config.bias),
+            nn.Linear(16, 3, bias=config.bias),  # Output: [Phi_adj, Tol_adj, Temp_adj]
         )
         
         # Default targets
         self.register_buffer('phi_target', torch.tensor(0.95))
         self.register_buffer('tol_base', torch.tensor(config.deq_tol))
+        self.register_buffer('temp_base', torch.tensor(1.0))  # Base temperature
     
     def compute_semantic_fields(self, logits, z, z_prev, metrics):
         """
@@ -1650,6 +1652,9 @@ class GlobalController(nn.Module):
         Read semantic fields, output control signals.
         
         This is physics, not learning.
+        
+        Returns:
+            (phi_target, tolerance, temperature)
         """
         # Compute scalar fields
         features = self.compute_semantic_fields(logits, z, z_prev, metrics)
@@ -1658,6 +1663,7 @@ class GlobalController(nn.Module):
         out = self.net(features.to(next(self.parameters()).device))
         phi_adjust = torch.sigmoid(out[0])  # [0, 1]
         tol_adjust = torch.sigmoid(out[1])  # [0, 1]
+        temp_adjust = torch.sigmoid(out[2])  # [0, 1] - NEW
         
         # Spectral target: φ* ∈ [0.9, 1.05]
         # HARD CLAMP (not soft) — this is the stability boundary
@@ -1669,7 +1675,14 @@ class GlobalController(nn.Module):
         tolerance = self.tol_base * (0.1 ** (1 - 2*tol_adjust))
         tolerance = torch.clamp(tolerance, self.tol_base * 0.1, self.tol_base * 10.0)
         
-        return phi_target, tolerance
+        # Temperature: Learnable annealing schedule (NEW)
+        # High uncertainty/entropy → High Temp (Explore via thermal noise)
+        # Low uncertainty → Low Temp (Exploit current basin)
+        # Range: [0.1, 5.0] - aggressive annealing
+        temperature = 0.1 + 4.9 * temp_adjust
+        temperature = torch.clamp(temperature, 0.1, 5.0)
+        
+        return phi_target, tolerance, temperature
 
 
 # -----------------------------------------------------------------------------
@@ -1943,6 +1956,59 @@ class GrayBoxDEQ(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
         
         return idx
+    
+    @torch.no_grad()
+    def inspect_concept_mass(self, top_k=20):
+        """
+        Inspects the Hamiltonian Mass Matrix to see which tokens are 'Heavy'.
+        
+        Physics: Kinetic Energy T = 1/2 p^T M^{-1} p
+        High Mass (Inertia) = Hard to change semantic direction.
+        Low Mass (Agile) = Easy to change (syntax/grammar).
+        
+        This reveals the learned semantic physics:
+        - Content words (nouns, verbs) → Heavy (high semantic inertia)
+        - Function words (the, a, is) → Light (agile syntactic glue)
+        
+        Returns:
+            dict with 'heavy_ids', 'heavy_vals', 'light_ids', 'light_vals'
+        """
+        if not self.config.hamiltonian:
+            print("⚠️  Model is not Hamiltonian (no mass matrix).")
+            return {
+                'heavy_ids': [], 'heavy_vals': [],
+                'light_ids': [], 'light_vals': []
+            }
+        
+        # 1. Get the diagonal of the inverse mass matrix (approximate)
+        # The mass_metric layer computes velocity = M^{-1} p
+        # We look at the norm of the weights projecting each dimension
+        M_inv_diag = self.deq.operator.mass_metric.weight.norm(dim=0)
+        
+        # Mass is inverse of this layer (roughly)
+        mass_score = 1.0 / (M_inv_diag + 1e-6)
+        
+        # 2. Project token embeddings onto this mass vector
+        # Which tokens align with high-mass dimensions?
+        # WTE: [Vocab, Dim]
+        # But we only use the "position" half of embeddings for q
+        dim_half = self.config.n_embd // 2
+        token_emb_q = self.encoder.wte.weight[:, :dim_half]  # Position component
+        
+        # Mass score for each token = sum of |embedding| * mass_score
+        token_mass = (token_emb_q.abs() * mass_score.unsqueeze(0)).sum(dim=1)
+        
+        # 3. Find heaviest and lightest tokens
+        # Returning IDs and scores for the training script to decode
+        heavy_vals, heavy_ids = torch.topk(token_mass, min(top_k, len(token_mass)), largest=True)
+        light_vals, light_ids = torch.topk(token_mass, min(top_k, len(token_mass)), largest=False)
+        
+        return {
+            'heavy_ids': heavy_ids.cpu().tolist(),
+            'heavy_vals': heavy_vals.cpu().tolist(),
+            'light_ids': light_ids.cpu().tolist(),
+            'light_vals': light_vals.cpu().tolist()
+        }
     
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         """AdamW optimizer with weight decay"""

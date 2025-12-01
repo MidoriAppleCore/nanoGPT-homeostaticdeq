@@ -145,6 +145,59 @@ from torch.nn import functional as F
 
 
 # -----------------------------------------------------------------------------
+# Pauli Exclusion Principle for Tokens (Anti-Stuttering Force)
+# -----------------------------------------------------------------------------
+
+def compute_pauli_exclusion_loss(logits, targets):
+    """
+    Physics: Coulomb Repulsion for Tokens (Pauli Exclusion Principle)
+    
+    In quantum mechanics, the Pauli Exclusion Principle states:
+    "Two identical fermions cannot occupy the same quantum state."
+    
+    For language: "Two identical tokens should not occupy adjacent timesteps."
+    
+    The model gets trapped in "Lily Lily Lily" loops because the energy well
+    for high-frequency tokens is too deep. This adds a REPULSION FORCE that
+    penalizes the model for predicting the exact same token it just generated.
+    
+    Args:
+        logits: [B, T, V] - Model predictions (before softmax)
+        targets: [B, T] - Ground truth token IDs
+    
+    Returns:
+        pauli_loss: Scalar - Average probability assigned to immediate repetition
+    
+    Physics Intuition:
+        - If model wants to say "Lily" at step t, and "Lily" was at step t-1,
+          we apply a massive energy penalty (Coulomb repulsion).
+        - This fills the "Lily gravity well" with concrete, forcing the
+          Hamiltonian momentum to redirect to different tokens.
+    """
+    # 1. Get probabilities of current predictions
+    probs = F.softmax(logits, dim=-1)  # [B, T, V]
+    
+    # 2. Identify what the "Previous Token" was for every step
+    # Shift targets to the right: [The, Cat, Sat] → [PAD, The, Cat]
+    prev_ids = targets.roll(1, dims=1)
+    prev_ids[:, 0] = -100  # Ignore first token (nothing before it)
+    
+    # 3. How much probability is assigned to the "Previous Token"?
+    # Gather the probability of prev_ids from the current distribution
+    # clamp(min=0) prevents error on -100 ignore index
+    token_prob_at_prev = probs.gather(-1, prev_ids.unsqueeze(-1).clamp(min=0)).squeeze(-1)
+    
+    # 4. The Penalty: Minimize probability of repeating last token
+    # Mask out -100 positions (first token in sequence)
+    mask = (prev_ids != -100).float()
+    
+    # Average probability assigned to immediate neighbor
+    pauli_loss = (token_prob_at_prev * mask).sum() / (mask.sum() + 1e-8)
+    
+    return pauli_loss
+
+
+# -----------------------------------------------------------------------------
 # Anderson Acceleration for fast fixed-point convergence
 # -----------------------------------------------------------------------------
 
@@ -430,6 +483,15 @@ class HamiltonianOperator(nn.Module):
         self.config = config
         self.dim = config.n_embd // 2  # Split into position/momentum
         
+        # HOMEOSTATIC ADAPTIVE FRICTION: Damping responds to Chaos Score
+        # Without this, Hamiltonian systems orbit forever (energy conservation)
+        # With adaptive friction: γ(chaos) scales from gentle to aggressive damping
+        self.gamma_min = 0.05  # Baseline friction (Zen mode, gentle damping)
+        self.gamma_max = 0.5   # Maximum friction (High chaos, aggressive damping)
+        self.current_gamma = self.gamma_min  # Will be updated dynamically
+        print(f"[Rayleigh] Homeostatic Adaptive Friction: γ ∈ [{self.gamma_min}, {self.gamma_max}]")
+        print(f"           Friction scales with Chaos Score for self-regulation")
+        
         # Kinetic Energy: T(p) = (1/2) p^T M^{-1} p
         # Learn the "mass tensor" M for semantic inertia
         self.mass_metric = nn.Linear(self.dim, self.dim, bias=False)
@@ -468,6 +530,7 @@ class HamiltonianOperator(nn.Module):
                 # Use simple index instead of full name (can't have dots in buffer names)
                 self._spectral_norm_power_iteration(module, f"h_layer_{layer_idx}")
                 layer_idx += 1
+        print(f"[Spectral] Applied spectral normalization to {layer_idx} linear layers in HamiltonianOperator")
     
     def _spectral_norm_power_iteration(self, module, name, n_power_iterations=1):
         """Manual spectral normalization via power iteration"""
@@ -536,12 +599,27 @@ class HamiltonianOperator(nn.Module):
         velocity = self.mass_metric(p + u_p)
         return velocity
     
-    def forward(self, state, u, mask=None):
+    def update_friction(self, chaos_score):
         """
-        Symplectic Euler Integration Step WITH ADAPTIVE METRIC
+        Homeostatic Adaptive Friction: Update γ based on observed Chaos Score
+        
+        chaos_score: float in [0.0, 1.0] representing system instability
+                     0.0 = Zen mode (stable, converged)
+                     1.0 = Chaos mode (diverging, max stress)
+        
+        Returns: Updated friction coefficient γ_adaptive
+        """
+        # Linear interpolation: γ = γ_min + (γ_max - γ_min) * chaos
+        self.current_gamma = self.gamma_min + (self.gamma_max - self.gamma_min) * chaos_score
+        return self.current_gamma
+    
+    def forward(self, state, u, mask=None, iteration=0):
+        """
+        Symplectic Euler Integration Step WITH ADAPTIVE METRIC AND HOMEOSTATIC FRICTION
         
         state: [B, T, C] where C = 2*dim = [q; p]
         u: [B, T, C] context (also split into q/p components)
+        iteration: int, current DEQ iteration (unused for Hamiltonian, but accepted for API compatibility)
         
         WARP DRIVE OPTIMIZATION:
         Instead of fixed dt=0.1 everywhere, we use adaptive step size
@@ -567,7 +645,15 @@ class HamiltonianOperator(nn.Module):
         # Symplectic Euler (1st order, preserves symplectic form)
         # Step 1: Momentum kick (force from potential)
         force = self.potential_gradient(q, u_q, mask)
-        p_new = p + dt * force  # p += dt * (-dV/dq)
+        
+        # HOMEOSTATIC RAYLEIGH DISSIPATION: Adaptive friction -γ(chaos)·p
+        # γ ranges from γ_min (Zen mode) to γ_max (Chaos mode)
+        # The current_gamma is updated by the homeostatic controller
+        # Physics: Rayleigh dissipation function R = (1/2)γ·p²
+        #          τ_effective = -∂V/∂q - ∂R/∂p = force - γ·p
+        friction_force = -self.current_gamma * p
+        
+        p_new = p + dt * (force + friction_force)  # p += dt * (F - γ(chaos)·p)
         
         # Step 2: Position drift (velocity from kinetic)
         velocity = self.kinetic_gradient(p_new, u_p)
@@ -600,6 +686,14 @@ class DEQOperator(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        
+        # TEMPORAL ENCODING: Iteration-aware embedding
+        # Allows network to learn different dynamics at different iteration depths
+        # Early iterations: High-frequency changes (syntax, structure)
+        # Late iterations: Low-frequency changes (semantic refinement)
+        max_iters = config.deq_max_iter if hasattr(config, 'deq_max_iter') else 30
+        self.iteration_embedding = nn.Embedding(max_iters + 1, config.n_embd)
+        print(f"[Temporal] Iteration-aware DEQ: {max_iters} temporal modes")
         
         # Attention
         self.ln_1 = nn.LayerNorm(config.n_embd, bias=config.bias)
@@ -639,6 +733,7 @@ class DEQOperator(nn.Module):
                 # Use simple index instead of full name (can't have dots in buffer names)
                 self._spectral_norm_power_iteration(module, f"layer_{layer_idx}")
                 layer_idx += 1
+        print(f"[Spectral] Applied spectral normalization to {layer_idx} linear layers in DEQOperator")
     
     def _spectral_norm_power_iteration(self, module, name, n_power_iterations=1):
         """
@@ -685,15 +780,29 @@ class DEQOperator(nn.Module):
         
         module.register_forward_pre_hook(spectral_norm_hook)
     
-    def forward(self, z, u, mask=None):
+    def forward(self, z, u, mask=None, iteration=0):
         """
         z: [B, T, C] current equilibrium state
         u: [B, T, C] context (from encoder + reflex)
+        iteration: int, current DEQ iteration (for temporal encoding)
         
         Returns: Δz [B, T, C] semantic integration
         """
+        B, T, C = z.shape
+        
+        # TEMPORAL ENCODING: Add iteration-aware modulation
+        # This allows the network to learn different behaviors at different depths
+        iter_emb = self.iteration_embedding(
+            torch.tensor(min(iteration, self.iteration_embedding.num_embeddings - 1), 
+                        device=z.device, dtype=torch.long)
+        )  # [C]
+        iter_emb = iter_emb.view(1, 1, C).expand(B, T, -1)  # [B, T, C]
+        
+        # Modulate state with temporal information
+        z_temporal = z + 0.1 * iter_emb  # Small modulation to preserve stability
+        
         # Inject context into query
-        z_ctx = z + u
+        z_ctx = z_temporal + u
         
         # Attention
         attn_out, _ = self.attn(
@@ -897,6 +1006,20 @@ class DEQBrain(nn.Module):
         # Physical laws
         self.laws = PhysicalLaws()
         
+        # TEMPORAL ENCODING: Iteration-aware thinking (Deep Temporal Encoding)
+        # The operator needs to know "what stage of thought" it's in
+        # Early iterations (1-3): high-frequency syntactic structure
+        # Late iterations (10+): low-frequency semantic refinement
+        self.temporal_encoding_enabled = getattr(config, 'temporal_encoding', True)
+        if self.temporal_encoding_enabled:
+            # Learnable sinusoidal encoding for iteration number
+            # Similar to positional encoding but for "thinking time"
+            self.iteration_embedding = nn.Parameter(
+                torch.randn(config.deq_max_iter, config.n_embd) * 0.02
+            )
+            print("[Physics] TEMPORAL ENCODING enabled: Iteration-aware thinking")
+            print("          Early iters → syntax, Late iters → semantics")
+        
         # Metrics tracking (for visualization)
         self.last_complexity = None
         self.last_dt = None
@@ -948,6 +1071,8 @@ class DEQBrain(nn.Module):
         
         u: [B, T, C] context (embeddings + reflex)
         effort: thinking depth multiplier (< 1 = fast, > 1 = deep)
+                ADAPTIVE DEPTH: effort is modulated by chaos score (fractal complexity)
+                High chaos → need more iters to navigate basin boundaries
         verbose: if True, print progress every 5 iterations
         
         Returns: (z*, num_iters, metrics) equilibrium state, iteration count, and diagnostic metrics
@@ -962,9 +1087,11 @@ class DEQBrain(nn.Module):
         # Anderson acceleration
         anderson = AndersonAcceleration(m=5, beta=1.0) if self.config.anderson_accel else None
         
-        # Adaptive parameters (can be overridden by physical laws)
-        max_iter = int(self.config.deq_max_iter * effort)
+        # ADAPTIVE DEPTH: Base parameters (will be adjusted by complexity)
+        base_max_iter = int(self.config.deq_max_iter * effort)
+        max_iter = base_max_iter  # Will be updated after early chaos estimate
         tol = self.config.deq_tol
+        adaptive_depth_enabled = getattr(self.config, 'adaptive_depth', True)
         
         # Global step size γ ∈ [0.9, 1.05]
         # HARD CLAMP: This is the spectral band constraint
@@ -976,15 +1103,17 @@ class DEQBrain(nn.Module):
         # SPEEDUP 1: Early stopping with looser initial tolerance
         # Start loose, tighten as we converge (allows early exit on easy tokens)
         min_iters = 3  # Always do at least 3 iterations
+        chaos_estimated = False  # Track if we've adjusted depth
         
         if verbose:
-            print(f"[DEQ] Starting solve: max_iter={max_iter}, tol={tol:.1e}")
+            print(f"[DEQ] Starting solve: max_iter={max_iter}, tol={tol:.1e}, adaptive_depth={adaptive_depth_enabled}")
         
         for i in range(max_iter):
             z_prev_iter = z
             
-            # Compute semantic integration
-            delta_z = self.operator(z, u, mask)
+            # Compute semantic integration (now iteration-aware!)
+            # The operator has built-in temporal encoding
+            delta_z = self.operator(z, u, mask, iteration=i)
             
             # Stabilizer: per-dimension damping α ∈ [0.1, 0.9]
             alpha = self.stabilizer(z, u)
@@ -1008,6 +1137,32 @@ class DEQBrain(nn.Module):
                 
                 if verbose and (i + 1) % 5 == 0:
                     print(f"[DEQ] iter {i+1:2d}/{max_iter}: residual={residual:.2e}")
+                
+                # ADAPTIVE DEPTH: After 3 iterations, estimate chaos and adjust max_iter
+                # This allows easy sequences to exit early, hard sequences to think longer
+                if adaptive_depth_enabled and i == 2 and not chaos_estimated:
+                    # Estimate chaos from residual stress (distance to convergence)
+                    # High residual after 3 iters → fractal boundary → need more thinking
+                    import math
+                    res_log = math.log10(residual) if residual > 1e-10 else -10
+                    # Map residual to [0, 1]: res=0.001 → 0.4, res=1.0 → 0.7, res=10 → 0.9
+                    chaos_estimate = (res_log + 3.0) / 5.0  # Same scale as chaos sensor
+                    chaos_estimate = max(0.0, min(1.0, chaos_estimate))
+                    
+                    # Adjust max_iter based on chaos: chaos ∈ [0, 1] → multiplier ∈ [0.5, 1.5]
+                    # Low chaos (smooth) → fewer iters, High chaos (fractal) → more iters
+                    depth_multiplier = 0.5 + chaos_estimate
+                    new_max_iter = int(base_max_iter * depth_multiplier)
+                    
+                    # Clamp to reasonable range
+                    new_max_iter = max(min_iters + 2, min(new_max_iter, base_max_iter * 2))
+                    
+                    if new_max_iter != max_iter:
+                        max_iter = new_max_iter
+                        if verbose:
+                            print(f"[Adaptive Depth] chaos_est={chaos_estimate:.3f} → max_iter adjusted to {max_iter}")
+                    
+                    chaos_estimated = True
                 
                 # SPEEDUP: Adaptive early stopping
                 # After min_iters, check if we're converging fast enough
@@ -1104,7 +1259,7 @@ class DEQBrain(nn.Module):
         
         fine_iters = max(3, int(self.config.deq_max_iter * 0.4))
         for i in range(fine_iters):
-            delta_z = self.operator(z_fine, u, mask)
+            delta_z = self.operator(z_fine, u, mask, iteration=i)
             alpha = self.stabilizer(z_fine, u)
             z_fine = z_fine + gamma * alpha * delta_z
             
@@ -1165,7 +1320,7 @@ class DEQBrain(nn.Module):
             
             # Evolve trajectory
             for t in range(path_length):
-                delta_z = self.operator(z, u, mask)
+                delta_z = self.operator(z, u, mask, iteration=t)
                 alpha = self.stabilizer(z, u)
                 z = z + alpha * delta_z
             
@@ -1174,7 +1329,7 @@ class DEQBrain(nn.Module):
             # Compute "action" / "energy" of this path
             # Lower energy = more probable quantum state
             with torch.no_grad():
-                residual = (z - self.operator(z, u, mask)).norm(dim=-1).mean()
+                residual = (z - self.operator(z, u, mask, iteration=path_length)).norm(dim=-1).mean()
                 energies.append(residual)
         
         # Boltzmann weighting: P(z) ∝ exp(-β·E[z])
@@ -1295,7 +1450,7 @@ class DEQBrain(nn.Module):
         # Let each orbit find its preferred mode (ALL AT ONCE)
         for i in range(phase1_iters):
             # DEQ step with thermal noise (batched across all orbits)
-            delta_z = self.operator(z_batched, u_batched, mask_batched)
+            delta_z = self.operator(z_batched, u_batched, mask_batched, iteration=i)
             alpha = self.stabilizer(z_batched, u_batched)
             
             # Thermal fluctuations help choose mode
@@ -1311,7 +1466,7 @@ class DEQBrain(nn.Module):
             for g in range(num_orbits):
                 z_g = z_all[g]
                 u_g = u  # Original input
-                residual = (z_g - self.operator(z_g, u_g, mask)).norm(dim=-1).mean()
+                residual = (z_g - self.operator(z_g, u_g, mask, iteration=phase1_iters)).norm(dim=-1).mean()
                 orbit_energies.append(residual)
         
         if verbose:
@@ -1329,31 +1484,42 @@ class DEQBrain(nn.Module):
         convergence_threshold = 1e-3
         prev_residuals = torch.tensor(orbit_energies, device=device)
         
+        # RAYCAST STATS: Track how often tunneling actually happens (should be rare!)
+        tunnel_events = 0
+        tunnel_attempts = 0
+        
         # Batch all non-converged orbits together
         z_batched = z_all.reshape(num_orbits * B, T_seq, C)
         u_batched = u_expanded.reshape(num_orbits * B, T_seq, C)
+        
+        # Initialize i in case phase2_iters is 0 or loop exits early
+        i = -1
         
         for i in range(phase2_iters):
             iter_idx = phase1_iters + i
             temperature = temp_schedule[iter_idx].item()  # Use cached temperature!
             
             # Standard DEQ step (BATCHED)
-            delta_z = self.operator(z_batched, u_batched, mask_batched)
+            delta_z = self.operator(z_batched, u_batched, mask_batched, iteration=iter_idx)
             alpha = self.stabilizer(z_batched, u_batched)
             z_next = z_batched + alpha * delta_z
             
             # QUANTUM TUNNELING: If stuck, try jumping to another basin
+            # OPTIMIZED: "Raycast" approach - process orbits sequentially since tunneling is rare
             if self.config.enable_tunneling and i > 0:
                 with torch.no_grad():
                     # Reshape to compute per-orbit residuals
                     z_next_orbits = z_next.reshape(num_orbits, B, T_seq, C)
                     
+                    # RAYCAST OPTIMIZATION: Check each orbit sequentially
+                    # Since tunneling is rare, we avoid batching overhead
                     for g in range(num_orbits):
                         if converged[g]:
                             continue  # Skip converged orbits
                         
+                        # RAYCAST: Single orbit residual check
                         z_g = z_next_orbits[g]
-                        residual = (z_g - self.operator(z_g, u, mask)).norm(dim=-1).mean()
+                        residual = (z_g - self.operator(z_g, u, mask, iteration=iter_idx)).norm(dim=-1).mean()
                         
                         # EARLY STOPPING: Check convergence
                         if residual < convergence_threshold:
@@ -1363,21 +1529,53 @@ class DEQBrain(nn.Module):
                             continue
                         
                         # Stuck if residual not decreasing
+                        # QUANTUM RAYCAST: Fire multiple tunnel rays to explore wave function!
                         if residual > prev_residuals[g] * self.config.tunnel_threshold:
-                            # Attempt tunneling (instanton path)
-                            z_tunnel = u + 0.3 * torch.randn_like(u)
-                            E_tunnel = (z_tunnel - self.operator(z_tunnel, u, mask)).norm(dim=-1).mean()
+                            tunnel_attempts += 1
                             
-                            # Tunneling probability (Boltzmann factor)
-                            dE = E_tunnel - residual
+                            # QUANTUM WAVE FUNCTION: Sample multiple possible tunnel paths
+                            # Like Feynman path integral - explore the probability cloud!
+                            num_rays = self.config.num_tunnel_rays if hasattr(self.config, 'num_tunnel_rays') else 8
+                            
+                            tunnel_candidates = []
+                            tunnel_energies = []
+                            
+                            # Fire rays through quantum probability space
+                            for ray_idx in range(num_rays):
+                                # Each ray = possible instanton trajectory
+                                # Vary the tunnel "amplitude" for diversity
+                                amplitude = 0.2 + 0.3 * torch.rand(1, device=device).item()
+                                z_ray = u + amplitude * torch.randn_like(u)
+                                
+                                # Measure energy of this quantum state
+                                E_ray = (z_ray - self.operator(z_ray, u, mask, iteration=iter_idx)).norm(dim=-1).mean()
+                                
+                                tunnel_candidates.append(z_ray)
+                                tunnel_energies.append(E_ray)
+                            
+                            # WAVE FUNCTION COLLAPSE: Choose based on Boltzmann statistics
+                            # Lower energy = higher probability (quantum ground state seeking)
+                            energies_tensor = torch.stack(tunnel_energies)
+                            
+                            # Find best ray (minimum energy in the probability cloud)
+                            best_ray_idx = energies_tensor.argmin()
+                            best_energy = tunnel_energies[best_ray_idx]
+                            
+                            # Tunneling probability (compare best ray to current state)
+                            dE = best_energy - residual
                             P_tunnel = torch.exp(-dE / (temperature + 1e-8))
                             
-                            if torch.rand(1, device=device) < P_tunnel:
-                                # Tunnel! Update in batched tensor
-                                z_next_orbits[g] = z_tunnel
+                            # MEASUREMENT/COLLAPSE: Accept if energetically favorable
+                            if best_energy < residual * 0.95 or torch.rand(1, device=device) < P_tunnel:
+                                # WAVE FUNCTION COLLAPSED! Jump to best quantum state
+                                z_next_orbits[g] = tunnel_candidates[best_ray_idx]
+                                tunnel_events += 1
                                 if verbose:
-                                    print(f"[Quantum] Orbit {g} tunneled at iter {i}")
+                                    energy_spread = energies_tensor.std().item()
+                                    print(f"[Quantum] Orbit {g} tunneled via {num_rays} rays: "
+                                          f"E={best_energy:.3e} (spread={energy_spread:.3e}, P={P_tunnel:.3f})")
                         
+                        # Update residual tracker
                         prev_residuals[g] = residual
                     
                     # Update batched tensor
@@ -1395,17 +1593,23 @@ class DEQBrain(nn.Module):
         # Reshape back to separate orbits
         z_all = z_batched.reshape(num_orbits, B, T_seq, C)
         
+        # Count actual iterations used (including early stopping)
+        # i is -1 if loop never ran, otherwise it's the last iteration index
+        phase2_completed = i + 1 if i >= 0 else 0
+        actual_iters = phase1_iters + (phase2_iters if not converged.all() else phase2_completed)
+        
         # Update energies
         with torch.no_grad():
             orbit_energies = []
             for g in range(num_orbits):
                 z_g = z_all[g]
-                final_residual = (z_g - self.operator(z_g, u, mask)).norm(dim=-1).mean()
+                final_residual = (z_g - self.operator(z_g, u, mask, iteration=actual_iters)).norm(dim=-1).mean()
                 orbit_energies.append(final_residual)
         
         if verbose:
             print(f"[Quantum] Phase 2 energies: {[f'{e:.3e}' for e in orbit_energies]}")
             print(f"[Quantum] Converged orbits: {converged.sum().item()}/{num_orbits}")
+            print(f"[Quantum] Tunnel stats: {tunnel_events} events / {tunnel_attempts} attempts ({100*tunnel_events/(tunnel_attempts+1e-8):.1f}%)")
         
         # ==========================================
         # PHASE 3: PATH INTEGRAL ENSEMBLE AVERAGE
@@ -1432,9 +1636,6 @@ class DEQBrain(nn.Module):
             z_var += weights[g] * (z_all[g] - z_star).pow(2)
         uncertainty = z_var.mean().sqrt().item()
         
-        # Count actual iterations used (including early stopping)
-        actual_iters = phase1_iters + (phase2_iters if not converged.all() else i+1)
-        
         metrics = {
             'num_iters': actual_iters,
             'num_orbits': num_orbits,
@@ -1445,6 +1646,8 @@ class DEQBrain(nn.Module):
             'uncertainty': uncertainty,
             'final_residual': energies_tensor.min().item(),
             'converged_orbits': converged.sum().item(),
+            'tunnel_events': tunnel_events,
+            'tunnel_attempts': tunnel_attempts,
         }
         
         return self.ln_f(z_star), actual_iters, metrics
@@ -1484,7 +1687,7 @@ class DEQBrain(nn.Module):
             T = T_init * (T_final / T_init) ** (i / max_iter)
             
             # DEQ update
-            delta_z = self.operator(z, u, mask)
+            delta_z = self.operator(z, u, mask, iteration=i)
             alpha = self.stabilizer(z, u)
             
             # Add thermal noise (decreases with temperature)
@@ -1498,7 +1701,7 @@ class DEQBrain(nn.Module):
             
             # Track energy (residual)
             with torch.no_grad():
-                energy = (z - self.operator(z, u, mask)).norm(dim=-1).mean().item()
+                energy = (z - self.operator(z, u, mask, iteration=i)).norm(dim=-1).mean().item()
                 energy_history.append(energy)
                 
                 if verbose and (i + 1) % 5 == 0:
@@ -1755,6 +1958,7 @@ class GrayBoxConfig:
     refinement_iters: int = 5  # Late iters to converge within mode
     enable_tunneling: bool = True  # Allow jumps between basins
     tunnel_threshold: float = 0.9  # Tunnel if stuck (residual ratio > this)
+    num_tunnel_rays: int = 8  # Fire multiple rays to sample quantum probability cloud
     temperature_schedule: str = "exponential"  # "exponential", "linear", "constant"
     T_init: float = 0.5  # Initial exploration temperature
     T_final: float = 0.01  # Final convergence temperature
@@ -1826,17 +2030,26 @@ class GrayBoxDEQ(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, idx, targets=None, effort=1.0, return_metrics=False):
+    def forward(self, idx, targets=None, effort=1.0, return_metrics=False, training_iter=None):
         """
         idx: [B, T] token indices
         targets: [B, T] target tokens (for training)
         effort: thinking depth multiplier
         return_metrics: if True, return (logits, loss, metrics), else (logits, loss)
+        training_iter: optional training iteration number (for curriculum/phase-aware learning)
+                       During inference, this is None. The model's position in semantic space
+                       is already captured by the chaos score (distance to fractal basin boundaries).
         
         Returns: (logits, loss) or (logits, loss, metrics) depending on return_metrics
         """
         B, T = idx.shape
         device = idx.device
+        
+        # Store training iteration for potential use in curriculum learning
+        # NOTE: The chaos score already measures our position on the Newton fractal basin boundaries,
+        # so this is redundant for most physics-based dynamics. Useful for explicit phase transitions.
+        if training_iter is not None:
+            self.current_training_iter = training_iter
         
         # Causal mask (on same device as input)
         mask = torch.triu(torch.ones(T, T, dtype=torch.float32, device=device), diagonal=1)
@@ -1893,9 +2106,9 @@ class GrayBoxDEQ(nn.Module):
                     eps = 1e-3
                     z_pert = z_star + eps * torch.randn_like(z_star)
                     
-                    # Compute operator output at perturbed point
-                    delta_pert = self.deq.operator(z_pert, u, mask)
-                    delta_star = self.deq.operator(z_star.detach(), u, mask)
+                    # Compute operator output at perturbed point (use final iteration)
+                    delta_pert = self.deq.operator(z_pert, u, mask, iteration=num_iters)
+                    delta_star = self.deq.operator(z_star.detach(), u, mask, iteration=num_iters)
                     
                     # Approximate ||∂f/∂z||_F ≈ ||Δf||_F / ||Δz||_F
                     jacobian_norm = (delta_pert - delta_star).norm() / (eps + 1e-12)

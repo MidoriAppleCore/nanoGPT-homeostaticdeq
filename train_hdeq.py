@@ -20,7 +20,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 # Import from model_graybox instead of model
-from model_hdeq import GPTConfig, GPT
+from model_hdeq import GPTConfig, GPT, compute_pauli_exclusion_loss, HamiltonianOperator, DEQOperator
 
 # Homeostatic monitoring system
 from homeostatic_monitor import HomeostaticMonitor
@@ -62,26 +62,33 @@ n_embd = 384
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = True # do we use bias inside LayerNorm and Linear layers?
 # DEQ-specific parameters
-deq_max_iter = 30
+deq_max_iter = 100  # INCREASED: Allow stable system time to reach res < 1e-3 (Profound Fix)
 deq_tol = 1e-3
 anderson_accel = True
-spectral_norm = False  # Disabled for now (device placement issues)
+spectral_norm = True  # Disabled for now (device placement issues)
 
 # Hamiltonian Dynamics (energy-conserving symplectic integrator)
-hamiltonian = False  # Use Hamiltonian operator instead of dissipative DEQ
+hamiltonian = True  # Use Hamiltonian operator instead of dissipative DEQ
 
 # Unified Quantum Solver (combines multiple physics concepts)
-quantum_solver = False  # Enable unified quantum-inspired solving
+quantum_solver = True  # Enable unified quantum-inspired solving
 
 # Quantum solver parameters (when quantum_solver=True)
 num_gauge_orbits = 3
 symmetry_breaking_iters = 3
-refinement_iters = 5
+refinement_iters = 15  # INCREASED: Need more iters to actually converge (was 5)
 enable_tunneling = True
 tunnel_threshold = 0.95
+num_tunnel_rays = 32  # Sample quantum probability cloud (more rays = better statistics)
 temperature_schedule = "exponential"
-T_init = 0.5
+T_init = 0.1
 T_final = 0.01
+
+# Pauli Exclusion (Anti-Stuttering Force)
+lambda_pauli = 2.0  # Weight for repetition penalty (0.0 = disabled, 2.0 = strong)
+
+# Algorithmic Efficiency Loss (DISABLED - contradicts giving more iterations!)
+lambda_efficiency = 0.0  # Weight for iteration count penalty (DISABLED for stability testing)
 
 # adamw optimizer
 learning_rate = 1e-3 # max learning rate
@@ -183,6 +190,7 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   refinement_iters=refinement_iters,
                   enable_tunneling=enable_tunneling,
                   tunnel_threshold=tunnel_threshold,
+                  num_tunnel_rays=num_tunnel_rays,
                   temperature_schedule=temperature_schedule,
                   T_init=T_init, T_final=T_final)
 if init_from == 'scratch':
@@ -260,7 +268,7 @@ def estimate_loss():
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
+                logits, loss = model(X, Y, training_iter=iter_num)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
@@ -449,37 +457,54 @@ def get_chaos_aware_lr(it, metrics, base_lr):
     dynamical state of the system, preventing explosions in chaotic regions
     and accelerating in stable basins.
     
+    CRITICAL FIX: This function now RESPECTS the normal LR schedule (warmup/decay)
+    by calling get_lr() first, then applying chaos as a multiplicative modifier.
+    This ensures warmup happens correctly and chaos is a local tweak, not a replacement.
+    
     Args:
         it: Current iteration number
         metrics: Dictionary containing DEQ convergence diagnostics:
             - 'num_iters': How many fixed-point iterations were needed
             - 'final_residual': How far from equilibrium (||f(z) - z||)
-        base_lr: The base learning rate (before chaos adjustment)
+        base_lr: The base learning rate (passed to get_lr for schedule)
     
     Returns:
-        Throttled learning rate that responds to system stability
+        Scheduled LR with chaos-based multiplicative adjustment
     """
-    # 1. Standard Warmup/Decay (The Baseline Schedule)
-    if it < warmup_iters:
-        lr = base_lr * (it + 1) / (warmup_iters + 1)
-    elif it > lr_decay_iters:
-        lr = min_lr
-    else:
-        decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-        lr = min_lr + coeff * (base_lr - min_lr)
+    # 1. FIRST: Compute the normal scheduled LR (warmup + cosine decay)
+    # This is the SOURCE OF TRUTH for the learning rate trajectory
+    lr = get_lr(it)
     
-    # 2. THE CHAOS FACTOR (Lyapunov-Guided Throttle)
-    # If the model is struggling, we cut the LR to prevent spectral explosion.
+    # 2. THEN: Apply chaos as a multiplicative modifier on that scheduled LR
+    # The chaos throttle adjusts the already-scheduled LR, not the base LR
     
     # Stress Signal 1: Thinking too hard (hitting max iters)
     # Normalized to deq_max_iter (typically 30)
     stress_iters = min(1.0, metrics.get('num_iters', 0) / deq_max_iter)
     
     # Stress Signal 2: High Residual (Energy not conserved/minimized)
-    # Residuals > 1e-2 imply the fixed point was not found
+    # Use LOGARITHMIC scale to distinguish orders of magnitude
+    # RECALIBRATED for quantum solver (which explores before converging)
+    # - Residual 100.0: Initialization chaos, explosive
+    # - Residual 10.0: Early exploration, very high
+    # - Residual 1.0: Mid exploration, acceptable
+    # - Residual 0.1: Converging well
+    # - Residual 1e-2 (0.01): Locked in
+    # - Residual 1e-3 (0.001): Perfect equilibrium
     raw_res = metrics.get('final_residual', 0.0)
-    stress_residual = min(1.0, raw_res * 100.0)  # Scale to [0, 1]
+    if raw_res > 0:
+        # Map log10(residual) from [-3, +2] to [0, 1]
+        # log10(1e-3) = -3 -> 0.0 (Zen - perfect)
+        # log10(0.01) = -2 -> 0.2 (Excellent)
+        # log10(0.1) = -1 -> 0.4 (Good)
+        # log10(1.0) = 0 -> 0.6 (Exploring)
+        # log10(10.0) = +1 -> 0.8 (High exploration)
+        # log10(100.0) = +2 -> 1.0 (Panic - explosive)
+        log_res = math.log10(max(raw_res, 1e-4))  # Clamp to avoid log(0)
+        stress_residual = (log_res + 3.0) / 5.0  # Map [-3, +2] to [0, 1]
+        stress_residual = max(0.0, min(1.0, stress_residual))  # Clamp to [0, 1]
+    else:
+        stress_residual = 0.0
     
     # Combined Chaos Score (0.0 = Zen, 1.0 = Panic)
     chaos_score = max(stress_iters, stress_residual)
@@ -490,6 +515,14 @@ def get_chaos_aware_lr(it, metrics, base_lr):
     throttle = 1.0 - max(0, (chaos_score - 0.2) / 0.8)
     throttle = max(0.1, throttle)  # Never stop completely, but slow down 10x
     
+    # REMOVED: Early training override (no longer needed with recalibrated chaos sensor)
+    # The new residual scale (log10 mapped from [-3, +1]) handles explosive init correctly:
+    # - res = 10.0 → chaos = 1.0 → throttle = 0.1× (prevent explosion)
+    # - res = 1.0 → chaos = 0.75 → throttle = 0.4× (gentle descent)
+    # - res = 0.1 → chaos = 0.5 → throttle = 0.7× (converging)
+    # This allows homeostatic feedback FROM STEP 0, keeping the marble on the fractal edge.
+    
+    # Apply the chaos throttle to the SCHEDULED lr, not base_lr
     return lr * throttle
 
 # logging
@@ -499,6 +532,9 @@ if wandb_log and master_process:
 
 # Initialize Homeostatic Monitor
 monitor = HomeostaticMonitor(out_dir) if master_process else None
+
+# Adaptive min_lr to prevent training stagnation
+lr_plateau = {'min_lr': min_lr, 'plateau_counter': 0, 'last_loss': 1e9}
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
@@ -586,7 +622,28 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss, metrics = model(X, Y, return_metrics=True)
+            logits, loss, metrics = model(X, Y, return_metrics=True, training_iter=iter_num)
+            
+            # Add Pauli Exclusion loss (anti-stuttering force)
+            # This is the NOVELTY/EXPLORATION DRIVE (ℂ) - the computational boredom signal
+            pauli_loss = 0.0
+            if lambda_pauli > 0:
+                pauli_loss = compute_pauli_exclusion_loss(logits, Y)
+                loss = loss + lambda_pauli * pauli_loss
+            
+            # ALGORITHMIC EFFICIENCY LOSS: Penalize long thinking
+            # Forces the model to learn the FASTEST trajectory to the answer
+            # This creates intrinsic motivation for computational efficiency
+            efficiency_loss = 0.0
+            if lambda_efficiency > 0:
+                num_iters = metrics.get('num_iters', 0)
+                efficiency_loss = lambda_efficiency * num_iters
+                loss = loss + efficiency_loss
+            
+            # Store for homeostatic monitoring (Free Energy Principle)
+            metrics['novelty_drive'] = pauli_loss.item() if isinstance(pauli_loss, torch.Tensor) else pauli_loss
+            metrics['efficiency_cost'] = efficiency_loss.item() if isinstance(efficiency_loss, torch.Tensor) else efficiency_loss
+            
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
@@ -613,15 +670,58 @@ while True:
     # Save metrics for next iteration's chaos-aware LR adjustment
     prev_metrics = {
         'num_iters': metrics.get('num_iters', 0),
-        'final_residual': metrics.get('final_residual', 0.0)
+        'final_residual': metrics.get('final_residual', 0.0),
+        'novelty_drive': metrics.get('novelty_drive', 0.0)  # ℂ: Boredom/Curiosity signal
     }
     
-    # Calculate chaos score components for logging
+    # Calculate chaos score components for logging (MUST MATCH get_chaos_aware_lr formula!)
     stress_iters = min(1.0, prev_metrics['num_iters'] / deq_max_iter)
-    stress_residual = min(1.0, prev_metrics['final_residual'] * 100.0)
+    # Use logarithmic scale for residual - UPDATED to match quantum solver range
+    raw_res = prev_metrics['final_residual']
+    if raw_res > 0:
+        log_res = math.log10(max(raw_res, 1e-4))
+        stress_residual = (log_res + 3.0) / 5.0  # Map [-3, +2] to [0, 1] (quantum scale)
+        stress_residual = max(0.0, min(1.0, stress_residual))
+    else:
+        stress_residual = 0.0
     chaos_score = max(stress_iters, stress_residual)
     throttle = 1.0 - max(0, (chaos_score - 0.2) / 0.8)
     throttle = max(0.1, throttle)
+    
+    # HOMEOSTATIC ADAPTIVE FRICTION: Update Hamiltonian friction based on Chaos Score
+    # This makes the damping self-regulate: High chaos → High γ → Aggressive damping
+
+    # HOMEOSTATIC ADAPTIVE FRICTION: Update Hamiltonian friction based on Chaos Score
+    # This makes the damping self-regulate: High chaos → High γ → Aggressive damping
+    if hasattr(raw_model, 'deq') and hasattr(raw_model.deq, 'operator'):
+        if hasattr(raw_model.deq.operator, 'update_friction'):
+            gamma_current = raw_model.deq.operator.update_friction(chaos_score)
+            # Only log occasionally to avoid spam
+            if iter_num % (log_interval * 10) == 0:
+                print(f"[Homeostatic] γ(chaos={chaos_score:.3f}) = {gamma_current:.4f}")
+    
+    # Adaptive minimum LR to prevent training stagnation
+    # If loss plateaus for too long, raise min_lr to escape local minima
+    if iter_num % 100 == 0 and iter_num > warmup_iters:  # Check every 100 iters after warmup
+        current_loss = loss.item() * gradient_accumulation_steps if 'loss' in locals() else lr_plateau['last_loss']
+        loss_improvement = lr_plateau['last_loss'] - current_loss
+        
+        # Plateau detection: loss not improving by at least 0.1%
+        if abs(loss_improvement) < 0.001 * lr_plateau['last_loss']:
+            lr_plateau['plateau_counter'] += 1
+            if lr_plateau['plateau_counter'] >= 5:  # 500 iters of plateau
+                # Raise min_lr by 50%
+                old_min_lr = lr_plateau['min_lr']
+                lr_plateau['min_lr'] = min(lr_plateau['min_lr'] * 1.5, learning_rate * 0.1)  # Cap at 10% of base LR
+                print(f"[LR Plateau] Loss stagnant! Raising min_lr: {old_min_lr:.2e} → {lr_plateau['min_lr']:.2e}")
+                lr_plateau['plateau_counter'] = 0  # Reset counter
+        else:
+            lr_plateau['plateau_counter'] = max(0, lr_plateau['plateau_counter'] - 1)  # Decay counter
+        
+        lr_plateau['last_loss'] = current_loss
+    
+    # Apply adaptive min_lr (override the static min_lr)
+    lr = max(lr, lr_plateau['min_lr'])
     
     # Log to homeostatic monitor
     if monitor:
@@ -645,7 +745,15 @@ while True:
         if monitor:
             monitor.log_loss(iter_num, lossf)
         
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {time_ms:.2f}ms, mfu {running_mfu*100:.2f}%, deq_iters={deq_iters}, lr={lr:.2e}, chaos={chaos_score:.3f}")
+        # Show both raw residual and log-scaled chaos for transparency
+        raw_residual = prev_metrics.get('final_residual', 0.0)
+        novelty_drive = prev_metrics.get('novelty_drive', 0.0)
+        
+        # CHAOS BREAKDOWN: Show what's actually driving the chaos score
+        chaos_breakdown = f"[σ_iter={stress_iters:.2f}, σ_res={stress_residual:.2f}]"
+        
+        # Log line with NOVELTY/EXPLORATION DRIVE (ℂ) and chaos breakdown
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {time_ms:.2f}ms, mfu {running_mfu*100:.2f}%, deq_iters={deq_iters}, lr={lr:.2e}, chaos={chaos_score:.3f}{chaos_breakdown}, res={raw_residual:.2e}, ℂ={novelty_drive:.3e}")
         
         # [PHYSICS PROBE] Inspect Semantic Mass Matrix (every 1000 iters)
         if iter_num % 1000 == 0 and iter_num > 0 and hamiltonian:

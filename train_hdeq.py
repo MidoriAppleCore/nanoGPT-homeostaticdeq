@@ -22,6 +22,17 @@ from torch.distributed import init_process_group, destroy_process_group
 # Import from model_graybox instead of model
 from model_hdeq import GPTConfig, GPT
 
+# For phase space visualization
+try:
+    import matplotlib
+    matplotlib.use('Agg')  # Non-interactive backend
+    import matplotlib.pyplot as plt
+    from sklearn.decomposition import PCA
+    VISUALIZATION_AVAILABLE = True
+except ImportError:
+    VISUALIZATION_AVAILABLE = False
+    print("⚠️  matplotlib/sklearn not available - phase space visualization disabled")
+
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
@@ -270,20 +281,146 @@ def generate_samples():
     print("SAMPLE GENERATIONS")
     print("="*70)
     
-    # Sample 1: Shakespeare-style (conditioned on newline)
-    start_ids = [meta['stoi']['\n']] if os.path.exists(meta_path) else [0]
+    # Sample 1: Conditioned on newline token (198 in GPT-2)
+    # For TinyStories, use a simple prompt
+    if os.path.exists(meta_path):
+        # Use newline token ID 198 for GPT-2 tokenizer
+        start_ids = [198]  # newline in GPT-2
+    else:
+        start_ids = [0]
+    
     x = torch.tensor([start_ids], dtype=torch.long, device=device)
     y = model.generate(x, max_new_tokens=200, temperature=0.8, top_k=200, effort=1.0)
-    print("\n[Shakespeare-style generation]")
+    print("\n[Conditioned generation]")
     print(decode(y[0].tolist()))
     
-    # Sample 2: Unconditional (random start)
-    x = torch.randint(0, model.config.vocab_size, (1, 1), device=device)
+    # Sample 2: Short prompt
+    if os.path.exists(meta_path):
+        # "Once upon a time" = [7454, 2402, 257, 640]
+        start_ids = [7454, 2402, 257, 640]
+    else:
+        start_ids = [1, 2, 3]
+    
+    x = torch.tensor([start_ids], dtype=torch.long, device=device)
     y = model.generate(x, max_new_tokens=200, temperature=0.8, top_k=200, effort=1.0)
-    print("\n[Unconditional generation]")
+    print("\n[Story generation]")
     print(decode(y[0].tolist()))
     
     print("="*70 + "\n")
+    model.train()
+
+def visualize_phase_space(iter_num):
+    """Generate phase space visualization of DEQ trajectories"""
+    if not VISUALIZATION_AVAILABLE:
+        return
+    
+    model.eval()
+    
+    # Capture DEQ trajectories by monkey-patching
+    trajectories = []
+    original_solve = model.deq.solve
+    
+    def captured_solve(u, mask=None, effort=1.0, verbose=False):
+        B, T, C = u.shape
+        z = u.clone()
+        z_prev = None
+        batch_traj = []
+        
+        max_iter = model.config.deq_max_iter
+        tol = model.config.deq_tol
+        gamma = 1.0
+        
+        for i in range(max_iter):
+            batch_traj.append(z.detach().cpu())
+            delta_z = model.deq.operator(z, u, mask)
+            alpha = model.deq.stabilizer(z, u)
+            z_next = z + gamma * alpha * delta_z
+            z_next = model.deq.laws.semantic_continuity(z_next, z_prev)
+            z_prev = z
+            z = z_next
+            
+            if i > 0:
+                diff = (z - batch_traj[-1].to(z.device)).abs().max()
+                if i > 3 and diff < tol:
+                    break
+        
+        trajectories.append(torch.stack(batch_traj))
+        return model.deq.ln_f(z), i+1, {}
+    
+    # Apply patch and run inference
+    model.deq.solve = captured_solve
+    
+    # Simple prompt - just use a few common tokens
+    # Token 198 = newline, 262 = "the", 257 = "a"
+    start_ids = [262, 257]  # "the a" - simple and safe
+    x = torch.tensor([start_ids], dtype=torch.long, device=device)
+    
+    with torch.no_grad():
+        model(x)
+    
+    # Restore original
+    model.deq.solve = original_solve
+    
+    if len(trajectories) == 0:
+        model.train()
+        return
+    
+    # Extract trajectories
+    traj = trajectories[0][:, 0, -1, :].numpy()  # Last token
+    traj_start = trajectories[0][:, 0, 0, :].numpy()  # First token
+    
+    # PCA projection
+    pca = PCA(n_components=2)
+    combined = np.concatenate([traj, traj_start], axis=0)
+    pca.fit(combined)
+    traj_2d = pca.transform(traj)
+    start_2d = pca.transform(traj_start)
+    
+    # Plot
+    plt.figure(figsize=(10, 8))
+    plt.style.use('dark_background')
+    
+    plt.plot(traj_2d[:, 0], traj_2d[:, 1], 'r-', linewidth=2, label='Last Token Trajectory')
+    plt.scatter(traj_2d[0, 0], traj_2d[0, 1], c='white', marker='o', s=100, label='Start', zorder=5)
+    plt.scatter(traj_2d[-1, 0], traj_2d[-1, 1], c='red', marker='*', s=300, label='Equilibrium', zorder=5)
+    
+    plt.plot(start_2d[:, 0], start_2d[:, 1], 'b--', alpha=0.5, linewidth=1.5, label='First Token (Control)')
+    plt.scatter(start_2d[-1, 0], start_2d[-1, 1], c='blue', marker='x', s=150, zorder=5)
+    
+    # Arrows for first few iterations
+    for i in range(min(len(traj_2d)-1, 10)):
+        dx = traj_2d[i+1,0] - traj_2d[i,0]
+        dy = traj_2d[i+1,1] - traj_2d[i,1]
+        plt.arrow(traj_2d[i,0], traj_2d[i,1], dx*0.7, dy*0.7,
+                 head_width=0.05, head_length=0.05, fc='red', ec='red', alpha=0.6, zorder=3)
+    
+    # Diagnostics
+    center = traj_2d.mean(axis=0)
+    radii = np.linalg.norm(traj_2d - center, axis=1)
+    radius_trend = np.polyfit(range(len(radii)), radii, 1)[0]
+    
+    if abs(radius_trend) < 0.01:
+        dynamics_type = "ORBITAL (Hamiltonian)"
+    elif radius_trend < -0.01:
+        dynamics_type = "SPIRAL (Dissipative)"
+    else:
+        dynamics_type = "DIVERGING"
+    
+    plt.title(f'Phase Space @ Iter {iter_num}\nDynamics: {dynamics_type} | DEQ Iters: {len(traj)}', fontsize=14)
+    plt.xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%})', fontsize=11)
+    plt.ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%})', fontsize=11)
+    plt.legend(loc='best', fontsize=9)
+    plt.grid(True, alpha=0.2)
+    plt.tight_layout()
+    
+    # Save to reports
+    phase_dir = os.path.join(out_dir, 'reports', 'phase_space')
+    os.makedirs(phase_dir, exist_ok=True)
+    output_path = os.path.join(phase_dir, f'phase_iter_{iter_num:06d}.png')
+    plt.savefig(output_path, dpi=200, bbox_inches='tight')
+    plt.close()
+    
+    print(f"  📊 Phase space saved: {output_path} ({dynamics_type})")
     model.train()
 
 # learning rate decay scheduler (cosine with warmup)
@@ -299,6 +436,58 @@ def get_lr(it):
     assert 0 <= decay_ratio <= 1
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
+
+# Lyapunov-Guided Optimization: Chaos-Aware Learning Rate
+def get_chaos_aware_lr(it, metrics, base_lr):
+    """
+    Adjusts Learning Rate based on the model's physiological stress.
+    
+    This is **Homeostatic Optimization**: the learning rate responds to the
+    dynamical state of the system, preventing explosions in chaotic regions
+    and accelerating in stable basins.
+    
+    Args:
+        it: Current iteration number
+        metrics: Dictionary containing DEQ convergence diagnostics:
+            - 'num_iters': How many fixed-point iterations were needed
+            - 'final_residual': How far from equilibrium (||f(z) - z||)
+        base_lr: The base learning rate (before chaos adjustment)
+    
+    Returns:
+        Throttled learning rate that responds to system stability
+    """
+    # 1. Standard Warmup/Decay (The Baseline Schedule)
+    if it < warmup_iters:
+        lr = base_lr * (it + 1) / (warmup_iters + 1)
+    elif it > lr_decay_iters:
+        lr = min_lr
+    else:
+        decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        lr = min_lr + coeff * (base_lr - min_lr)
+    
+    # 2. THE CHAOS FACTOR (Lyapunov-Guided Throttle)
+    # If the model is struggling, we cut the LR to prevent spectral explosion.
+    
+    # Stress Signal 1: Thinking too hard (hitting max iters)
+    # Normalized to deq_max_iter (typically 30)
+    stress_iters = min(1.0, metrics.get('num_iters', 0) / deq_max_iter)
+    
+    # Stress Signal 2: High Residual (Energy not conserved/minimized)
+    # Residuals > 1e-2 imply the fixed point was not found
+    raw_res = metrics.get('final_residual', 0.0)
+    stress_residual = min(1.0, raw_res * 100.0)  # Scale to [0, 1]
+    
+    # Combined Chaos Score (0.0 = Zen, 1.0 = Panic)
+    chaos_score = max(stress_iters, stress_residual)
+    
+    # The Valve: If chaos is high, throttle the LR
+    # If chaos > 0.8, LR drops to 10%. If chaos < 0.2, LR is 100%.
+    # This prevents "driving into corners at full speed"
+    throttle = 1.0 - max(0, (chaos_score - 0.2) / 0.8)
+    throttle = max(0.1, throttle)  # Never stop completely, but slow down 10x
+    
+    return lr * throttle
 
 # logging
 if wandb_log and master_process:
@@ -321,10 +510,19 @@ if master_process and not os.path.exists(metrics_csv):
     with open(metrics_csv, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['iter','loss','time_ms_synced','mfu_percent','deq_iters','timestamp'])
+
+# Track previous metrics for chaos-aware LR
+prev_metrics = {'num_iters': 0, 'final_residual': 0.0}
+
 while True:
 
     # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
+    # Use Lyapunov-guided (chaos-aware) LR if we have metrics from previous step
+    if decay_lr and iter_num > 0:
+        lr = get_chaos_aware_lr(iter_num, prev_metrics, learning_rate)
+    else:
+        lr = get_lr(iter_num) if decay_lr else learning_rate
+    
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
@@ -335,6 +533,9 @@ while True:
         
         # Generate samples to see model progress
         generate_samples()
+        
+        # Visualize phase space dynamics (every eval)
+        visualize_phase_space(iter_num)
         
         if wandb_log:
             wandb.log({
@@ -393,6 +594,13 @@ while True:
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
+    
+    # Save metrics for next iteration's chaos-aware LR adjustment
+    prev_metrics = {
+        'num_iters': metrics.get('num_iters', 0),
+        'final_residual': metrics.get('final_residual', 0.0)
+    }
+    
     if iter_num % log_interval == 0 and master_process:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
@@ -402,7 +610,13 @@ while True:
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         deq_iters = metrics.get('num_iters', 0)
         time_ms = dt * 1000.0
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {time_ms:.2f}ms, mfu {running_mfu*100:.2f}%, deq_iters={deq_iters}")
+        
+        # Calculate chaos score for display
+        stress_iters = min(1.0, deq_iters / deq_max_iter)
+        stress_residual = min(1.0, prev_metrics['final_residual'] * 100.0)
+        chaos_score = max(stress_iters, stress_residual)
+        
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {time_ms:.2f}ms, mfu {running_mfu*100:.2f}%, deq_iters={deq_iters}, lr={lr:.2e}, chaos={chaos_score:.3f}")
         # append to CSV for later plotting/analysis
         if master_process:
             try:

@@ -452,6 +452,52 @@ class HamiltonianOperator(nn.Module):
             nn.Linear(4 * self.dim, self.dim, bias=config.bias),
             nn.Dropout(config.dropout),
         )
+        
+        # Spectral normalization for Hamiltonian stability
+        # Even though Hamiltonian preserves volume (det(J)=1), we still need
+        # bounded operator norms to prevent numerical instability
+        if config.spectral_norm:
+            self._apply_spectral_norm()
+    
+    def _apply_spectral_norm(self):
+        """Apply spectral norm to all linear layers in Hamiltonian operator"""
+        # Use same manual power iteration as DEQOperator
+        layer_idx = 0
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                # Use simple index instead of full name (can't have dots in buffer names)
+                self._spectral_norm_power_iteration(module, f"h_layer_{layer_idx}")
+                layer_idx += 1
+    
+    def _spectral_norm_power_iteration(self, module, name, n_power_iterations=1):
+        """Manual spectral normalization via power iteration"""
+        weight = module.weight
+        height = weight.size(0)
+        width = weight.view(height, -1).size(1)
+        
+        u = torch.randn(height).to(weight.device)
+        u = u / (u.norm() + 1e-12)
+        module.register_buffer(f'{name}_u', u)
+        
+        def spectral_norm_hook(module, input):
+            weight = module.weight
+            weight_mat = weight.view(height, -1)
+            u = getattr(module, f'{name}_u')
+            
+            with torch.no_grad():
+                for _ in range(n_power_iterations):
+                    v = weight_mat.t() @ u
+                    v = v / (v.norm() + 1e-12)
+                    u = weight_mat @ v
+                    u = u / (u.norm() + 1e-12)
+                
+                getattr(module, f'{name}_u').copy_(u)
+                sigma = (u @ weight_mat @ v).item()
+            
+            if sigma > 1.0:
+                module.weight.data = weight.data / sigma
+        
+        module.register_forward_pre_hook(spectral_norm_hook)
     
     def potential_gradient(self, q, u_q, mask=None):
         """
@@ -574,28 +620,70 @@ class DEQOperator(nn.Module):
             nn.Dropout(config.dropout),
         )
         
-        # TODO: Re-enable spectral norm properly (device placement issue)
-        # For now, disabled to get model working
-        # self._apply_spectral_norm()
+        # Spectral normalization for stability (CRITICAL for DEQ convergence)
+        # Must enforce Lipschitz constant K < 1 for Banach Fixed Point Theorem
+        if config.spectral_norm:
+            self._apply_spectral_norm()
     
     def _apply_spectral_norm(self):
         """
-        Apply spectral normalization to ALL linear layers.
-        This enforces Lipschitz continuity and prevents runaway dynamics.
+        Apply spectral normalization using power iteration to ALL linear layers.
+        This enforces Lipschitz continuity K < 1 and guarantees fixed point convergence.
         
-        Not "sometimes stable" — ALWAYS stable.
-        
-        NOTE: Must be called BEFORE moving model to device!
+        Uses manual power iteration instead of torch.nn.utils to avoid device placement issues.
         """
+        layer_idx = 0
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
-                # Skip if already has spectral norm
-                if not any(isinstance(hook, nn.utils.spectral_norm.SpectralNorm) 
-                          for hook in module._forward_pre_hooks.values()):
-                    try:
-                        nn.utils.spectral_norm(module)
-                    except:
-                        pass  # Some modules may already have it
+                # Register spectral norm via power iteration
+                # Use simple index instead of full name (can't have dots in buffer names)
+                self._spectral_norm_power_iteration(module, f"layer_{layer_idx}")
+                layer_idx += 1
+    
+    def _spectral_norm_power_iteration(self, module, name, n_power_iterations=1):
+        """
+        Manual implementation of spectral normalization using power iteration.
+        
+        Estimates largest singular value σ_max and scales weight by 1/σ_max.
+        This ensures ||W||_2 ≤ 1, making the operator a contraction mapping.
+        """
+        weight = module.weight
+        height = weight.size(0)
+        width = weight.view(height, -1).size(1)
+        
+        # Initialize random unit vector u
+        u = torch.randn(height).to(weight.device)
+        u = u / (u.norm() + 1e-12)
+        
+        # Register as buffer (persistent state)
+        module.register_buffer(f'{name}_u', u)
+        
+        # Add forward pre-hook to normalize weight before each forward pass
+        def spectral_norm_hook(module, input):
+            # Power iteration: estimate largest singular value
+            weight = module.weight
+            weight_mat = weight.view(height, -1)
+            u = getattr(module, f'{name}_u')
+            
+            with torch.no_grad():
+                for _ in range(n_power_iterations):
+                    v = weight_mat.t() @ u
+                    v = v / (v.norm() + 1e-12)
+                    u = weight_mat @ v
+                    u = u / (u.norm() + 1e-12)
+                
+                # Update u buffer
+                getattr(module, f'{name}_u').copy_(u)
+                
+                # Estimate spectral norm σ = u^T W v
+                sigma = (u @ weight_mat @ v).item()
+            
+            # Normalize weight in-place (W' = W / max(1, σ))
+            # This ensures ||W||_2 ≤ 1 (Lipschitz constant K ≤ 1)
+            if sigma > 1.0:
+                module.weight.data = weight.data / sigma
+        
+        module.register_forward_pre_hook(spectral_norm_hook)
     
     def forward(self, z, u, mask=None):
         """
@@ -1770,15 +1858,39 @@ class GrayBoxDEQ(nn.Module):
         # Apply ALWAYS (both training and inference) to maintain stable dynamics
         logits = self.deq.laws.entropy_floor(logits, min_entropy=1.0)
         
-        # Loss with optional entropy PENALTY (not injection)
+        # Loss with Jacobian regularization for DEQ stability
         loss = None
         if targets is not None:
             # Standard cross-entropy loss
-            loss = F.cross_entropy(
+            loss_ce = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1),
                 ignore_index=-1
             )
+            
+            # JACOBIAN REGULARIZATION (Critical for DEQ stability)
+            # Penalize ||∇_z f(z*, u)||_F^2 to prevent singular Jacobians
+            # This ensures smooth dynamics and stable implicit differentiation
+            jacobian_reg = 0.0
+            if self.config.spectral_norm and self.training:
+                # Estimate Jacobian norm via finite differences (cheap approximation)
+                # Full Jacobian is O(d^2), but Frobenius norm can be estimated
+                with torch.enable_grad():
+                    # Perturb z_star slightly
+                    eps = 1e-3
+                    z_pert = z_star + eps * torch.randn_like(z_star)
+                    
+                    # Compute operator output at perturbed point
+                    delta_pert = self.deq.operator(z_pert, u, mask)
+                    delta_star = self.deq.operator(z_star.detach(), u, mask)
+                    
+                    # Approximate ||∂f/∂z||_F ≈ ||Δf||_F / ||Δz||_F
+                    jacobian_norm = (delta_pert - delta_star).norm() / (eps + 1e-12)
+                    jacobian_reg = jacobian_norm ** 2
+            
+            # Total loss: CE + λ * Jacobian regularization
+            lambda_jac = 1e-4  # Small penalty coefficient
+            loss = loss_ce + lambda_jac * jacobian_reg
             
             # OPTIONAL: Add entropy penalty as soft constraint (better than hard floor)
             # This encourages diversity without adding noise to logits

@@ -9,6 +9,7 @@ $ python train_graybox.py --batch_size=32 --compile=False
 
 import os
 import time
+import csv
 import math
 import pickle
 from contextlib import nullcontext
@@ -24,37 +25,54 @@ from model_hdeq import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
-out_dir = 'out'
-eval_interval = 2000
-log_interval = 1
-eval_iters = 200
+out_dir = 'out-shakespeare-char-hdeq'
+eval_interval = 100
+log_interval = 10
+eval_iters = 50
 eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
+always_save_checkpoint = False # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' (gpt2* not supported for DEQ)
 # wandb logging
 wandb_log = False # disabled by default
-wandb_project = 'owt'
-wandb_run_name = 'graybox-deq'
+wandb_project = 'shakespeare-char'
+wandb_run_name = 'hdeq'
 # data
-dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
-block_size = 1024
+dataset = 'shakespeare_char'
+gradient_accumulation_steps = 1
+batch_size = 16 # if gradient_accumulation_steps > 1, this is the micro-batch size
+block_size = 256
 # model
 n_layer = 2  # For Gray Box, this controls n_reflex (number of reflex blocks)
-n_head = 12
-n_embd = 768
+n_head = 6
+n_embd = 384
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
-bias = False # do we use bias inside LayerNorm and Linear layers?
+bias = True # do we use bias inside LayerNorm and Linear layers?
 # DEQ-specific parameters
 deq_max_iter = 30
 deq_tol = 1e-3
 anderson_accel = True
 spectral_norm = False  # Disabled for now (device placement issues)
+
+# Hamiltonian Dynamics (energy-conserving symplectic integrator)
+hamiltonian = False  # Use Hamiltonian operator instead of dissipative DEQ
+
+# Unified Quantum Solver (combines multiple physics concepts)
+quantum_solver = False  # Enable unified quantum-inspired solving
+
+# Quantum solver parameters (when quantum_solver=True)
+num_gauge_orbits = 3
+symmetry_breaking_iters = 3
+refinement_iters = 5
+enable_tunneling = True
+tunnel_threshold = 0.95
+temperature_schedule = "exponential"
+T_init = 0.5
+T_final = 0.01
+
 # adamw optimizer
-learning_rate = 6e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
-weight_decay = 1e-1
+learning_rate = 1e-3 # max learning rate
+max_iters = 1000 # total number of training iterations
+weight_decay = 0.1
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
@@ -144,7 +162,15 @@ if os.path.exists(meta_path):
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout,
                   deq_max_iter=deq_max_iter, deq_tol=deq_tol, 
-                  anderson_accel=anderson_accel, spectral_norm=spectral_norm)
+                  anderson_accel=anderson_accel, spectral_norm=spectral_norm,
+                  hamiltonian=hamiltonian, quantum_solver=quantum_solver,
+                  num_gauge_orbits=num_gauge_orbits, 
+                  symmetry_breaking_iters=symmetry_breaking_iters,
+                  refinement_iters=refinement_iters,
+                  enable_tunneling=enable_tunneling,
+                  tunnel_threshold=tunnel_threshold,
+                  temperature_schedule=temperature_schedule,
+                  T_init=T_init, T_final=T_final)
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new Gray Box DEQ model from scratch")
@@ -285,6 +311,16 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+
+# Prepare reports directory and CSV logging for per-iteration metrics
+reports_dir = os.path.join(out_dir, 'reports')
+os.makedirs(reports_dir, exist_ok=True)
+metrics_csv = os.path.join(reports_dir, 'metrics.csv')
+# write header if new
+if master_process and not os.path.exists(metrics_csv):
+    with open(metrics_csv, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['iter','loss','time_ms_synced','mfu_percent','deq_iters','timestamp'])
 while True:
 
     # determine and set the learning rate for this iteration
@@ -351,6 +387,9 @@ while True:
     optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
+    # make sure GPU work is finished so timings represent wall-clock runtime
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
@@ -362,7 +401,16 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         deq_iters = metrics.get('num_iters', 0)
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%, deq_iters={deq_iters}")
+        time_ms = dt * 1000.0
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {time_ms:.2f}ms, mfu {running_mfu*100:.2f}%, deq_iters={deq_iters}")
+        # append to CSV for later plotting/analysis
+        if master_process:
+            try:
+                with open(metrics_csv, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([iter_num, f"{lossf:.6f}", f"{time_ms:.3f}", f"{running_mfu*100:.4f}", deq_iters, time.strftime('%Y-%m-%d %H:%M:%S')])
+            except Exception as e:
+                print(f"Warning: failed to write metrics CSV: {e}")
     iter_num += 1
     local_iter_num += 1
 

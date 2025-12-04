@@ -87,6 +87,35 @@ class PoincareManifold:
         # Möbius addition
         return self.mobius_add(x, second_term)
     
+    def logarithmic_map(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        Logarithmic map: find tangent vector at x pointing toward y.
+        This is the inverse of exponential_map.
+        
+        log_x(y) = (2/√c) * artanh(√c||(-x)⊕y||) * ((-x)⊕y)/||(-x)⊕y||
+        
+        Used for:
+        - Path compression (find direction from path_summary to current_node)
+        - Gradient descent in hyperbolic space
+        """
+        sqrt_c = math.sqrt(self.c)
+        
+        # Compute (-x) ⊕ y (Möbius addition from -x to y)
+        neg_x = -x
+        diff = self.mobius_add(neg_x, y)
+        
+        diff_norm = diff.norm(dim=-1, keepdim=True).clamp_min(self.eps)
+        
+        # artanh(√c * ||diff||)
+        # Use safe artanh to avoid numerical issues at boundary
+        scaled_norm = (sqrt_c * diff_norm).clamp(-self.max_norm, self.max_norm)
+        artanh_term = torch.atanh(scaled_norm)
+        
+        # Scale and normalize
+        tangent = (2.0 / sqrt_c) * artanh_term * diff / diff_norm
+        
+        return tangent
+    
     def mobius_add(self, u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """
         Möbius addition (non-commutative!)

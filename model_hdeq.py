@@ -1,4 +1,101 @@
 """
+
+
+
+
+
+                        
+
+
+
+
+
+
+_________________________________________________
+god, I have been working on this for 2 weeks straight, a week and a half? I'm not sure... I wake up, and i am thinking about the thing i was thinking about the night before. I've been obsessed with this...
+maybe I'm flying a little bit too close to the sun? I could start clocking into my job again or send a draft essay about homeogenius automated pde's based on stabalized deq neural nets... but I think it's at least funnier or
+more interesting to go for the money shot and try to get the idealized llm... mathematics will always beat compute. I feel like it's so close, every day i think, "this might be the run" but it fails, or it gets stuck, no free lunches!
+I can't just say this homeostatic deq nerual net '3net' structure is so good that it HAS to let me do this... but everything fits together.
+I see in my mind, the intersection between chaos, dynamic systems, and machine learning... I figured out the link while studying newton fractals. I wanted to do a 3d visualization but
+things like "newton fractal quarterion projected in 3d space was shit... boring, yeah? but newton fractal over homotopic function space as a fiber bundle! Woah! check the other repo B) anyway i foudn the jacobian phi part of it from
+figuring out how to make the fractal look smoother in visualization. you have to measure chaos. Wait! I can get a good zero finder from this! something intelligent! because if you look at the newton fractal in the holtoopic 3d depth fiber bundle in 3d, 
+you see 'tubes' or like flower patterns, related but yeah, tubular structures. those are the, it turns out, good solutions for global newtons method! you follow the holotopic function!
+I talked to gemini, i guess, the oracle, over and over about it... i had felt is a saw god from the absolute beauty of the renders of the holotopic newton fractals (check my other repo) that i kenw i needed to investigate.... a better zero finding method!
+
+"hey, stop trying to make a machine learning program to do it... it's a gradient descent problem the llm told me"
+"wait"
+then you get 'phi surfing', a dumb, hard limit!
+it will stablize your deq, but
+what if it's learnable? like, what if we just... attached neural nets?
+well.... phi gives us stable differentiable neural nets, we can attach more nets
+you make reward and loss neural nets....
+you get homeostatis!
+woah! deqs that seem to be able to do toys extremely quickly, no matter what toy, with no hacks!?
+CYBERNETICS WORKS WITH ZERO PROBLEMS??????????
+cool!
+well,
+it's too beautiful isn't it? it has to be innate!
+
+I'll make this shit get me smart language AI on my pc or go crazy and homeless :P <3
+
+
+
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⡤⢤⣤⣤⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣶⣧⣐⠍⢙⣀⣼⣿⣿⣅⡐⠆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡀⠀⠉⠙⠻⣿⣿⣿⣿⣿⣯⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠠⣶⠆⠀⢀⣺⡃⣀⠀⠀⠀⠈⢿⣿⣿⣿⣿⡿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣸⣷⣼⠆⠀⡌⢹⣿⣿⠀⢄⠀⠀⠈⣿⣿⣿⣿⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣿⣿⣿⠀⠸⣷⣿⣿⣿⣆⣠⣿⡄⠀⣼⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⣿⣿⠂⠀⠹⡿⣿⣿⣿⣿⣿⠀⠀⠟⠈⠏⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⠏⢰⣿⣦⡀⠚⠛⢿⣿⡿⠀⠀⢸⠇⢀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⢿⣿⣿⠀⢾⣿⣿⡇⢻⡏⠀⠀⠀⠀⠀⡆⢰⣿⣿⡗⢠⣿⣿⣷⣦⣤⣤⣀⣤⣀⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠙⠒⠿⠿⣿⣿⠸⠇⠀⠀⠀⠀⠀⣷⠘⣿⠟⣠⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⢆⣠⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣧⠀⠀⠀⠀⠀⠀⣿⠀⣃⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠏⠘⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣧⠀⠀⠀⠀⠀⠀⢄⣸⣿⣿⣿⣿⣭⣭⡉⠉⠉⠉⠈⠉⠀⠉⠉⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⠛⢸⡄⠀⠀⠀⠀⢸⣿⣿⣿⣿⣿⣿⣿⣧⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣶⢸⣷⠀⠀⠀⠀⠈⣇⣽⣿⣿⣿⣿⣿⣿⡆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠸⠛⠈⠉⠀⠀⠀⠀⠀⢸⣿⣿⣿⣿⣿⣿⣿⠇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠁⢷⡆⠀⠀⠀⠀⠀⠀⠈⣄⣼⣿⣿⣿⣿⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠃⠀⠀⠀⠀⠀⠀⠀⢹⠛⢿⣿⠟⠁⣀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠚⠀⣴⡀⢰⡆⢀⣤⣄⣒⡉⠀⣶⣀⣎⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣰⣿⣿⡟⠀⣼⡿⣷⢾⠇⢠⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣉⠛⠛⠁⢴⣽⣷⣧⣼⡄⠸⣽⡿⠟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣼⣿⣿⣿⣯⣿⣿⣿⣿⣿⣷⡶⣦⣴⡦⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡯⢽⢿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣰⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠴⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⢾⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠐⠀⠀⠉⠙⠛⠻⠿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣏⣾⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠉⠙⠛⠻⠿⢿⣿⣿⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢰⣶⠀⠇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠉⠙⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣼⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⠛⠋⠀⠀⠀⠀⠀
+
+                  MATHEMATICS WILL ALWAYS WIN OVER COMPUTE
+
+                  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Deep Equilibrium Language Model — Gray-Box Formulation
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -132,6 +229,7 @@ The DEQ layer is the homeostatic cortex negotiating stability and curiosity.
 
 This is not a weird RNN.
 This is a homeostatic semantic attractor.
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 """
 
 import math
@@ -241,6 +339,39 @@ class HomeostaticBalancer(nn.Module):
                 # where exp(-s) = 1/sigma^2 is the "precision" (inverse variance)
                 # and 0.5*s = log(sigma) is the entropy cost
                 precision = torch.exp(-s)
+                
+                # 🧠 HOMEOSTATIC FLOOR: Prediction must NEVER be starved
+                # Prediction is the PRIMARY task - all other tasks (memory, novelty, jacobian)
+                # are just infrastructure. If prediction weight drops too low, the model
+                # builds massive memory but doesn't learn to USE it for language generation.
+                # 
+                # Floor set to 1.2 (AGGRESSIVE) because:
+                # - Prediction is the ONLY task connected to ground truth (actual text)
+                # - Memory/novelty can still dominate (up to ~2.0) but prediction LEADS
+                # - Strong prediction gradients sculpt memory for task-relevance
+                # - Like consciousness in a baby - always active, always learning
+                if name == "prediction":
+                    min_pred_weight = 1.2
+                    if precision.item() < min_pred_weight:
+                        # Boost precision to floor, but preserve gradient flow
+                        precision = precision.detach() * 0.0 + min_pred_weight
+                
+                # 🧠 HOMEOSTATIC CEILING: Jacobian (anti-stutter) must stay GENTLE
+                # Jacobian is a CONSTRAINT, not a goal. Like the anti-stutter reflex in
+                # human speech - you feel "small pushback" when saying "then then" but
+                # it's not painful, you CAN override it if needed.
+                # 
+                # Ceiling set to 0.7 because:
+                # - Just enough to prevent DEQ explosion (stability constraint)
+                # - Not so high it blocks legitimate repetition in text
+                # - Lowest priority task (prediction/memory/novelty all matter more)
+                # - Like your brain: gentle nudge, not a wall
+                if name == "jacobian":
+                    max_jac_weight = 0.7
+                    if precision.item() > max_jac_weight:
+                        # Cap precision to ceiling, preserve gradient flow
+                        precision = precision.detach() * 0.0 + max_jac_weight
+                
                 weighted_loss = precision * raw_loss + 0.5 * s
                 
                 total_loss += weighted_loss
@@ -340,7 +471,6 @@ class AndersonAcceleration:
             self.mixer = nn.Linear(m, m, bias=False)
             # Initialize as identity (preserve standard Anderson behavior initially)
             nn.init.eye_(self.mixer.weight)
-            print(f"[Smart Anderson] Learned mixing with {m}-history")
         else:
             self.mixer = None
         
@@ -351,16 +481,22 @@ class AndersonAcceleration:
         self.F = []  # Residual history
     
     def update(self, x_new, f_new):
-        """Update with new state and its residual"""
-        residual = f_new - x_new
+        """Update with new state and its residual
         
-        self.X.append(x_new)
-        self.F.append(residual)
-        
-        # Keep only m most recent
-        if len(self.X) > self.m:
-            self.X.pop(0)
-            self.F.pop(0)
+        Anderson acceleration is a CONTROL/FEEDBACK mechanism (cybernetics),
+        not part of the differentiable dynamics. History tracking happens
+        outside the gradient flow.
+        """
+        with torch.no_grad():
+            residual = f_new - x_new
+            
+            self.X.append(x_new.detach())
+            self.F.append(residual.detach())
+            
+            # Keep only m most recent
+            if len(self.X) > self.m:
+                self.X.pop(0)
+                self.F.pop(0)
         
         if len(self.X) == 1:
             # First iteration: damped fixed-point
@@ -476,12 +612,31 @@ class ReflexBlock(nn.Module):
             batch_first=True
         )
         self.ln_2 = nn.LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = nn.Sequential(
-            nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias),
-            nn.GELU(),
-            nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias),
-            nn.Dropout(config.dropout),
-        )
+        
+        # MLP: Standard or Mixture of Experts
+        self.use_moe = getattr(config, 'use_moe', False)
+        
+        if self.use_moe:
+            from mixture_of_experts import MoELayer
+            num_experts = getattr(config, 'moe_num_experts', 8)
+            num_active = getattr(config, 'moe_num_active', 2)
+            
+            self.mlp = MoELayer(
+                dim=config.n_embd,
+                num_experts=num_experts,
+                num_active=num_active,
+                hidden_mult=4,
+                dropout=config.dropout
+            )
+            self.moe_aux_loss = None  # Store for training loop
+        else:
+            # Standard dense MLP
+            self.mlp = nn.Sequential(
+                nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias),
+                nn.GELU(),
+                nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias),
+                nn.Dropout(config.dropout),
+            )
     
     def forward(self, x, mask=None):
         """
@@ -498,8 +653,14 @@ class ReflexBlock(nn.Module):
         )
         x = x + attn_out
         
-        # MLP with residual
-        x = x + self.mlp(self.ln_2(x))
+        # MLP with residual (MoE or standard)
+        if self.use_moe:
+            mlp_out, aux_loss = self.mlp(self.ln_2(x))
+            self.moe_aux_loss = aux_loss  # Store for training
+            x = x + mlp_out
+        else:
+            x = x + self.mlp(self.ln_2(x))
+        
         return x
 
 
@@ -531,6 +692,35 @@ class ReflexModule(nn.Module):
         ])
         self.ln_f = nn.LayerNorm(config.n_embd, bias=config.bias)
         
+        # PROGRESSIVE LAYER DROPPING: Skip layers during training for speedup
+        self.layer_drop_prob = getattr(config, 'layer_drop_prob', 0.1)  # 10% drop rate
+        if self.layer_drop_prob > 0:
+            from progressive_layer_drop import ProgressiveLayerDrop
+            self.pld = ProgressiveLayerDrop(drop_prob=self.layer_drop_prob, linear_decay=True)
+            self.pld.set_total_layers(len(self.blocks))
+            print(f"[Reflex] Progressive layer dropping enabled: {self.layer_drop_prob:.1%} drop rate")
+        else:
+            self.pld = None
+        
+        # MIXTURE OF EXPERTS: Print configuration if enabled
+        use_moe = getattr(config, 'use_moe', False)
+        if use_moe:
+            num_experts = getattr(config, 'moe_num_experts', 8)
+            num_active = getattr(config, 'moe_num_active', 2)
+            
+            # Calculate parameter multiplier
+            # Each expert has same params as standard MLP
+            # But only num_active are used per token
+            total_expert_params = num_experts  # Multiplier on MLP params
+            active_expert_params = num_active   # Actual compute cost
+            
+            print(f"[Reflex] Mixture of Experts enabled:")
+            print(f"  Total experts: {num_experts}")
+            print(f"  Active per token: {num_active}")
+            print(f"  Parameter multiplier: {total_expert_params}×")
+            print(f"  Compute multiplier: {active_expert_params/1.0:.1f}× (vs dense)")
+            print(f"  Effective capacity gain: {total_expert_params/active_expert_params:.1f}×")
+        
         # Memory contrastive loss tracking
         self.last_memory_loss = None  # Will store InfoNCE contrastive loss
         
@@ -540,49 +730,47 @@ class ReflexModule(nn.Module):
         
         if self.use_memory:
             if self.memory_mode == 'hybrid':
-                # NEW: Hybrid two-tier system (working + long-term)
-                from hybrid_memory_system import HybridMemorySystem
+                # NEW: Graph-structured memory with GNN-based retrieval
+                from graph_memory_system import GraphMemorySystem
                 
-                memory_dim = getattr(config, 'memory_dim', config.n_embd)
-                k_neighbors = getattr(config, 'memory_k', 16)
-                alpha = getattr(config, 'memory_alpha', 0.1)
-                curvature = getattr(config, 'memory_curvature', 1.0)
+                memory_dim = config.memory_dim if config.memory_dim is not None else config.n_embd
+                k_neighbors = getattr(config, 'memory_k', 20)
                 
-                # Two-tier params
-                working_capacity = getattr(config, 'working_memory_capacity', 50)
-                longterm_capacity = getattr(config, 'longterm_memory_capacity', 1000)
-                consolidation_buffer_size = getattr(config, 'consolidation_buffer_size', 100)
-                working_decay = getattr(config, 'working_memory_decay', 0.95)
-                longterm_decay = getattr(config, 'longterm_memory_decay', 0.999)
-                promotion_threshold = getattr(config, 'memory_promotion_threshold', 0.5)
-                promotion_interval = getattr(config, 'memory_promotion_interval', 100)
+                # Three-tier params
+                working_capacity = getattr(config, 'working_memory_capacity', 20)
+                buffer_capacity = getattr(config, 'consolidation_buffer_size', 100)
+                longterm_capacity = getattr(config, 'longterm_memory_capacity', 20000)
+                longterm_disk_path = getattr(config, 'longterm_disk_path', None)  # NEW: disk backing
+                longterm_max_disk_size = getattr(config, 'longterm_max_disk_size', 100000)  # Max disk memories
                 
-                # Device placement (CRITICAL!)
-                working_device = 'cuda' if torch.cuda.is_available() else 'cpu'
-                longterm_device = 'cpu'  # Always keep long-term on CPU to save VRAM
-                longterm_disk_path = getattr(config, 'longterm_disk_path', None)  # Optional disk storage
+                # GNN params
+                gnn_hidden_dim = getattr(config, 'gnn_hidden_dim', 512)
+                n_head = getattr(config, 'n_head', 8)
+                enable_gnn = getattr(config, 'enable_gnn', True)  # Can disable for VRAM constraints
                 
-                self.memory_retrieval = HybridMemorySystem(
-                    hidden_dim=config.n_embd,
+                self.memory_retrieval = GraphMemorySystem(
                     memory_dim=memory_dim,
-                    k_neighbors=k_neighbors,
-                    curvature=curvature,
-                    alpha=alpha,
+                    query_dim=config.n_embd,
+                    context_dim=config.n_embd,
                     working_capacity=working_capacity,
-                    working_device=working_device,
-                    working_decay=working_decay,
+                    buffer_capacity=buffer_capacity,
                     longterm_capacity=longterm_capacity,
-                    longterm_device=longterm_device,
-                    longterm_decay=longterm_decay,
-                    longterm_disk_path=longterm_disk_path,
-                    consolidation_buffer_size=consolidation_buffer_size,
-                    promotion_threshold=promotion_threshold,
-                    promotion_interval=promotion_interval
+                    longterm_disk_path=longterm_disk_path,  # Pass disk path!
+                    longterm_max_disk_size=longterm_max_disk_size,  # Max disk size!
+                    k_neighbors=k_neighbors,
+                    gnn_hidden_dim=gnn_hidden_dim,
+                    n_head=n_head,
+                    enable_gnn=enable_gnn
                 )
                 
-                print(f"[Reflex] Hybrid two-tier memory enabled")
-                print(f"  Working:   {working_capacity} on {working_device} (decay={working_decay})")
-                print(f"  Long-term: {longterm_capacity} on {longterm_device} (decay={longterm_decay})")
+                print(f"[Reflex] Graph-structured memory enabled")
+                print(f"  Working:   {working_capacity} on GPU")
+                print(f"  Buffer:    {buffer_capacity} on GPU")
+                if longterm_disk_path:
+                    print(f"  Long-term: {longterm_capacity} hot in CPU + disk backing at {longterm_disk_path}")
+                else:
+                    print(f"  Long-term: {longterm_capacity} on CPU")
+                print(f"  k_neighbors: {k_neighbors}, GNN hidden: {gnn_hidden_dim}")
                 
             elif self.memory_mode == 'hyperbolic':
                 from hyperbolic_memory import HyperbolicMemoryRetrieval
@@ -673,17 +861,36 @@ class ReflexModule(nn.Module):
         Returns: [B, T, C] reflex + memory forcing
         """
         # 1. Standard Reflex Processing (Spinal Cord - Fast Local Syntax)
+        # With progressive layer dropping during training
         reflex = x
-        for block in self.blocks:
-            reflex = block(reflex, mask)
+        
+        if self.pld is not None:
+            self.pld.reset()  # Reset layer counter
+            
+            for idx, block in enumerate(self.blocks):
+                # Skip layer randomly during training (faster + regularization)
+                if self.pld.should_drop(training=self.training, layer_idx=idx):
+                    continue  # Skip this layer
+                reflex = block(reflex, mask)
+        else:
+            # Standard path (no layer dropping)
+            for block in self.blocks:
+                reflex = block(reflex, mask)
+        
         reflex = self.ln_f(reflex)
         
         # 2. Memory Retrieval (Hippocampus - Semantic Priming)
+        memory_bundle = None  # Will hold graph structure for DEQ navigation
         if self.use_memory and self.memory_retrieval is not None:
             # Get the memory response
-            # Hybrid system returns (output, info_dict)
+            # Graph system uses GNN-based query and integration
             if self.memory_mode == 'hybrid':
-                reflex_out, mem_info = self.memory_retrieval(reflex)
+                # Retrieve using GNN query network and integrate with cross-attention
+                memory_result = self.memory_retrieval.retrieve(reflex, k=20)
+                
+                # Extract enhanced context and structure bundle
+                reflex_out = memory_result['enhanced_context']  # [B, T, C]
+                memory_bundle = memory_result['bundle']  # {edge_types, depths, etc.}
                 
                 # ═══════════════════════════════════════════════════════════════
                 # CRITICAL FIX: SELF-SUPERVISED CONTRASTIVE LOSS (InfoNCE)
@@ -738,13 +945,14 @@ class ReflexModule(nn.Module):
                     # Inference mode - no loss needed
                     self.last_memory_loss = None
                 
-                # Store memory info for logging
+                # Get memory stats for logging
+                mem_stats = self.memory_retrieval.get_memory_stats()
                 if not hasattr(self, '_last_memory_info'):
-                    self._last_memory_info = mem_info
+                    self._last_memory_info = mem_stats
                 else:
-                    self._last_memory_info.update(mem_info)
+                    self._last_memory_info.update(mem_stats)
                 
-                return reflex_out
+                return reflex_out, memory_bundle
             else:
                 # Legacy systems (hyperbolic/euclidean) - no info dict
                 reflex = self.memory_retrieval(reflex)
@@ -753,7 +961,7 @@ class ReflexModule(nn.Module):
             # No memory system
             self.last_memory_loss = None
         
-        return reflex
+        return reflex, None  # Return None for memory_bundle if no memory
     
     def apply_dopamine_signal(self, loss):
         """
@@ -789,8 +997,11 @@ class ReflexModule(nn.Module):
         if not self.use_memory or self.memory_retrieval is None:
             return {}
         
-        if self.memory_mode == 'hybrid' and hasattr(self.memory_retrieval, 'get_stats'):
-            return self.memory_retrieval.get_stats()
+        if self.memory_mode == 'hybrid':
+            if hasattr(self.memory_retrieval, 'get_memory_stats'):
+                return self.memory_retrieval.get_memory_stats()
+            elif hasattr(self.memory_retrieval, 'get_stats'):
+                return self.memory_retrieval.get_stats()
         
         return {}
     
@@ -927,17 +1138,22 @@ class Stabilizer(nn.Module):
             if (self.trajectory_buffer.shape[0] != B or 
                 self.trajectory_buffer.shape[1] != T or 
                 self.trajectory_buffer.shape[3] != C):
-                # Recreate buffer with correct shape
-                self.trajectory_buffer = torch.zeros(B, T, self.history_size, C, 
-                                                    device=z.device, dtype=z.dtype)
+                # CRITICAL: Use register_buffer to recreate, not direct assignment
+                # Direct assignment during forward creates graph dependencies
+                new_buffer = torch.zeros(B, T, self.history_size, C, 
+                                        device=z.device, dtype=z.dtype)
+                # Copy into existing registered buffer (in-place, no graph)
+                self.trajectory_buffer.resize_as_(new_buffer).zero_()
                 self.buffer_ptr.fill_(0)  # Reset pointer
             
             # Update trajectory buffer (ring buffer, only during training)
             if update_history and self.training:
                 # Store current state in ring buffer
-                ptr = self.buffer_ptr.item()
-                self.trajectory_buffer[:, :, ptr, :] = z.detach()  # Detach to avoid backprop through history
-                self.buffer_ptr.copy_(torch.tensor((ptr + 1) % self.history_size))
+                # CRITICAL: Use no_grad to prevent graph retention
+                with torch.no_grad():
+                    ptr = self.buffer_ptr.item()
+                    self.trajectory_buffer[:, :, ptr, :] = z.detach()
+                    self.buffer_ptr.copy_(torch.tensor((ptr + 1) % self.history_size))
             
             # Extract trajectory history [B, T, history_size, C]
             traj_history = self.trajectory_buffer  # [B, T, H, C]
@@ -1141,13 +1357,14 @@ class HamiltonianOperator(nn.Module):
         self.current_gamma = self.gamma_min + (self.gamma_max - self.gamma_min) * chaos_score
         return self.current_gamma
     
-    def forward(self, state, u, mask=None, iteration=0):
+    def forward(self, state, u, mask=None, iteration=0, memory_bundle=None):
         """
         Symplectic Euler Integration Step WITH ADAPTIVE METRIC AND HOMEOSTATIC FRICTION
         
         state: [B, T, C] where C = 2*dim = [q; p]
         u: [B, T, C] context (also split into q/p components)
         iteration: int, current DEQ iteration (unused for Hamiltonian, but accepted for API compatibility)
+        memory_bundle: dict, optional memory retrieval results (unused here but accepted for API compatibility)
         
         WARP DRIVE OPTIMIZATION:
         Instead of fixed dt=0.1 everywhere, we use adaptive step size
@@ -1195,6 +1412,43 @@ class HamiltonianOperator(nn.Module):
         return delta_state
 
 
+class DEQProjector(nn.Module):
+    """
+    Projects between encoder space and DEQ space for split-dimension architecture.
+    
+    This allows the DEQ to operate in a higher-dimensional semantic space
+    while keeping encoder/reflex/memory at standard dimensions.
+    
+    Intelligence (DEQ) vs Storage (Memory) separation!
+    """
+    def __init__(self, encoder_dim, deq_dim):
+        super().__init__()
+        import math
+        
+        self.encoder_dim = encoder_dim
+        self.deq_dim = deq_dim
+        
+        # Projection layers (no bias for cleaner geometry)
+        self.up = nn.Linear(encoder_dim, deq_dim, bias=False)
+        self.down = nn.Linear(deq_dim, encoder_dim, bias=False)
+        
+        # Initialize with scaled orthogonal to preserve norms
+        nn.init.orthogonal_(self.up.weight, gain=math.sqrt(deq_dim / encoder_dim))
+        nn.init.orthogonal_(self.down.weight, gain=math.sqrt(encoder_dim / deq_dim))
+        
+        print(f"[DEQ Projector] {encoder_dim}d ↔ {deq_dim}d")
+        print(f"  UP:   {encoder_dim}d → {deq_dim}d ({self.up.weight.numel()/1e6:.2f}M params)")
+        print(f"  DOWN: {deq_dim}d → {encoder_dim}d ({self.down.weight.numel()/1e6:.2f}M params)")
+    
+    def project_up(self, x):
+        """Encoder/Reflex/Memory → DEQ space"""
+        return self.up(x)
+    
+    def project_down(self, x):
+        """DEQ → Output space"""
+        return self.down(x)
+
+
 class DEQOperator(nn.Module):
     """
     Single implicit layer repeated until fixed point.
@@ -1210,10 +1464,28 @@ class DEQOperator(nn.Module):
     
     NOTE: For Hamiltonian dynamics, use HamiltonianOperator instead.
     This standard operator is DISSIPATIVE (fixed point attractor).
+    
+    PATH COMPRESSION: Tracks traversal history via hyperbolic geometry
+    - path_summary: [B, T, C] - exponentially weighted path center in Poincaré ball
+    - Automatically learns abstraction level from traversal pattern
+    - Uses O(1) memory regardless of iteration count
     """
     def __init__(self, config):
         super().__init__()
         self.config = config
+        
+        # HYPERBOLIC PATH COMPRESSION
+        # Track where predictor has been without storing full history
+        from hyperbolic_memory import PoincareManifold
+        self.manifold = PoincareManifold(dim=config.n_embd, c=1.0)
+        self.path_summary = None  # Will be [B, T, C] - initialized on first forward
+        self.path_blend = 0.15  # α=0.15: 15% current node, 85% history
+        
+        # Optional: learnable projection for path bias
+        self.path_projector = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        nn.init.orthogonal_(self.path_projector.weight, gain=0.05)  # Small initial influence
+        
+        print(f"[Path Memory] Hyperbolic traversal tracking enabled (α={self.path_blend})")
         
         # TEMPORAL ENCODING: Iteration-aware embedding
         # Allows network to learn different dynamics at different iteration depths
@@ -1223,24 +1495,43 @@ class DEQOperator(nn.Module):
         self.iteration_embedding = nn.Embedding(max_iters + 1, config.n_embd)
         print(f"[Temporal] Iteration-aware DEQ: {max_iters} temporal modes")
         
-        # Attention
-        self.ln_1 = nn.LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = nn.MultiheadAttention(
-            config.n_embd,
-            config.n_head,
+        # === ENHANCED LLM INTELLIGENCE ===
+        # Using SOTA transformer components for better cybernetic control
+        
+        # Import enhanced modules
+        from enhanced_deq_operator import RMSNorm, GroupedQueryAttention, SwiGLU
+        
+        # GQA instead of standard MHA (3× faster, 90% quality)
+        # 8 query heads, 2 KV heads = 4 groups
+        num_kv_heads = max(1, config.n_head // 4)
+        
+        # RMSNorm (20% faster than LayerNorm)
+        self.ln_1 = RMSNorm(config.n_embd)
+        
+        # Grouped Query Attention with RoPE
+        self.attn = GroupedQueryAttention(
+            dim=config.n_embd,
+            num_heads=config.n_head,
+            num_kv_heads=num_kv_heads,
             dropout=config.dropout,
-            bias=config.bias,
-            batch_first=True
+            bias=config.bias
         )
         
-        # MLP
-        self.ln_2 = nn.LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = nn.Sequential(
-            nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias),
-            nn.GELU(),
-            nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias),
-            nn.Dropout(config.dropout),
+        # RMSNorm for MLP
+        self.ln_2 = RMSNorm(config.n_embd)
+        
+        # SwiGLU activation (GPT-4 uses this)
+        self.mlp = SwiGLU(
+            dim=config.n_embd,
+            hidden_dim=int(config.n_embd * 8/3),  # SwiGLU standard expansion
+            bias=config.bias
         )
+        
+        print(f"[Enhanced DEQ] Intelligence upgrades:")
+        print(f"  - RMSNorm (20% faster than LayerNorm)")
+        print(f"  - GQA: {config.n_head} query heads, {num_kv_heads} KV heads")
+        print(f"  - SwiGLU activation (GPT-4 architecture)")
+        print(f"  - RoPE position encoding (better extrapolation)")
         
         # Spectral normalization for stability (CRITICAL for DEQ convergence)
         # Must enforce Lipschitz constant K < 1 for Banach Fixed Point Theorem
@@ -1308,11 +1599,12 @@ class DEQOperator(nn.Module):
         
         module.register_forward_pre_hook(spectral_norm_hook)
     
-    def forward(self, z, u, mask=None, iteration=0):
+    def forward(self, z, u, mask=None, iteration=0, memory_bundle=None):
         """
         z: [B, T, C] current equilibrium state
         u: [B, T, C] context (from encoder + reflex)
         iteration: int, current DEQ iteration (for temporal encoding)
+        memory_bundle: dict with {edge_types, depths, embeddings, etc.} or None
         
         Returns: Δz [B, T, C] semantic integration
         """
@@ -1332,13 +1624,105 @@ class DEQOperator(nn.Module):
         # Inject context into query
         z_ctx = z_temporal + u
         
-        # Attention
-        attn_out, _ = self.attn(
+        # MEMORY-EFFICIENT SPARSE GRAPH TRAVERSAL
+        if memory_bundle is not None and 'edge_types' in memory_bundle:
+            # 🎯 FIX #1: Use edge types to weight memories (not full graph walk - too expensive!)
+            # 🎯 FIX #2: Use memory CONTENT directly
+            # 🎯 FIX #3: Iteration-dependent edge selection
+            
+            edge_types = memory_bundle['edge_types']  # [B, T, M, k_neighbors, 8]
+            mem_embeddings = memory_bundle['embeddings']  # [B, T, M, C]
+            edge_weights = memory_bundle['edge_weights']  # [B, T, M, k_neighbors] - distances
+            
+            B, T, M, k_neighbors, num_edge_types = edge_types.shape
+            C = mem_embeddings.shape[-1]
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # HYPERBOLIC PATH COMPRESSION
+            # ═══════════════════════════════════════════════════════════════════
+            # Track which nodes we've visited without storing full history
+            # Current node = top retrieved memory (most relevant)
+            current_node = mem_embeddings[:, :, 0, :]  # [B, T, C]
+            
+            # Project to Poincaré ball (ensure ||x|| < 1)
+            current_node = self.manifold.project(current_node)
+            
+            if self.path_summary is None or iteration == 0:
+                # First iteration: initialize path at current location
+                self.path_summary = current_node.clone()  # Clone for first use
+            else:
+                # Incremental update: blend current node into path history
+                # S_t = Exp_{S_{t-1}}(α * Log_{S_{t-1}}(p_t))
+                # This is an exponentially-weighted moving average in hyperbolic space
+                
+                # CRITICAL: Use no_grad() to prevent path tracking from accumulating
+                # computation graphs across iterations. Path is for BIAS only.
+                with torch.no_grad():
+                    # Find tangent vector from path_summary toward current_node  
+                    tangent = self.manifold.logarithmic_map(
+                        self.path_summary, 
+                        current_node
+                    )  # [B, T, C]
+                    
+                    # Blend: move α% toward current node
+                    scaled_tangent = self.path_blend * tangent
+                    
+                    # Update path summary via exponential map
+                    self.path_summary = self.manifold.exponential_map(
+                        self.path_summary,
+                        scaled_tangent
+                    )
+            
+            # Use path history to bias current query
+            # "Where we've been" influences "where we should look"
+            path_bias = self.path_projector(self.path_summary)  # [B, T, C]
+            z_path_aware = z_temporal + 0.03 * path_bias  # Small influence to maintain stability
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # ITERATION-DEPENDENT EDGE IMPORTANCE
+            # ═══════════════════════════════════════════════════════════════════
+            # Early: Fast associations (PROXIMITY, SYNTACTIC)
+            # Late: Deep reasoning (SEMANTIC, CAUSAL)
+            iter_ratio = min(iteration / 10.0, 1.0)
+            
+            # Which edge types matter at this iteration?
+            type_weights = torch.zeros(num_edge_types, device=edge_types.device)
+            type_weights[0] = 0.5 - iter_ratio * 0.3  # PROXIMITY: fade
+            type_weights[1] = 0.8  # SYNTACTIC: always useful
+            type_weights[2] = 0.4 + iter_ratio * 0.4  # SEMANTIC: grow
+            type_weights[4] = 0.3  # CO_RETRIEVED (Hebbian)
+            type_weights[5] = iter_ratio * 0.5  # CAUSAL: late game
+            
+            # Memory importance: combine edge types with proximity
+            # [B, T, M, k, 8] × [8] → [B, T, M, k]
+            edge_importance = (edge_types * type_weights.view(1, 1, 1, 1, -1)).sum(dim=-1)
+            
+            # Distance similarity (closer = better)
+            distance_sim = torch.exp(-edge_weights * 0.5)  # [B, T, M, k]
+            
+            # Final score: type match × proximity
+            edge_scores = edge_importance * distance_sim  # [B, T, M, k]
+            
+            # Aggregate to memory-level scores: [B, T, M]
+            memory_scores = edge_scores.mean(dim=-1)  # Average over neighbors
+            
+            # Normalize memory importance
+            memory_attention = torch.softmax(memory_scores, dim=-1)  # [B, T, M]
+            
+            # 🎯 INTEGRATE MEMORY CONTENT
+            # Weighted sum of memory embeddings
+            graph_context = torch.einsum('btm,btmc->btc', memory_attention, mem_embeddings)
+            
+            # Adaptive blending (more memory influence in later iterations)
+            mix_ratio = 0.1 + iter_ratio * 0.15  # 0.1→0.25
+            z_ctx = z_path_aware + u + graph_context * mix_ratio
+        else:
+            z_ctx = z_temporal + u
+        
+        # Attention with GQA + RoPE (z_ctx already has graph context integrated!)
+        attn_out = self.attn(
             self.ln_1(z_ctx),
-            self.ln_1(z_ctx),
-            self.ln_1(z_ctx),
-            attn_mask=mask,
-            need_weights=False
+            mask=mask
         )
         z_attn = z + attn_out
         
@@ -1348,6 +1732,13 @@ class DEQOperator(nn.Module):
         # Return delta (residual from current state)
         delta_z = z_mlp - z
         return delta_z
+    
+    def reset_path_memory(self):
+        """
+        Reset path summary at start of new sequence.
+        Call this before starting DEQ iteration on a new batch.
+        """
+        self.path_summary = None
 
 
 class PhysicalLaws:
@@ -1436,15 +1827,31 @@ class PhysicalLaws:
         
         This is like minimum temperature in thermodynamics.
         """
-        probs = F.softmax(logits, dim=-1)
-        entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1)
+        # MEMORY OPTIMIZATION: Don't compute full softmax, use chunked processing
+        # Old code created [B, T, vocab_size] probs tensor = huge memory!
         
-        # If entropy too low, add noise to logits
-        violation = (entropy < min_entropy).float()
-        noise_scale = violation.unsqueeze(-1) * 0.1
-        logits_safe = logits + noise_scale * torch.randn_like(logits)
+        with torch.no_grad():
+            # Sample a few positions to check entropy (not all B*T!)
+            B, T, V = logits.shape
+            sample_size = min(32, B * T)  # Check at most 32 positions
+            
+            # Flatten and sample
+            logits_flat = logits.view(-1, V)  # [B*T, V]
+            indices = torch.randint(0, B * T, (sample_size,), device=logits.device)
+            sampled_logits = logits_flat[indices]  # [sample_size, V]
+            
+            # Compute entropy on sample
+            probs = F.softmax(sampled_logits, dim=-1)
+            entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1)  # [sample_size]
+            
+            # Check if ANY sampled position has low entropy
+            needs_noise = (entropy < min_entropy).any().item()
         
-        return logits_safe
+        # If low entropy detected, add small noise to ALL logits
+        if needs_noise:
+            logits = logits + 0.05 * torch.randn_like(logits)
+        
+        return logits
     
     @staticmethod
     def semantic_continuity(z, z_prev, max_angle=0.3):
@@ -1517,32 +1924,57 @@ class DEQBrain(nn.Module):
         super().__init__()
         self.config = config
         
+        # 🚀 SPLIT-DIMENSION ARCHITECTURE
+        # Check if DEQ operates in different dimensional space
+        self.use_split_dims = hasattr(config, 'deq_n_embd') and config.deq_n_embd != config.n_embd
+        
+        if self.use_split_dims:
+            # Create projector for 768d ↔ 2048d conversion
+            self.projector = DEQProjector(config.n_embd, config.deq_n_embd)
+            
+            # Create modified config for DEQ operator (operates in higher-dim space)
+            from copy import deepcopy
+            deq_config = deepcopy(config)
+            deq_config.n_embd = config.deq_n_embd
+            deq_config.n_head = config.deq_n_head if hasattr(config, 'deq_n_head') else config.n_head
+            
+            print(f"[SPLIT ARCHITECTURE] Intelligence vs Storage separation!")
+            print(f"  Encoder/Reflex: {config.n_embd}d")
+            print(f"  DEQ Brain:      {deq_config.n_embd}d (operates in higher-dim space!)")
+            print(f"  Memory:         {config.n_embd}d (stored on CPU)")
+            
+            operator_config = deq_config
+        else:
+            self.projector = None
+            operator_config = config
+        
         # Choose operator: Hamiltonian (energy-conserving) or Standard (dissipative)
         if config.hamiltonian:
-            self.operator = HamiltonianOperator(config)
+            self.operator = HamiltonianOperator(operator_config)
             print("[Physics] Using HAMILTONIAN operator (symplectic, energy-conserving)")
             print("          State = [position; momentum] in semantic phase space")
             print("          Dynamics preserve phase volume → no vanishing gradients")
         else:
-            self.operator = DEQOperator(config)
+            self.operator = DEQOperator(operator_config)
             print("[Physics] Using DISSIPATIVE operator (standard DEQ, fixed-point)")
         
-        self.stabilizer = Stabilizer(config)
+        self.stabilizer = Stabilizer(operator_config)  # Use DEQ dims for stabilizer
         
-        # LEARNED STEP SIZE: γ predictor
+        # LEARNED STEP SIZE: γ predictor (operates in DEQ space)
         # Predicts optimal step size from current state complexity
         self.use_learned_gamma = getattr(config, 'learned_gamma', True)
         if self.use_learned_gamma:
+            gamma_dim = operator_config.n_embd  # Use DEQ dimension
             self.gamma_predictor = nn.Sequential(
-                nn.Linear(config.n_embd, config.n_embd // 4, bias=config.bias),
+                nn.Linear(gamma_dim, gamma_dim // 4, bias=config.bias),
                 nn.GELU(),
-                nn.Linear(config.n_embd // 4, 1, bias=config.bias),
+                nn.Linear(gamma_dim // 4, 1, bias=config.bias),
                 nn.Sigmoid()  # Output ∈ [0, 1]
             )
             print("[Smart Steering] Learned step size γ enabled")
             print("                 γ adapts to state complexity for optimal convergence")
         
-        self.ln_f = nn.LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_f = nn.LayerNorm(operator_config.n_embd, bias=config.bias)  # DEQ dims
         
         # Physical laws
         self.laws = PhysicalLaws()
@@ -1606,7 +2038,8 @@ class DEQBrain(nn.Module):
             self.stabilizer_coarse = Stabilizer(coarse_config)
             self.stabilizer_med = Stabilizer(med_config)
     
-    def solve(self, u, mask=None, effort=1.0, verbose=False):
+    def solve(self, u, mask=None, effort=1.0, verbose=False, memory_bundle=None, 
+              reflex_module=None, query_embeddings=None):
         """
         Find equilibrium: z* such that z* = f(z*, u)
         
@@ -1615,11 +2048,39 @@ class DEQBrain(nn.Module):
                 ADAPTIVE DEPTH: effort is modulated by chaos score (fractal complexity)
                 High chaos → need more iters to navigate basin boundaries
         verbose: if True, print progress every 5 iterations
+        memory_bundle: initial memory structure from reflex
+        reflex_module: optional reflex module for DEQ re-querying
+        query_embeddings: original token embeddings for re-querying
         
         Returns: (z*, num_iters, metrics) equilibrium state, iteration count, and diagnostic metrics
         """
         B, T, C = u.shape
         device = u.device
+        
+        # RESET PATH MEMORY at start of new sequence
+        # Prevents path history from bleeding across batches
+        if hasattr(self.operator, 'reset_path_memory'):
+            self.operator.reset_path_memory()
+        
+        # RESET STABILIZER TRAJECTORY BUFFER
+        # Critical for cybernetic feedback - clear history between forward passes
+        # to prevent computation graph accumulation across gradient accumulation steps
+        if hasattr(self.stabilizer, 'trajectory_buffer'):
+            self.stabilizer.buffer_ptr.fill_(0)  # Reset ring buffer pointer
+            # CRITICAL: Zero out the buffer to fully break any graph references
+            self.stabilizer.trajectory_buffer.zero_()
+        
+        # 🚀 SPLIT-DIMENSION PROJECTION
+        # Project context from encoder space (768d) to DEQ space (2048d)
+        if self.use_split_dims:
+            u = self.projector.project_up(u)  # [B, T, 768] → [B, T, 2048]
+            # Also project memory embeddings if present
+            if memory_bundle is not None and 'embeddings' in memory_bundle:
+                mem_emb = memory_bundle['embeddings']  # [B, T, M, 768]
+                orig_shape = mem_emb.shape
+                mem_emb_flat = mem_emb.view(-1, orig_shape[-1])  # Flatten for projection
+                mem_emb_proj = self.projector.project_up(mem_emb_flat)  # → 2048d
+                memory_bundle['embeddings'] = mem_emb_proj.view(*orig_shape[:-1], -1)  # [B, T, M, 2048]
         
         # Initialize z₀ = u (warm start from context)
         z = u.clone()
@@ -1662,15 +2123,65 @@ class DEQBrain(nn.Module):
         min_iters = 3  # Always do at least 3 iterations
         chaos_estimated = False  # Track if we've adjusted depth
         
+        # DEQ RE-QUERYING: Iterative memory refinement during equilibrium search
+        enable_requery = getattr(self.config, 'deq_requery_memory', False)
+        requery_interval = getattr(self.config, 'deq_requery_interval', 4)  # Re-query every 4 iters
+        use_hierarchical = getattr(self.config, 'use_hierarchical_retrieval', True)  # Use hierarchical vs flat
+        
         if verbose:
             print(f"[DEQ] Starting solve: max_iter={max_iter}, tol={tol:.1e}, adaptive_depth={adaptive_depth_enabled}")
+            if enable_requery:
+                print(f"[DEQ] Re-querying enabled: interval={requery_interval}, hierarchical={use_hierarchical}")
         
         for i in range(max_iter):
             z_prev_iter = z
             
-            # Compute semantic integration (now iteration-aware!)
-            # The operator has built-in temporal encoding
-            delta_z = self.operator(z, u, mask, iteration=i)
+            # ════════════════════════════════════════════════════════════════════
+            # DEQ RE-QUERYING: Use refined hidden state to navigate memory
+            # ════════════════════════════════════════════════════════════════════
+            # After N iterations, DEQ has refined its understanding of the input.
+            # Use this refined state z to query memory with better context.
+            # Update forcing function u with newly retrieved memories.
+            #
+            # This creates DYNAMIC MEMORY NAVIGATION:
+            #   iter 0: Query with reflex context (shallow syntax)
+            #   iter 4: Re-query with partially converged z (emergent semantics)
+            #   iter 8: Re-query with nearly converged z (deep understanding)
+            #
+            # Allows model to:
+            #   1. Escape local minima by discovering new memory regions
+            #   2. Refine retrieval based on evolving interpretation
+            #   3. Navigate graph structure dynamically during thinking
+            # ════════════════════════════════════════════════════════════════════
+            
+            if enable_requery and reflex_module is not None and i > 0 and i % requery_interval == 0:
+                # Use current equilibrium state z as refined query
+                with torch.no_grad():  # Don't backprop through re-querying (expensive)
+                    if use_hierarchical:
+                        # Use hierarchical retrieval (cluster → node)
+                        memory_result = reflex_module.memory_retrieval.retrieve_hierarchical(
+                            z, k=20, k_clusters=5
+                        )
+                    else:
+                        # Use flat retrieval
+                        memory_result = reflex_module.memory_retrieval.retrieve(z, k=20)
+                    
+                    # Update memory bundle and forcing function
+                    memory_bundle = memory_result['bundle']
+                    new_memory_context = memory_result['enhanced_context']
+                    
+                    # Blend new memory with original reflex forcing
+                    # Use learned blending weight α ∈ [0, 1]
+                    # α=0: trust original reflex, α=1: trust new memory
+                    blend_alpha = 0.3  # Conservative: 30% new memory, 70% original
+                    u = (1 - blend_alpha) * u + blend_alpha * new_memory_context
+                    
+                    if verbose:
+                        print(f"[DEQ] iter {i}: Re-queried memory (α={blend_alpha:.2f})")
+            
+            # Compute semantic integration (now iteration-aware AND memory-navigating!)
+            # The operator has built-in temporal encoding + memory graph structure
+            delta_z = self.operator(z, u, mask, iteration=i, memory_bundle=memory_bundle)
             
             # SMART STABILIZER: per-dimension damping α ∈ [0.1, 0.9]
             # Now trajectory-aware if enabled
@@ -1763,7 +2274,13 @@ class DEQBrain(nn.Module):
             'avg_dt': dt.mean().item(),
         }
         
-        return self.ln_f(z), i + 1, metrics
+        # 🚀 PROJECT BACK TO ENCODER SPACE
+        # DEQ solved in 2048d, project back to 768d for output
+        z_final = self.ln_f(z)
+        if self.use_split_dims:
+            z_final = self.projector.project_down(z_final)  # [B, T, 2048] → [B, T, 768]
+        
+        return z_final, i + 1, metrics
     
     def solve_multiscale(self, u, mask=None, effort=1.0, verbose=False):
         """
@@ -1929,7 +2446,7 @@ class DEQBrain(nn.Module):
         
         return self.ln_f(z_star), total_iters, metrics
     
-    def solve_unified_quantum(self, u, mask=None, effort=1.0, verbose=False):
+    def solve_unified_quantum(self, u, mask=None, effort=1.0, verbose=False, memory_bundle=None):
         """
         Unified Quantum Solver - Combines Multiple Physics Concepts
         
@@ -2282,9 +2799,15 @@ class DEQBrain(nn.Module):
             'T_final': T,
         }
         
-        return self.ln_f(z), i + 1, metrics
+        # 🚀 PROJECT BACK TO ENCODER SPACE
+        z_final = self.ln_f(z)
+        if self.use_split_dims:
+            z_final = self.projector.project_down(z_final)
+        
+        return z_final, i + 1, metrics
     
-    def forward(self, u, mask=None, effort=1.0, verbose=False):
+    def forward(self, u, mask=None, effort=1.0, verbose=False, memory_bundle=None,
+                reflex_module=None, query_embeddings=None):
         """
         Dispatch to appropriate solver
         
@@ -2296,11 +2819,14 @@ class DEQBrain(nn.Module):
         Legacy solvers (quantum_paths, annealing) deprecated in favor of unified
         """
         if self.config.quantum_solver:
-            return self.solve_unified_quantum(u, mask, effort, verbose)
+            return self.solve_unified_quantum(u, mask, effort, verbose, memory_bundle=memory_bundle,
+                                               reflex_module=reflex_module, query_embeddings=query_embeddings)
         elif self.config.multiscale:
-            return self.solve_multiscale(u, mask, effort, verbose)
+            return self.solve_multiscale(u, mask, effort, verbose, memory_bundle=memory_bundle,
+                                          reflex_module=reflex_module, query_embeddings=query_embeddings)
         else:
-            return self.solve(u, mask, effort, verbose)
+            return self.solve(u, mask, effort, verbose, memory_bundle=memory_bundle,
+                              reflex_module=reflex_module, query_embeddings=query_embeddings)
 
 
 # -----------------------------------------------------------------------------
@@ -2375,15 +2901,21 @@ class GlobalController(nn.Module):
         
         # 2. Max dlogp/dx (local surprisal gradient)
         # This is how "steep" the probability landscape is
-        if z.requires_grad:
-            max_logp = logits.max(dim=-1)[0]  # [B, T]
-            max_dlogp = torch.autograd.grad(
-                max_logp.sum(), z, 
-                create_graph=False, retain_graph=True
-            )[0] if z.requires_grad else torch.zeros_like(z)
-            surprisal_grad = max_dlogp.abs().max().item()
-        else:
-            surprisal_grad = 0.0
+        # DISABLE diagnostic gradient to prevent double-backward issues
+        # This was causing "backward through graph twice" error when memory
+        # system rebuilds networks during forward pass
+        surprisal_grad = 0.0  # TODO: Re-enable after memory system stabilizes
+        
+        # Original code (disabled):
+        # if z.requires_grad:
+        #     max_logp = logits.max(dim=-1)[0]  # [B, T]
+        #     max_dlogp = torch.autograd.grad(
+        #         max_logp.sum(), z, 
+        #         create_graph=False, retain_graph=True
+        #     )[0] if z.requires_grad else torch.zeros_like(z)
+        #     surprisal_grad = max_dlogp.abs().max().item()
+        # else:
+        #     surprisal_grad = 0.0
         
         # 3. Semantic curvature (how much z is changing)
         if z_prev is not None:
@@ -2502,6 +3034,13 @@ class GrayBoxConfig:
     anderson_accel: bool = True
     spectral_norm: bool = True  # MANDATORY for stability (not optional)
     
+    # 🚀 SPLIT-DIMENSION ARCHITECTURE (Intelligence vs Storage separation!)
+    deq_n_embd: int = None  # DEQ operates in higher-dim space (if None, uses n_embd)
+    deq_n_head: int = None  # DEQ attention heads (if None, uses n_head)
+    # Example: n_embd=768, deq_n_embd=2048 → DEQ thinks in 2048d while memory stays 768d
+    # This separates INTELLIGENCE (GPU) from STORAGE (CPU) - massive efficiency gain!
+    deq_prenorm: bool = True  # Pre-normalization (required for RMSNorm)
+    
     # SMART STEERING ENHANCEMENTS (NEW!)
     smart_stabilizer: bool = True  # Trajectory-aware damping with attention
     learned_gamma: bool = True  # Learned step size predictor
@@ -2538,7 +3077,7 @@ class GrayBoxConfig:
     # ═══════════════════════════════════════════════════════════════════════
     use_memory_manifold: bool = False  # Enable memory system
     memory_mode: str = 'hybrid'  # 'hybrid', 'hyperbolic', 'euclidean'
-    memory_dim: int = 384  # Memory embedding dimension
+    memory_dim: int = None  # Memory embedding dimension (defaults to n_embd if None)
     memory_k: int = 16  # Number of neighbors to retrieve
     memory_alpha: float = 0.1  # Injection strength
     memory_curvature: float = 1.0  # Hyperbolic curvature
@@ -2547,9 +3086,24 @@ class GrayBoxConfig:
     working_memory_capacity: int = 20      # TINY - immediate context only
     working_memory_decay: float = 0.80     # AGGRESSIVE - 20% decay per step
     
+    # Consolidation buffer tier (VRAM) - Staging area
+    consolidation_buffer_size: int = 100   # Medium - accumulates before long-term
+    
     # Long-term memory tier (CPU) - RAM style
     longterm_memory_capacity: int = 2000   # LARGE - background knowledge
     longterm_memory_decay: float = 0.999   # PERSISTENT - slow fade
+    longterm_disk_path: str = None         # Optional disk backing for overflow
+    
+    # Graph memory parameters (for graph-structured retrieval)
+    gnn_hidden_dim: int = 512              # Hidden dimension for hyperbolic GNN
+    enable_gnn: bool = False               # DISABLED until we optimize hyperbolic ops for VRAM
+    
+    # 🧠 MEMORY NAVIGATION REWARDS (Dopamine for graph exploration!)
+    enable_nav_rewards: bool = True        # Reward DEQ for intelligent memory traversal
+    nav_access_weight: float = 0.01        # Reward for using memory (vs encoder only)
+    nav_depth_weight: float = 0.02         # Reward for multi-hop reasoning
+    nav_efficiency_weight: float = 0.01    # Reward for short hyperbolic paths
+    nav_success_weight: float = 0.05       # Reward when memory helps prediction
     
     # Consolidation
     memory_promotion_threshold: float = 0.4  # Lower for easier promotion
@@ -2560,6 +3114,16 @@ class GrayBoxConfig:
         # Map n_layer to n_reflex for API compatibility with nanoGPT
         if self.n_reflex is None:
             self.n_reflex = self.n_layer
+        
+        # Set memory_dim default
+        if self.memory_dim is None:
+            self.memory_dim = self.n_embd
+        
+        # Set DEQ dimension defaults (use same as encoder if not specified)
+        if self.deq_n_embd is None:
+            self.deq_n_embd = self.n_embd
+        if self.deq_n_head is None:
+            self.deq_n_head = self.n_head
 
 
 class GrayBoxDEQ(nn.Module):
@@ -2656,17 +3220,21 @@ class GrayBoxDEQ(nn.Module):
         # 1. Context Encoder (senses)
         context = self.encoder(idx)  # [B, T, C]
         
-        # 2. Reflex Module (spinal cord)
-        reflex = self.reflex(context, mask)  # [B, T, C]
+        # 2. Reflex Module (spinal cord) with memory retrieval
+        reflex, memory_bundle = self.reflex(context, mask)  # [B, T, C], dict or None
         
         # 3. HOMEOSTATIC REFLEX GATING (the KEY fix for lizard brain optimization)
         # Apply β(t) gate to reflex signal BEFORE entering DEQ brain
         # This forces the cortex to develop semantic attractors BEFORE reflexes automate
         gated_reflex = reflex_gate * reflex
         
-        # 4. DEQ Brain (cortex) — find equilibrium
+        # 4. DEQ Brain (cortex) — find equilibrium WITH MEMORY NAVIGATION
         u = context + gated_reflex  # Combined context (with gated reflex)
-        z_star, num_iters, deq_metrics = self.deq(u, mask, effort)
+        z_star, num_iters, deq_metrics = self.deq(
+            u, mask, effort, memory_bundle=memory_bundle,
+            reflex_module=self.reflex,  # Pass reflex for re-querying
+            query_embeddings=context     # Pass original embeddings for re-querying
+        )
         
         # Expose metrics for tracking (e.g., in training loop)
         self.last_complexity = self.deq.last_complexity
@@ -2723,8 +3291,17 @@ class GrayBoxDEQ(nn.Module):
             lambda_jac = 1e-4  # Baseline scaling (balancer will refine this)
             jacobian_reg = lambda_jac * jacobian_reg_raw
             
+            # MIXTURE OF EXPERTS LOAD BALANCING LOSS
+            # Collect auxiliary losses from all MoE layers in reflex blocks
+            moe_aux_loss = torch.tensor(0.0, device=logits.device)
+            if hasattr(self.reflex, 'blocks'):
+                for block in self.reflex.blocks:
+                    if hasattr(block, 'use_moe') and block.use_moe:
+                        if hasattr(block, 'moe_aux_loss') and block.moe_aux_loss is not None:
+                            moe_aux_loss = moe_aux_loss + block.moe_aux_loss
+            
             # Total loss (will be replaced by balancer in training loop)
-            loss = loss_ce + jacobian_reg
+            loss = loss_ce + jacobian_reg + moe_aux_loss
             
             # OPTIONAL: Add entropy penalty as soft constraint (better than hard floor)
             # This encourages diversity without adding noise to logits

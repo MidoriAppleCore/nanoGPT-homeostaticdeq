@@ -352,7 +352,8 @@ class HomeostaticMonitor:
         fig = plt.figure(figsize=(20, 16), facecolor='white')
         gs = fig.add_gridspec(4, 3, hspace=0.3, wspace=0.3)
         
-        fig.suptitle(f'🧠 Homeostatic DEQ - Complete System Monitor @ Iteration {iter_num}', 
+        # Use text brain emoji for better font compatibility
+        fig.suptitle(f'Homeostatic DEQ - Complete System Monitor @ Iteration {iter_num}', 
                      fontsize=18, fontweight='bold', color='black')
         
         iters = loss_df['iter'].values
@@ -594,7 +595,11 @@ class HomeostaticMonitor:
                        ha='center', va='center', transform=ax.transAxes,
                        fontsize=11, color='gray')
         
-        plt.tight_layout()
+        # Use tight_layout with error suppression for complex subplots
+        try:
+            plt.tight_layout()
+        except Exception:
+            pass  # Some complex layouts don't support tight_layout, that's okay
         
         # Save to reports
         output_path = os.path.join(self.reports_dir, f'homeostasis_iter_{iter_num:06d}.png')
@@ -604,7 +609,7 @@ class HomeostaticMonitor:
         # Also create an "all-in-one" combined metrics plot
         self._plot_combined_metrics(iter_num, loss_df, chaos_df, deq_df, lr_df)
         
-        print(f"  📊 Homeostatic dashboard (12 panels) saved: {output_path}")
+        # Silent mode - dashboard saved to graph
     
     def _plot_combined_metrics(self, iter_num, loss_df, chaos_df, deq_df, lr_df):
         """Create a single plot with all key metrics on same axes (normalized)"""
@@ -612,6 +617,9 @@ class HomeostaticMonitor:
             return
         
         import pandas as pd
+        
+        # Load loss components for base loss
+        loss_components_df = pd.read_csv(self.csv_files['loss_components'])
         
         # Create combined plot with all metrics normalized to [0, 1]
         fig, ax = plt.subplots(1, 1, figsize=(14, 7), facecolor='white')
@@ -629,15 +637,21 @@ class HomeostaticMonitor:
         # High contrast colors
         COLORS = {
             'loss': '#e74c3c',      # Red
+            'base': '#c0392b',      # Dark red (base loss)
             'chaos': '#f39c12',     # Orange
             'deq': '#27ae60',       # Green
             'lr': '#3498db',        # Blue
             'residual': '#9b59b6',  # Purple
         }
         
+        # Plot BASE LOSS (ce_jacobian) - most important!
+        if len(loss_components_df) > 0 and len(loss_components_df) == len(iters):
+            ax.plot(loss_components_df['iter'], normalize(loss_components_df['ce_jacobian']), 
+                   color=COLORS['base'], linewidth=3.5, label='Base Loss (CE+Jac)', alpha=0.95, zorder=10)
+        
         # Plot normalized metrics
         ax.plot(iters, normalize(loss_df['train_loss']), 
-               color=COLORS['loss'], linewidth=2.5, label='Loss', alpha=0.85)
+               color=COLORS['loss'], linewidth=2.5, label='Total Loss', alpha=0.85)
         
         if len(chaos_df) > 0 and len(chaos_df) == len(iters):
             ax.plot(chaos_df['iter'], normalize(chaos_df['chaos_score']), 
@@ -676,7 +690,7 @@ class HomeostaticMonitor:
                    facecolor='white', edgecolor='none')
         plt.close()
         
-        print(f"  📈 Combined metrics plot saved: {output_path}")
+        # Silent mode - metrics saved to graph
     
     def create_reflex_animation(self, iter_num, reflex_activations, token_ids, decode_fn):
         """

@@ -138,9 +138,9 @@ class DiskBackedTensor:
         - Tuple: tensor[5, :10] or tensor[0:100, :]
         """
         if isinstance(idx, tuple):
-            # Handle tuple indexing like tensor[row, col_slice]
+            # Handle tuple indexing like tensor[row, col_slice] or tensor[i, j, k]
             row_idx = idx[0]
-            col_idx = idx[1] if len(idx) > 1 else slice(None)
+            col_indices = idx[1:] if len(idx) > 1 else (slice(None),)
             
             # Get the row(s) first
             if isinstance(row_idx, int):
@@ -152,8 +152,8 @@ class DiskBackedTensor:
             else:
                 raise TypeError(f"Unsupported row index type: {type(row_idx)}")
             
-            # Apply column indexing
-            return row_data[col_idx]
+            # Apply remaining indices (unpack tuple for correct indexing)
+            return row_data[col_indices] if len(col_indices) > 1 else row_data[col_indices[0]]
         elif isinstance(idx, int):
             return self._get_single(idx)
         elif isinstance(idx, slice):
@@ -208,7 +208,12 @@ class DiskBackedTensor:
     def _get_slice(self, s: slice):
         """Get a slice of rows."""
         start, stop, step = s.indices(self._actual_size)
-        indices = range(start, stop, step or 1)
+        indices = list(range(start, stop, step or 1))
+        
+        # Safety: Return empty tensor if slice is empty
+        if len(indices) == 0:
+            return torch.zeros((0,) + self.row_shape, dtype=self.dtype, device=self.device)
+        
         return torch.stack([self._get_single(i) for i in indices])
     
     def _get_batch(self, indices):
@@ -221,7 +226,15 @@ class DiskBackedTensor:
         """
         Transparent write - automatically expands storage and flushes to disk.
         """
-        if isinstance(idx, int):
+        if isinstance(idx, tuple):
+            # Handle multi-dimensional indexing: tensor[i, j] or tensor[i, j, k] = value
+            # Read-modify-write pattern to preserve row
+            row_idx = idx[0]
+            col_indices = idx[1:]  # Remaining indices (might be multiple for 3D+)
+            row = self._get_single(row_idx).clone()  # Load full row
+            row[col_indices] = value  # Modify using remaining indices
+            self._set_single(row_idx, row)  # Write back full row
+        elif isinstance(idx, int):
             self._set_single(idx, value)
         elif isinstance(idx, slice):
             self._set_slice(idx, value)

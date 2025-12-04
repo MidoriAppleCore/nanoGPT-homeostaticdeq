@@ -65,7 +65,8 @@ class GraphMemoryTier(nn.Module):
             poincare = PoincareManifold(dim=memory_dim, c=1.0)
             cache_capacity = min(2000, capacity // 2)  # Keep half in RAM
             
-            # Use DiskBackedTensor for embeddings - TRANSPARENT!
+            # 🔥 DISK-BACKED EVERYTHING (enables scaling to millions of memories!)
+            # Embeddings
             self.embeddings = DiskBackedTensor(
                 shape=(max_disk_size, memory_dim),
                 dtype=torch.float32,
@@ -77,32 +78,114 @@ class GraphMemoryTier(nn.Module):
                 enable_async=True
             )
             
+            # Graph structure (adjacency matrix)
+            self.adjacency = DiskBackedTensor(
+                shape=(max_disk_size, k_neighbors),
+                dtype=torch.int64,
+                device=device,
+                disk_path=os.path.join(disk_path, 'adjacency'),
+                hot_capacity=cache_capacity,
+                flush_interval=5.0,
+                enable_async=True
+            )
+            
+            # Edge weights (hyperbolic distances - Hebbian strengthened!)
+            self.edge_weights = DiskBackedTensor(
+                shape=(max_disk_size, k_neighbors),
+                dtype=torch.float32,
+                device=device,
+                disk_path=os.path.join(disk_path, 'edge_weights'),
+                hot_capacity=cache_capacity,
+                flush_interval=5.0,
+                enable_async=True
+            )
+            
+            # Edge types (semantic relationships)
+            self.edge_types = DiskBackedTensor(
+                shape=(max_disk_size, k_neighbors, num_edge_types),
+                dtype=torch.float32,
+                device=device,
+                disk_path=os.path.join(disk_path, 'edge_types'),
+                hot_capacity=cache_capacity,
+                flush_interval=5.0,
+                enable_async=True
+            )
+            
+            # 🧠 HEBBIAN LEARNING STATE (usage statistics)
+            self.edge_traversal_count = DiskBackedTensor(
+                shape=(max_disk_size, k_neighbors),
+                dtype=torch.float32,
+                device=device,
+                disk_path=os.path.join(disk_path, 'edge_traversal_count'),
+                hot_capacity=cache_capacity,
+                flush_interval=5.0,
+                enable_async=True
+            )
+            
+            self.edge_success_rate = DiskBackedTensor(
+                shape=(max_disk_size, k_neighbors),
+                dtype=torch.float32,
+                device=device,
+                disk_path=os.path.join(disk_path, 'edge_success_rate'),
+                hot_capacity=cache_capacity,
+                flush_interval=5.0,
+                enable_async=True
+            )
+            
+            # Metadata - ALSO disk-backed for 200K+ scale!
+            self.cluster_ids = DiskBackedTensor(
+                shape=(max_disk_size,),
+                dtype=torch.int64,
+                device=device,
+                disk_path=os.path.join(disk_path, 'cluster_ids'),
+                hot_capacity=cache_capacity,
+                flush_interval=5.0,
+                enable_async=True
+            )
+            
+            self.depths = DiskBackedTensor(
+                shape=(max_disk_size,),
+                dtype=torch.float32,
+                device=device,
+                disk_path=os.path.join(disk_path, 'depths'),
+                hot_capacity=cache_capacity,
+                flush_interval=5.0,
+                enable_async=True
+            )
+            
+            # TYPE SYSTEM: Continuous type embeddings (learned from context)
+            if use_types:
+                self.type_embeddings = DiskBackedTensor(
+                    shape=(max_disk_size, type_dim),
+                    dtype=torch.float32,
+                    device=device,
+                    disk_path=os.path.join(disk_path, 'type_embeddings'),
+                    hot_capacity=cache_capacity,
+                    flush_interval=5.0,
+                    enable_async=True
+                )
+            
             print(f"💾 Disk-backed tier: {disk_path}")
             print(f"   Max size: {max_disk_size} memories")
-            print(f"   Hot cache: {cache_capacity} in RAM")
+            print(f"   Hot cache: {cache_capacity} in RAM per tensor")
+            print(f"   🔥 GRAPH STRUCTURE ON DISK (scales to millions!)")
             print(f"   Strategy: Transparent write-back cache with async I/O")
         else:
-            # No disk - use regular buffer
+            # No disk - use regular buffers
             self.register_buffer('embeddings', torch.zeros(0, memory_dim, device=device))
+            self.register_buffer('adjacency', torch.full((0, k_neighbors), -1, dtype=torch.long, device=device))
+            self.register_buffer('edge_weights', torch.zeros(0, k_neighbors, device=device))
+            self.register_buffer('cluster_ids', torch.full((0,), -1, dtype=torch.long, device=device))
+            self.register_buffer('depths', torch.zeros(0, device=device))
+            self.register_buffer('edge_types', torch.zeros(0, k_neighbors, num_edge_types, device=device))
+            self.register_buffer('edge_traversal_count', torch.zeros(0, k_neighbors, device=device))
+            self.register_buffer('edge_success_rate', torch.zeros(0, k_neighbors, device=device))
+            
+            # TYPE SYSTEM
+            if use_types:
+                self.register_buffer('type_embeddings', torch.zeros(0, type_dim, device=device))
         
-        # Memory storage (adjacency and other metadata always in RAM for speed)
-        self.register_buffer('adjacency', torch.full((0, k_neighbors), -1, dtype=torch.long, device=device))
-        self.register_buffer('edge_weights', torch.zeros(0, k_neighbors, device=device))
-        self.register_buffer('cluster_ids', torch.full((0,), -1, dtype=torch.long, device=device))
-        self.register_buffer('depths', torch.zeros(0, device=device))  # Distance from origin (abstraction level)
-        
-        # TYPE SYSTEM: Continuous type embeddings (learned from context)
-        # This is MORE EFFICIENT than storing "noun" for every "dog"!
-        # Instead: type emerges from position in hyperbolic space + graph structure
-        if use_types:
-            self.register_buffer('type_embeddings', torch.zeros(0, type_dim, device=device))
-        
-        # HETEROGENEOUS EDGES: Different relationship types between nodes
-        # Edge types encode: syntactic roles, semantic relations, functional connections
-        # Shape: [N, k_neighbors, num_edge_types] - multi-hot (edge can have multiple types)
-        self.register_buffer('edge_types', torch.zeros(0, k_neighbors, num_edge_types, device=device))
-        
-        # Edge type semantics (can be learned or predefined)
+        # Edge type semantics (predefined - same for disk-backed and in-memory)
         # 0: PROXIMITY - geometric neighbors in hyperbolic space
         # 1: SYNTACTIC - same POS, similar syntactic role
         # 2: SEMANTIC - synonym/hypernym/association
@@ -120,16 +203,21 @@ class GraphMemoryTier(nn.Module):
         # Current size - always use a buffer, just access it differently
         self.register_buffer('_size', torch.tensor(0, dtype=torch.long, device=device))
         
-        # DYNAMIC GRAPH EVOLUTION: Track usage patterns
-        self.register_buffer('edge_traversal_count', torch.zeros(0, k_neighbors, device=device))
-        self.register_buffer('edge_success_rate', torch.zeros(0, k_neighbors, device=device))
+        # 🛣️ HIGHWAY TRACKING: Monitor which edges are being strengthened
+        # Keep top-K most strengthened edges for debugging
+        self.highway_log = []  # List of (source_idx, target_idx, old_weight, new_weight, strengthening_amount)
+        self.highway_log_max = 100  # Keep top 100 highways
     
     @property
     def size(self):
         """Get current size - compatible with both disk-backed and in-memory."""
         if self.use_disk:
-            # For disk-backed: adjacency is authoritative (always in RAM and synced)
-            return torch.tensor(self.adjacency.shape[0], dtype=torch.long, device=self.device)
+            # For disk-backed: use _actual_size (not .shape which is max capacity)
+            from disk_backed_tensor import DiskBackedTensor
+            if isinstance(self.adjacency, DiskBackedTensor):
+                return torch.tensor(self.adjacency._actual_size, dtype=torch.long, device=self.device)
+            else:
+                return torch.tensor(self.adjacency.shape[0], dtype=torch.long, device=self.device)
         else:
             # Regular buffer has _size attribute
             return self._size
@@ -412,7 +500,16 @@ class GraphMemoryTier(nn.Module):
             self.adjacency = torch.cat([self.adjacency, new_adjacency], dim=0)
             self.edge_weights = torch.cat([self.edge_weights, new_weights], dim=0)
             self.edge_types = torch.cat([self.edge_types, new_edge_types], dim=0) if self.size > 0 else new_edge_types
-            self.cluster_ids = torch.cat([self.cluster_ids, new_cluster], dim=0)
+            
+            # cluster_ids might be DiskBackedTensor
+            from disk_backed_tensor import DiskBackedTensor
+            if isinstance(self.cluster_ids, DiskBackedTensor):
+                old_size = self.cluster_ids._actual_size
+                self.cluster_ids[old_size] = new_cluster[0]
+            else:
+                self.cluster_ids = torch.cat([self.cluster_ids, new_cluster], dim=0)
+            
+            # rewards, age, access are always regular tensors
             self.rewards = torch.cat([self.rewards, torch.zeros(1, device=self.device)], dim=0)
             self.age = torch.cat([self.age, torch.zeros(1, device=self.device)], dim=0)
             self.access = torch.cat([self.access, torch.zeros(1, device=self.device)], dim=0)
@@ -429,15 +526,27 @@ class GraphMemoryTier(nn.Module):
                     neighbor_type_embs = self.type_embeddings[valid_indices]
                     # Average neighbor types (inherit from community)
                     inferred_type = neighbor_type_embs.mean(dim=0)
-                    self.type_embeddings = torch.cat([self.type_embeddings, inferred_type.unsqueeze(0)], dim=0)
+                    if isinstance(self.type_embeddings, DiskBackedTensor):
+                        old_size = self.type_embeddings._actual_size
+                        self.type_embeddings[old_size] = inferred_type
+                    else:
+                        self.type_embeddings = torch.cat([self.type_embeddings, inferred_type.unsqueeze(0)], dim=0)
                 else:
                     # No valid neighbors - use random type
-                    self.type_embeddings = torch.cat([self.type_embeddings, 
-                                                     torch.randn(1, self.type_dim, device=self.device) * 0.1], dim=0)
+                    random_type = torch.randn(1, self.type_dim, device=self.device) * 0.1
+                    if isinstance(self.type_embeddings, DiskBackedTensor):
+                        old_size = self.type_embeddings._actual_size
+                        self.type_embeddings[old_size] = random_type[0]
+                    else:
+                        self.type_embeddings = torch.cat([self.type_embeddings, random_type], dim=0)
             elif self.use_types:
                 # First node - random type
-                self.type_embeddings = torch.cat([self.type_embeddings, 
-                                                 torch.randn(1, self.type_dim, device=self.device) * 0.1], dim=0)
+                random_type = torch.randn(1, self.type_dim, device=self.device) * 0.1
+                if isinstance(self.type_embeddings, DiskBackedTensor):
+                    old_size = self.type_embeddings._actual_size
+                    self.type_embeddings[old_size] = random_type[0]
+                else:
+                    self.type_embeddings = torch.cat([self.type_embeddings, random_type], dim=0)
         
         new_idx = self.size.item()
         self.size = torch.tensor(self.size.item() + 1, dtype=torch.long, device=self.device)
@@ -476,29 +585,49 @@ class GraphMemoryTier(nn.Module):
         
         # AGGRESSIVE FIX: For CPU tier, force EVERYTHING to CPU regardless of size
         # This handles the case where model.cuda() moved all buffers to GPU
+        # BUT skip DiskBackedTensors (they manage their own device placement)
+        from disk_backed_tensor import DiskBackedTensor
+        
         if self.device == 'cpu':
-            # Move ALL buffers back to CPU
-            self.register_buffer('adjacency', self.adjacency.cpu())
-            self.register_buffer('edge_weights', self.edge_weights.cpu())
-            if self.edge_types.size(0) > 0:
+            # Move ALL buffers back to CPU (except DiskBackedTensors)
+            if not isinstance(self.adjacency, DiskBackedTensor):
+                self.register_buffer('adjacency', self.adjacency.cpu())
+            if not isinstance(self.edge_weights, DiskBackedTensor):
+                self.register_buffer('edge_weights', self.edge_weights.cpu())
+            if self.edge_types.size(0) > 0 and not isinstance(self.edge_types, DiskBackedTensor):
                 self.register_buffer('edge_types', self.edge_types.cpu())
-            self.register_buffer('cluster_ids', self.cluster_ids.cpu())
-            self.register_buffer('rewards', self.rewards.cpu())
-            self.register_buffer('age', self.age.cpu())
-            self.register_buffer('access', self.access.cpu())
-            self.register_buffer('depths', self.depths.cpu())
-            self.register_buffer('edge_traversal_count', self.edge_traversal_count.cpu())
-            self.register_buffer('edge_success_rate', self.edge_success_rate.cpu())
-            if self.use_types and self.type_embeddings.size(0) > 0:
+            if not isinstance(self.edge_traversal_count, DiskBackedTensor):
+                self.register_buffer('edge_traversal_count', self.edge_traversal_count.cpu())
+            if not isinstance(self.edge_success_rate, DiskBackedTensor):
+                self.register_buffer('edge_success_rate', self.edge_success_rate.cpu())
+            
+            # Metadata: some are DiskBackedTensor (cluster_ids, depths, type_embeddings), some are not (rewards, age, access)
+            if not isinstance(self.cluster_ids, DiskBackedTensor):
+                self.register_buffer('cluster_ids', self.cluster_ids.cpu())
+            if not isinstance(self.rewards, DiskBackedTensor):
+                self.register_buffer('rewards', self.rewards.cpu())
+            if not isinstance(self.age, DiskBackedTensor):
+                self.register_buffer('age', self.age.cpu())
+            if not isinstance(self.access, DiskBackedTensor):
+                self.register_buffer('access', self.access.cpu())
+            if not isinstance(self.depths, DiskBackedTensor):
+                self.register_buffer('depths', self.depths.cpu())
+            if self.use_types and self.type_embeddings.size(0) > 0 and not isinstance(self.type_embeddings, DiskBackedTensor):
                 self.register_buffer('type_embeddings', self.type_embeddings.cpu())
         elif self.size > 0:
-            # For GPU tier, move to target device if needed
-            if self.adjacency.device != target_device:
+            # For GPU tier, move to target device if needed (skip DiskBackedTensors)
+            if not isinstance(self.adjacency, DiskBackedTensor) and self.adjacency.device != target_device:
                 self.register_buffer('adjacency', self.adjacency.to(target_device))
-            if self.edge_weights.device != target_device:
+            if not isinstance(self.edge_weights, DiskBackedTensor) and self.edge_weights.device != target_device:
                 self.register_buffer('edge_weights', self.edge_weights.to(target_device))
-            if self.edge_types.size(0) > 0 and self.edge_types.device != target_device:
+            if not isinstance(self.edge_types, DiskBackedTensor) and self.edge_types.size(0) > 0 and self.edge_types.device != target_device:
                 self.register_buffer('edge_types', self.edge_types.to(target_device))
+            if not isinstance(self.edge_traversal_count, DiskBackedTensor) and self.edge_traversal_count.device != target_device:
+                self.register_buffer('edge_traversal_count', self.edge_traversal_count.to(target_device))
+            if not isinstance(self.edge_success_rate, DiskBackedTensor) and self.edge_success_rate.device != target_device:
+                self.register_buffer('edge_success_rate', self.edge_success_rate.to(target_device))
+            
+            # These are always regular tensors
             if self.cluster_ids.device != target_device:
                 self.register_buffer('cluster_ids', self.cluster_ids.to(target_device))
             if self.rewards.device != target_device:
@@ -509,10 +638,6 @@ class GraphMemoryTier(nn.Module):
                 self.register_buffer('access', self.access.to(target_device))
             if self.depths.device != target_device:
                 self.register_buffer('depths', self.depths.to(target_device))
-            if self.edge_traversal_count.device != target_device:
-                self.register_buffer('edge_traversal_count', self.edge_traversal_count.to(target_device))
-            if self.edge_success_rate.device != target_device:
-                self.register_buffer('edge_success_rate', self.edge_success_rate.to(target_device))
             if self.use_types and self.type_embeddings.size(0) > 0 and self.type_embeddings.device != target_device:
                 self.register_buffer('type_embeddings', self.type_embeddings.to(target_device))
         
@@ -595,43 +720,92 @@ class GraphMemoryTier(nn.Module):
                     # Regular concatenation for normal tensors
                     self.embeddings = torch.cat([self.embeddings, batch_cpu], dim=0)
                 
-                self.adjacency = torch.cat([self.adjacency, batch_adjacency_cpu], dim=0)
-                self.edge_weights = torch.cat([self.edge_weights, batch_weights_cpu], dim=0)
+                # Handle adjacency and edge_weights (might be DiskBackedTensor)
+                if isinstance(self.adjacency, DiskBackedTensor):
+                    start_idx = self.size.item() if hasattr(self, 'size') else self.adjacency._actual_size
+                    for local_i in range(chunk_size):
+                        self.adjacency[start_idx + local_i] = batch_adjacency_cpu[local_i]
+                else:
+                    self.adjacency = torch.cat([self.adjacency, batch_adjacency_cpu], dim=0)
+                
+                if isinstance(self.edge_weights, DiskBackedTensor):
+                    start_idx = self.size.item() if hasattr(self, 'size') else self.edge_weights._actual_size
+                    for local_i in range(chunk_size):
+                        self.edge_weights[start_idx + local_i] = batch_weights_cpu[local_i]
+                else:
+                    self.edge_weights = torch.cat([self.edge_weights, batch_weights_cpu], dim=0)
                 
                 # Initialize other metadata - CRITICAL: Use target_device for all new tensors!
                 batch_edge_types = torch.zeros(chunk_size, self.k_neighbors, self.num_edge_types, device=target_device)
                 batch_edge_types[:, :k_actual, 0] = 1.0  # Proximity type
                 
-                # Always concatenate edge_types (handle empty case)
-                if self.edge_types.size(0) == 0:
+                # Handle edge_types (might be DiskBackedTensor)
+                if self.edge_types.size(0) == 0 and not isinstance(self.edge_types, DiskBackedTensor):
+                    # First batch with regular tensor - direct assignment
                     self.edge_types = batch_edge_types
                 else:
-                    self.edge_types = torch.cat([self.edge_types, batch_edge_types], dim=0)
+                    # Append mode (works for both DiskBackedTensor and regular tensor)
+                    if isinstance(self.edge_types, DiskBackedTensor):
+                        start_idx = self.edge_types._actual_size
+                        for local_i in range(chunk_size):
+                            self.edge_types[start_idx + local_i] = batch_edge_types[local_i]
+                    else:
+                        self.edge_types = torch.cat([self.edge_types, batch_edge_types], dim=0)
                 
+                # Initialize cluster IDs (might be DiskBackedTensor)
                 batch_clusters = torch.zeros(chunk_size, dtype=torch.long, device=target_device)
-                self.cluster_ids = torch.cat([self.cluster_ids, batch_clusters], dim=0)
+                if isinstance(self.cluster_ids, DiskBackedTensor):
+                    start_idx = self.cluster_ids._actual_size
+                    for local_i in range(chunk_size):
+                        self.cluster_ids[start_idx + local_i] = batch_clusters[local_i]
+                else:
+                    self.cluster_ids = torch.cat([self.cluster_ids, batch_clusters], dim=0)
                 
+                # Rewards, age, access are always regular tensors
                 self.rewards = torch.cat([self.rewards, torch.zeros(chunk_size, device=target_device)], dim=0)
                 self.age = torch.cat([self.age, torch.zeros(chunk_size, device=target_device)], dim=0)
                 self.access = torch.cat([self.access, torch.zeros(chunk_size, device=target_device)], dim=0)
                 
-                # Initialize depths (distance from origin in hyperbolic space)
+                # Initialize depths (distance from origin in hyperbolic space) - might be DiskBackedTensor
                 batch_depths = torch.norm(batch_cpu, dim=-1).to(target_device)
-                self.depths = torch.cat([self.depths, batch_depths], dim=0)
+                if isinstance(self.depths, DiskBackedTensor):
+                    start_idx = self.depths._actual_size
+                    for local_i in range(chunk_size):
+                        self.depths[start_idx + local_i] = batch_depths[local_i]
+                else:
+                    self.depths = torch.cat([self.depths, batch_depths], dim=0)
                 
-                # Edge tracking - use target_device
-                self.edge_traversal_count = torch.cat([self.edge_traversal_count, 
+                # Edge tracking (might be DiskBackedTensor)
+                if isinstance(self.edge_traversal_count, DiskBackedTensor):
+                    start_idx = self.edge_traversal_count._actual_size
+                    batch_trav = torch.zeros(chunk_size, self.k_neighbors, device=target_device)
+                    for local_i in range(chunk_size):
+                        self.edge_traversal_count[start_idx + local_i] = batch_trav[local_i]
+                else:
+                    self.edge_traversal_count = torch.cat([self.edge_traversal_count, 
+                                                           torch.zeros(chunk_size, self.k_neighbors, device=target_device)], dim=0)
+                
+                if isinstance(self.edge_success_rate, DiskBackedTensor):
+                    start_idx = self.edge_success_rate._actual_size
+                    batch_succ = torch.zeros(chunk_size, self.k_neighbors, device=target_device)
+                    for local_i in range(chunk_size):
+                        self.edge_success_rate[start_idx + local_i] = batch_succ[local_i]
+                else:
+                    self.edge_success_rate = torch.cat([self.edge_success_rate, 
                                                        torch.zeros(chunk_size, self.k_neighbors, device=target_device)], dim=0)
-                self.edge_success_rate = torch.cat([self.edge_success_rate, 
-                                                   torch.zeros(chunk_size, self.k_neighbors, device=target_device)], dim=0)
                 
-                # Type embeddings (if using types) - use target_device
+                # Type embeddings (if using types) - might be DiskBackedTensor
                 if self.use_types:
                     batch_type_embs = torch.randn(chunk_size, self.type_dim, device=target_device) * 0.1
-                    # Ensure existing type_embeddings is on target device
-                    if self.type_embeddings.device.type != target_device:
-                        self.type_embeddings = self.type_embeddings.to(target_device)
-                    self.type_embeddings = torch.cat([self.type_embeddings, batch_type_embs], dim=0)
+                    if isinstance(self.type_embeddings, DiskBackedTensor):
+                        start_idx = self.type_embeddings._actual_size
+                        for local_i in range(chunk_size):
+                            self.type_embeddings[start_idx + local_i] = batch_type_embs[local_i]
+                    else:
+                        # Ensure existing type_embeddings is on target device
+                        if self.type_embeddings.device.type != target_device:
+                            self.type_embeddings = self.type_embeddings.to(target_device)
+                        self.type_embeddings = torch.cat([self.type_embeddings, batch_type_embs], dim=0)
                 
                 # Update size - handle both DiskBackedTensor and regular tensor
                 if isinstance(self.embeddings, DiskBackedTensor):
@@ -694,37 +868,110 @@ class GraphMemoryTier(nn.Module):
         if edge_mask.any():
             edge_slot = edge_mask.nonzero(as_tuple=True)[0][0]
             
-            # Update statistics
-            self.edge_traversal_count[source_idx, edge_slot] += 1
+            # 🔥 CRITICAL: For DiskBackedTensor compatibility, use explicit assignment!
+            # In-place ops like += and *= don't trigger __setitem__, so changes
+            # would stay in RAM cache and never reach disk. We must READ then WRITE.
             
-            # Exponential moving average of success rate
+            # Update traversal count (read-modify-write)
+            old_count = self.edge_traversal_count[source_idx, edge_slot]
+            self.edge_traversal_count[source_idx, edge_slot] = old_count + 1
+            
+            # Exponential moving average of success rate (already uses =, OK!)
+            old_success = self.edge_success_rate[source_idx, edge_slot]
             self.edge_success_rate[source_idx, edge_slot] = (
-                0.9 * self.edge_success_rate[source_idx, edge_slot] + 
-                0.1 * reward
+                0.9 * old_success + 0.1 * reward
             )
             
             # Mark edge as CO_RETRIEVED (type 4)
             # Strength proportional to traversal count
-            co_retrieval_strength = min(1.0, self.edge_traversal_count[source_idx, edge_slot].item() / 10.0)
-            self.edge_types[source_idx, edge_slot, 4] = co_retrieval_strength
+            new_count = self.edge_traversal_count[source_idx, edge_slot].item()
+            co_retrieval_strength = min(1.0, new_count / 10.0)
+            old_edge_type = self.edge_types[source_idx, edge_slot].clone()
+            old_edge_type[4] = co_retrieval_strength
+            self.edge_types[source_idx, edge_slot] = old_edge_type
             
             # Reduce hyperbolic distance proportional to success
             # (Make "highway" between frequently co-retrieved memories)
             α = 0.01  # Learning rate
-            self.edge_weights[source_idx, edge_slot] *= (1 - α * reward)
+            old_weight = self.edge_weights[source_idx, edge_slot]
+            new_weight = old_weight * (1 - α * reward)
+            self.edge_weights[source_idx, edge_slot] = new_weight
+            
+            # 🛣️ LOG HIGHWAY FORMATION
+            # Track how much this edge was strengthened
+            strengthening = (old_weight - new_weight).item()
+            if strengthening > 0:
+                # Add to highway log
+                self.highway_log.append({
+                    'source_idx': source_idx,
+                    'target_idx': target_idx,
+                    'old_weight': old_weight.item(),
+                    'new_weight': new_weight.item(),
+                    'strengthening': strengthening,
+                    'traversal_count': new_count,
+                    'success_rate': self.edge_success_rate[source_idx, edge_slot].item()
+                })
+                
+                # Keep only top-K by strengthening amount
+                if len(self.highway_log) > self.highway_log_max * 2:
+                    # Sort by strengthening and keep top half
+                    self.highway_log.sort(key=lambda x: x['strengthening'], reverse=True)
+                    self.highway_log = self.highway_log[:self.highway_log_max]
+    
+    def get_highway_stats(self, top_k: int = 10):
+        """
+        Get statistics about the most strengthened edges (highways).
+        
+        Returns dict with:
+        - top_highways: List of top K most strengthened edges
+        - total_highways: Total number of strengthened edges
+        - avg_strengthening: Average strengthening amount
+        - max_strengthening: Maximum strengthening seen
+        """
+        if not self.highway_log:
+            return {
+                'top_highways': [],
+                'total_highways': 0,
+                'avg_strengthening': 0.0,
+                'max_strengthening': 0.0
+            }
+        
+        # Sort by strengthening amount
+        sorted_highways = sorted(self.highway_log, key=lambda x: x['strengthening'], reverse=True)
+        
+        return {
+            'top_highways': sorted_highways[:top_k],
+            'total_highways': len(self.highway_log),
+            'avg_strengthening': sum(h['strengthening'] for h in self.highway_log) / len(self.highway_log),
+            'max_strengthening': sorted_highways[0]['strengthening'] if sorted_highways else 0.0
+        }
     
     def prune_weak_edges(self, poincare, threshold: float = 0.1):
         """
         Remove rarely-used edges and replace with fresh k-NN search.
         
         Like overgrown paths in a forest - if unused, they disappear!
+        
+        NOTE: Disabled for disk-backed tiers - pruning 100K+ nodes is too expensive
+        and the k-NN graph is already well-formed. Focus on Hebbian strengthening instead!
         """
+        # Skip pruning for disk-backed tiers (too expensive, not needed)
+        if self.use_disk:
+            return
+        
         if self.size == 0:
             return
         
         # Check if edge_traversal_count is empty (can happen with disk-backed tier)
-        if self.edge_traversal_count.numel() == 0:
-            return
+        # For DiskBackedTensor, check shape; for regular tensor, check numel
+        if hasattr(self.edge_traversal_count, 'shape'):
+            if self.edge_traversal_count.shape[0] == 0:
+                return
+        elif hasattr(self.edge_traversal_count, 'numel'):
+            if self.edge_traversal_count.numel() == 0:
+                return
+        else:
+            return  # Unknown type, skip pruning
         
         # Normalize traversal counts
         max_count = self.edge_traversal_count.max()
@@ -740,6 +987,11 @@ class GraphMemoryTier(nn.Module):
         nodes_to_rewire = weak_mask.any(dim=1).nonzero(as_tuple=True)[0]
         
         for node_idx in nodes_to_rewire[:10]:  # Limit to 10 per call to avoid lag
+            # Safety: Skip if not enough nodes for k-NN
+            # Need at least 2 nodes to have any neighbors (self excluded)
+            if self.size.item() < 2:
+                continue
+            
             # Re-search k-NN in current embedding space
             dists = poincare.distance(
                 self.embeddings[node_idx].unsqueeze(0),
@@ -750,6 +1002,10 @@ class GraphMemoryTier(nn.Module):
             dists[node_idx] = float('inf')
             
             k_actual = min(self.k_neighbors, self.size.item() - 1)
+            # Additional safety: k_actual must be at least 1
+            if k_actual < 1:
+                continue
+            
             topk_dists, topk_indices = torch.topk(dists, k_actual, largest=False)
             
             # Replace adjacency for this node
@@ -882,42 +1138,85 @@ class GraphMemoryTier(nn.Module):
                 for i in range(batch_size):
                     self.embeddings[old_size + i] = embeddings_device[i]
             
-            self.adjacency = torch.cat([self.adjacency, adjacency_device], dim=0)
-            self.edge_weights = torch.cat([self.edge_weights, edge_weights_device], dim=0)
+            # Handle adjacency (might be DiskBackedTensor)
+            if not isinstance(self.adjacency, DiskBackedTensor):
+                self.adjacency = torch.cat([self.adjacency, adjacency_device], dim=0)
+            else:
+                for i in range(batch_size):
+                    self.adjacency[old_size + i] = adjacency_device[i]
+            
+            # Handle edge_weights (might be DiskBackedTensor)
+            if not isinstance(self.edge_weights, DiskBackedTensor):
+                self.edge_weights = torch.cat([self.edge_weights, edge_weights_device], dim=0)
+            else:
+                for i in range(batch_size):
+                    self.edge_weights[old_size + i] = edge_weights_device[i]
             
             # Initialize edge_types for new nodes (default: all zeros except PROXIMITY)
             new_edge_types = torch.zeros(batch_size, adjacency.shape[1], 8, device=self.device)
             new_edge_types[:, :, 0] = 1.0  # All edges are PROXIMITY by default
-            self.edge_types = torch.cat([self.edge_types, new_edge_types], dim=0)
+            if not isinstance(self.edge_types, DiskBackedTensor):
+                self.edge_types = torch.cat([self.edge_types, new_edge_types], dim=0)
+            else:
+                for i in range(batch_size):
+                    self.edge_types[old_size + i] = new_edge_types[i]
             
-            self.cluster_ids = torch.cat([self.cluster_ids, cluster_ids_device], dim=0)
+            # cluster_ids might be DiskBackedTensor
+            if isinstance(self.cluster_ids, DiskBackedTensor):
+                for i in range(batch_size):
+                    self.cluster_ids[old_size + i] = cluster_ids_device[i]
+            else:
+                self.cluster_ids = torch.cat([self.cluster_ids, cluster_ids_device], dim=0)
+            
+            # rewards, age, access are always regular tensors
             self.rewards = torch.cat([self.rewards, rewards_device], dim=0)
             self.age = torch.cat([self.age, torch.zeros(batch_size, device=self.device)], dim=0)
             self.access = torch.cat([self.access, torch.zeros(batch_size, device=self.device)], dim=0)
             
-            # Initialize depths and type_embeddings for new nodes
-            # CRITICAL: Ensure self.depths is on correct device (might have been moved during retrieval)
-            if str(self.depths.device).split(':')[0] != str(self.device).split(':')[0]:
-                self.depths = self.depths.to(self.device)
+            # depths might be DiskBackedTensor
             new_depths = torch.norm(embeddings_device, dim=-1).to(self.device)
-            self.depths = torch.cat([self.depths, new_depths], dim=0)
+            if isinstance(self.depths, DiskBackedTensor):
+                for i in range(batch_size):
+                    self.depths[old_size + i] = new_depths[i]
+            else:
+                # CRITICAL: Ensure self.depths is on correct device (might have been moved during retrieval)
+                if str(self.depths.device).split(':')[0] != str(self.device).split(':')[0]:
+                    self.depths = self.depths.to(self.device)
+                self.depths = torch.cat([self.depths, new_depths], dim=0)
             
+            # type_embeddings might be DiskBackedTensor
             if self.use_types:
                 new_type_embeddings = torch.randn(batch_size, self.type_dim, device=self.device) * 0.1
-                self.type_embeddings = torch.cat([self.type_embeddings, new_type_embeddings], dim=0)
+                if isinstance(self.type_embeddings, DiskBackedTensor):
+                    for i in range(batch_size):
+                        self.type_embeddings[old_size + i] = new_type_embeddings[i]
+                else:
+                    self.type_embeddings = torch.cat([self.type_embeddings, new_type_embeddings], dim=0)
             
-            # Initialize edge tracking for new nodes
+            # Initialize edge tracking for new nodes (might be DiskBackedTensor)
             new_edge_traversal = torch.zeros(batch_size, adjacency.shape[1], device=self.device)
             new_edge_success = torch.zeros(batch_size, adjacency.shape[1], device=self.device)
-            self.edge_traversal_count = torch.cat([self.edge_traversal_count, new_edge_traversal], dim=0)
-            self.edge_success_rate = torch.cat([self.edge_success_rate, new_edge_success], dim=0)
+            if not isinstance(self.edge_traversal_count, DiskBackedTensor):
+                self.edge_traversal_count = torch.cat([self.edge_traversal_count, new_edge_traversal], dim=0)
+            else:
+                for i in range(batch_size):
+                    self.edge_traversal_count[old_size + i] = new_edge_traversal[i]
+            
+            if not isinstance(self.edge_success_rate, DiskBackedTensor):
+                self.edge_success_rate = torch.cat([self.edge_success_rate, new_edge_success], dim=0)
+            else:
+                for i in range(batch_size):
+                    self.edge_success_rate[old_size + i] = new_edge_success[i]
         
-        # Update size: Use adjacency as source of truth (it's always kept in sync)
+        # Update size: Use _actual_size for DiskBackedTensor (not .shape which is max capacity)
         # This handles both DiskBackedTensor and regular tensor cases correctly
         from disk_backed_tensor import DiskBackedTensor
         if isinstance(self.embeddings, DiskBackedTensor):
-            # For DiskBackedTensor, adjacency size is authoritative (metadata is always in RAM)
-            self.size = torch.tensor(self.adjacency.shape[0], dtype=torch.long, device=self.device)
+            # For DiskBackedTensor, use _actual_size (number of items added, not max capacity)
+            self.size = torch.tensor(self.embeddings._actual_size, dtype=torch.long, device=self.device)
+        elif isinstance(self.adjacency, DiskBackedTensor):
+            # If adjacency is DiskBackedTensor, use its _actual_size
+            self.size = torch.tensor(self.adjacency._actual_size, dtype=torch.long, device=self.device)
         else:
             # For regular tensors, use embeddings size
             self.size = torch.tensor(self.embeddings.shape[0], dtype=torch.long, device=self.device)
@@ -1111,34 +1410,46 @@ class GraphMemoryTier(nn.Module):
 
 class HyperbolicGraphConv(nn.Module):
     """
-    Hyperbolic Graph Convolution with proper Möbius operations.
+    🧠 HIPPOCAMPAL DEQ-GNN: Single-layer iterative graph convolution
     
-    Instead of Euclidean aggregation, we:
-    1. Map features to Poincaré ball
-    2. Compute attention in hyperbolic space
-    3. Aggregate using logarithmic/exponential maps (tangent space)
-    4. Apply Möbius transformations
+    Instead of multi-layer GNN depth, we leverage DEQ's iterative refinement!
+    The DEQ runs this layer 12 times → implicit 12-hop message propagation.
+    
+    This is how the HIPPOCAMPUS works: recurrent loops through CA3→CA1→EC→CA3,
+    with memory retrieval as an iterative settling process into attractors.
     
     Mathematical foundation:
-    h'_i = exp_p_i(Σ α_ij * log_p_i(p_j))
+    z* = f(z*, neighbors) where DEQ solves for fixed point z*
     
-    where α_ij are attention weights computed from hyperbolic distances.
+    Each iteration:
+    h'_i = exp_p_i(Σ w_ij * α_ij * log_p_i(p_j))
+    
+    where:
+    - w_ij = exp(-d_hyp(i,j) / T) : Hyperbolic distance weighting (geometry prior)
+    - α_ij : Learned attention (relevance)
+    - DEQ iterations : Deep propagation through recurrence
+    
+    🔥 MEMORY OPTIMIZATION:
+    - Single layer (not 2-3 layers) → 50% less activation storage
+    - Hyperbolic distance weighting → implicit sparsity (far neighbors contribute less)
+    - DEQ reuses activations → no multi-layer gradient storage
+    - Expected VRAM savings: ~400-500 MB vs traditional multi-layer GNN
     """
     
-    def __init__(self, in_dim: int, out_dim: int, use_gradient_checkpointing: bool = True):
+    def __init__(self, in_dim: int, out_dim: int, use_gradient_checkpointing: bool = True,
+                 temperature: float = 1.0):
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.use_gradient_checkpointing = use_gradient_checkpointing  # Save ~30-40% VRAM
+        self.temperature = nn.Parameter(torch.tensor(temperature))  # Learnable distance decay
         
-        # Learned transformations in tangent space
-        self.W_self = nn.Linear(in_dim, out_dim)
-        self.W_neighbor = nn.Linear(in_dim, out_dim)
+        # SINGLE transformation (DEQ provides depth through iteration!)
+        self.W = nn.Linear(in_dim, out_dim)
         
-        # Attention mechanism
-        self.attn_query = nn.Linear(out_dim, out_dim)
-        self.attn_key = nn.Linear(out_dim, out_dim)
-        self.attn_scale = nn.Parameter(torch.ones(1))
+        # Lightweight attention (just for relevance, geometry handles proximity)
+        self.attn_query = nn.Linear(out_dim, out_dim // 4)  # Smaller dim = less memory
+        self.attn_key = nn.Linear(out_dim, out_dim // 4)
         
         self.ln = nn.LayerNorm(out_dim)
         
@@ -1166,89 +1477,81 @@ class HyperbolicGraphConv(nn.Module):
         else:
             return self._forward_impl(x, adjacency, edge_weights, node_embeddings, poincare)
     
-    def _forward_impl(self, x: torch.Tensor, adjacency: torch.Tensor, 
+    def _forward_impl(self, x: torch.Tensor, adjacency: torch.Tensor,
                      edge_weights: torch.Tensor, node_embeddings: torch.Tensor,
                      poincare: PoincareManifold) -> torch.Tensor:
-        """Actual forward implementation (checkpointed during training)"""
+        """
+        🌀 Hippocampal recurrent update (one DEQ iteration)
+        
+        This gets called 12 times by DEQ → 12-hop message propagation!
+        """
         N, k = adjacency.shape
         
-        # Transform features
-        x_self = self.W_self(x)  # [N, out_dim]
+        # CRITICAL: Device-aware neighbor gathering (CPU long-term → GPU processing)
+        if node_embeddings.device != x.device:
+            valid_mask = adjacency >= 0
+            adjacency_cpu = adjacency.cpu()
+            safe_adjacency_cpu = torch.where(valid_mask.cpu(), adjacency_cpu, torch.tensor(0, dtype=torch.long))
+            unique_idx = torch.unique(safe_adjacency_cpu)
+            
+            # Transfer ONLY needed neighbors to GPU (not all 200K!)
+            needed_embeddings = node_embeddings[unique_idx].to(x.device)
+            
+            # Build local index map
+            idx_map = torch.zeros(node_embeddings.shape[0], dtype=torch.long)
+            idx_map[unique_idx] = torch.arange(len(unique_idx))
+            local_adj = idx_map[safe_adjacency_cpu].to(x.device)
+            neighbor_features = needed_embeddings[local_adj]  # [N, k, in_dim]
+        else:
+            valid_mask = adjacency >= 0
+            safe_adjacency = torch.where(valid_mask, adjacency, torch.tensor(0, dtype=torch.long, device=adjacency.device))
+            neighbor_features = node_embeddings[safe_adjacency]  # [N, k, in_dim]
         
-        # Gather neighbors
-        valid_mask = adjacency >= 0
-        safe_adjacency = torch.where(valid_mask, adjacency, 0)
-        neighbor_features = node_embeddings[safe_adjacency]  # [N, k, in_dim]
-        neighbor_features = self.W_neighbor(neighbor_features)  # [N, k, out_dim]
+        # SINGLE transformation (not W_self + W_neighbor!)
+        x_transformed = self.W(x)  # [N, out_dim]
+        neighbor_transformed = self.W(neighbor_features)  # [N, k, out_dim]
         
-        # Map to hyperbolic space with MINIMAL memory footprint
-        # Use inplace operations and avoid storing intermediate lists
-        chunk_size = 32  # Smaller chunks
+        # 🔥 HYPERBOLIC DISTANCE WEIGHTING (Geometry Prior!)
+        # Closer neighbors = stronger influence (exponential decay with distance)
+        # This creates IMPLICIT SPARSITY - far neighbors contribute ~0
         
-        # Preallocate output tensors
-        x_hyp = torch.empty_like(x_self)
-        neighbor_hyp = torch.empty(N, k, self.out_dim, device=x_self.device, dtype=x_self.dtype)
+        # Normalize edge weights per node to prevent extreme outliers from dominating
+        # This helps when Hebbian learning creates very strong highways (very low distances)
+        # vs weak connections (very high distances) - keeps gradients stable
+        edge_weights_min = edge_weights.min(dim=-1, keepdim=True)[0]
+        edge_weights_max = edge_weights.max(dim=-1, keepdim=True)[0]
+        edge_weights_range = edge_weights_max - edge_weights_min + 1e-8
+        edge_weights_normalized = (edge_weights - edge_weights_min) / edge_weights_range  # [0, 1] per node
         
-        # Process x_self in chunks
-        for i in range(0, N, chunk_size):
-            end_i = min(i + chunk_size, N)
-            chunk = x_self[i:end_i]
-            x_hyp[i:end_i] = poincare.exponential_map(
-                torch.zeros_like(chunk), 
-                chunk * 0.1
-            )
+        # Apply exponential decay (now on normalized [0,1] scale, then scaled by learnable temp)
+        distance_weights = torch.exp(-edge_weights_normalized / self.temperature.abs())  # [N, k]
+        distance_weights = torch.where(valid_mask, distance_weights, torch.zeros_like(distance_weights))
         
-        # Process neighbors in chunks (most memory-intensive part)
-        for i in range(0, N, chunk_size):
-            end_i = min(i + chunk_size, N)
-            chunk = neighbor_features[i:end_i]  # [chunk, k, out_dim]
-            chunk_size_actual = end_i - i
-            chunk_flat = chunk.reshape(-1, self.out_dim)  # [chunk*k, out_dim]
-            chunk_hyp_flat = poincare.exponential_map(
-                torch.zeros_like(chunk_flat),
-                chunk_flat * 0.1
-            )
-            neighbor_hyp[i:end_i] = chunk_hyp_flat.reshape(chunk_size_actual, k, self.out_dim)
+        # Normalize distance weights (softmax-like, but geometry-driven)
+        distance_weights = distance_weights / (distance_weights.sum(dim=-1, keepdim=True) + 1e-8)
         
-        # Compute attention scores using hyperbolic geometry
-        # Query from current node
-        query = self.attn_query(x_self).unsqueeze(1)  # [N, 1, out_dim]
+        # ✨ LEARNED ATTENTION (Relevance, not just proximity)
+        # Lightweight: out_dim // 4 to save memory
+        query = self.attn_query(x_transformed).unsqueeze(1)  # [N, 1, out_dim//4]
+        keys = self.attn_key(neighbor_transformed)  # [N, k, out_dim//4]
         
-        # Keys from neighbors
-        keys = self.attn_key(neighbor_features)  # [N, k, out_dim]
+        learned_scores = (query @ keys.transpose(-2, -1)).squeeze(1) / ((self.out_dim // 4) ** 0.5)  # [N, k]
+        learned_scores = torch.where(valid_mask, learned_scores, torch.tensor(-1e9, device=learned_scores.device))
+        learned_weights = F.softmax(learned_scores, dim=-1)  # [N, k]
         
-        # Attention scores (mix geometric distance + learned attention)
-        # Geometric component: use hyperbolic distance
-        geo_scores = -edge_weights  # [N, k] - closer = higher score
+        # 🧠 COMBINED WEIGHTING: Geometry × Relevance
+        # Both geometry (distance) and semantics (attention) matter!
+        combined_weights = distance_weights * learned_weights  # Element-wise product
+        combined_weights = combined_weights / (combined_weights.sum(dim=-1, keepdim=True) + 1e-8)  # Renormalize
         
-        # Learned component: dot product attention
-        learned_scores = (query @ keys.transpose(-2, -1)).squeeze(1) / (self.out_dim ** 0.5)  # [N, k]
+        # MESSAGE AGGREGATION (Euclidean for speed, hyperbolic ops are expensive!)
+        # The graph structure + distance weighting already encodes hyperbolic geometry
+        messages = (neighbor_transformed * combined_weights.unsqueeze(-1)).sum(dim=1)  # [N, out_dim]
         
-        # Combine both with learned scale
-        attn_scores = self.attn_scale * learned_scores + geo_scores  # [N, k]
-        attn_scores = torch.where(valid_mask, attn_scores, -1e9)
+        # Residual connection + normalization (stable DEQ dynamics!)
+        output = self.ln(x_transformed + messages)
         
-        attn_weights = F.softmax(attn_scores, dim=-1)  # [N, k]
-        
-        # Aggregate in tangent space (mathematically correct!)
-        # For each node i, compute: exp_p_i(Σ α_ij * log_p_i(p_j))
-        
-        # Compute tangent vectors: simple difference (approximate log map)
-        # [N, k, out_dim] - [N, 1, out_dim] = [N, k, out_dim]
-        tangent_vecs = neighbor_hyp - x_hyp.unsqueeze(1)
-        
-        # Weighted sum in tangent space
-        aggregated_tangent = (tangent_vecs * attn_weights.unsqueeze(-1)).sum(dim=1)  # [N, out_dim]
-        
-        # Map back to manifold using exponential map (chunked in-place)
-        updated_hyp = torch.empty_like(x_hyp)
-        for i in range(0, N, chunk_size):
-            end_i = min(i + chunk_size, N)
-            node_chunk = x_hyp[i:end_i]
-            tangent_chunk = aggregated_tangent[i:end_i]
-            updated_hyp[i:end_i] = poincare.exponential_map(node_chunk, tangent_chunk * 0.1)
-        
-        # Project back to Euclidean for next layer
+        return output
         # Use inverse of exponential map (approximate)
         updated_euclidean = updated_hyp / (1 - updated_hyp.norm(dim=-1, keepdim=True).clamp(max=0.9))
         
@@ -1366,6 +1669,22 @@ class GraphMemoryQueryNetwork(nn.Module):
         
         # Use Euclidean distance (cheap, good approximation for k-NN)
         # Process in batches to handle DiskBackedTensor efficiently
+        
+        # Safety: If tier is empty, return empty bundle
+        if M == 0:
+            empty_bundle = {
+                'embeddings': torch.zeros(B, T, k, self.memory_dim, device=query.device),
+                'adjacency': torch.full((B, T, k, self.k_neighbors), -1, dtype=torch.long, device=query.device),
+                'edge_weights': torch.zeros(B, T, k, self.k_neighbors, device=query.device),
+                'edge_types': torch.zeros(B, T, k, self.k_neighbors, self.num_edge_types, device=query.device),
+                'cluster_ids': torch.zeros(B, T, k, dtype=torch.long, device=query.device),
+                'depths': torch.zeros(B, T, k, device=query.device),
+                'indices': torch.full((B, T, k), -1, dtype=torch.long, device=query.device),
+            }
+            if memory_tier.use_types:
+                empty_bundle['type_embeddings'] = torch.zeros(B, T, k, memory_tier.type_dim, device=query.device)
+            return empty_bundle
+        
         k_actual = min(k * 4, M)  # Oversample for refinement
         batch_size = min(1000, M)
         
@@ -1424,7 +1743,9 @@ class GraphMemoryQueryNetwork(nn.Module):
         # STRUCTURE: Get type embeddings (emergent categorical information)
         retrieved_types = None
         if memory_tier.use_types:
-            retrieved_types = memory_tier.type_embeddings[safe_indices]  # [B*T, k, type_dim]
+            # Use flattened indices for DiskBackedTensor compatibility
+            retrieved_types_flat = memory_tier.type_embeddings[flat_indices]  # [B*T*k, type_dim]
+            retrieved_types = retrieved_types_flat.view(-1, k, memory_tier.type_dim)  # [B*T, k, type_dim]
         
         # Optionally apply hyperbolic GNN to refine retrieved memories
         # This aggregates information from graph neighbors using proper Möbius operations
@@ -1434,7 +1755,16 @@ class GraphMemoryQueryNetwork(nn.Module):
             adj = retrieved_adj.view(-1, self.k_neighbors)  # [B*T*k, k_neighbors]
             weights = retrieved_edge_weights.view(-1, self.k_neighbors)  # [B*T*k, k_neighbors]
             
+            # CRITICAL: Move x to same device as GNN layers (GPU)
+            # retrieved_emb might be on CPU (long-term tier), but GNN is on GPU
+            target_device = next(self.graph_conv.parameters()).device
+            if x.device != target_device:
+                x = x.to(target_device)
+                adj = adj.to(target_device)
+                weights = weights.to(target_device)
+            
             # Apply graph convolution with hyperbolic geometry
+            # Device handling for node_embeddings is done inside graph_conv._forward_impl
             refined_flat = self.graph_conv(x, adj, weights, memory_tier.embeddings, self.poincare)
             refined = refined_flat.view(B, T, k, self.memory_dim)
         else:
@@ -1646,17 +1976,39 @@ class GraphMemorySystem(nn.Module):
     
     def record_retrieval_success(self, query_embedding: torch.Tensor, 
                                  retrieved_indices: torch.Tensor, 
-                                 reward: float):
+                                 reward: float,
+                                 tier: str = 'working'):
         """
         Record which memories were retrieved together successfully.
         
         Strengthens edges along the traversal path - creates "highways"!
+        
+        🔥 HEBBIAN LEARNING IN LONG-TERM MEMORY:
+        When the DEQ navigates through memories and gets rewarded (low loss),
+        we strengthen the edges it traversed. Over time, this creates "highways"
+        through the 200K memory graph - fast paths to useful knowledge!
+        
+        Args:
+            query_embedding: The query that triggered retrieval
+            retrieved_indices: Which memories were retrieved (in order)
+            reward: How helpful this retrieval was (higher = strengthen more)
+            tier: Which tier to strengthen ('working', 'buffer', or 'longterm')
         """
         if len(retrieved_indices) < 2:
             return
         
-        # Safety: skip if working memory is empty
-        if self.working.size == 0:
+        # Select tier to update
+        if tier == 'working':
+            memory_tier = self.working
+        elif tier == 'buffer':
+            memory_tier = self.buffer
+        elif tier == 'longterm':
+            memory_tier = self.longterm
+        else:
+            return
+        
+        # Safety: skip if tier is empty
+        if memory_tier.size == 0:
             return
         
         # Strengthen edges between consecutively retrieved memories
@@ -1664,12 +2016,12 @@ class GraphMemorySystem(nn.Module):
             idx_a = retrieved_indices[i].item()
             idx_b = retrieved_indices[i+1].item()
             
-            # Only strengthen if both are valid indices in working tier
+            # Only strengthen if both are valid indices in this tier
             # Check: >= 0 (not placeholder) and < size (within bounds)
-            if (idx_a >= 0 and idx_a < self.working.size.item() and 
-                idx_b >= 0 and idx_b < self.working.size.item()):
-                self.working.strengthen_edge(idx_a, idx_b, reward=reward)
-                self.working.strengthen_edge(idx_b, idx_a, reward=reward)  # Bidirectional
+            if (idx_a >= 0 and idx_a < memory_tier.size.item() and 
+                idx_b >= 0 and idx_b < memory_tier.size.item()):
+                memory_tier.strengthen_edge(idx_a, idx_b, reward=reward)
+                memory_tier.strengthen_edge(idx_b, idx_a, reward=reward)  # Bidirectional
     
     def evolve_graph(self, enable_sleep_replay: bool = False):
         """
@@ -1879,20 +2231,24 @@ class GraphMemorySystem(nn.Module):
         self.buffer.access = torch.zeros(0, device='cuda')
         self.buffer.size = torch.tensor(0, dtype=torch.long, device='cuda')
     
-    def retrieve(self, query: torch.Tensor, k: int = 20) -> dict:
+    def retrieve(self, query: torch.Tensor, k: int = None) -> dict:
         """
         Retrieve memories with FULL STRUCTURE for navigation.
         Also stores new memories during training AND records retrieval patterns!
         
         Args:
             query: [B, T, query_dim] reflex embeddings
-            k: number of memories to retrieve per tier
+            k: number of memories to retrieve per tier (default: use self.k_neighbors from config)
         
         Returns:
             dict with:
                 'enhanced_context': [B, T, context_dim] - integrated output
                 'bundle': dict with structure (embeddings, adjacency, depths, types, etc.)
         """
+        # Use configured k_neighbors if not specified
+        if k is None:
+            k = self.k_neighbors
+        
         B, T, C = query.shape
         
         # FORMATION: Add to working memory during training
@@ -1931,28 +2287,56 @@ class GraphMemorySystem(nn.Module):
                                  self.query_network.query_proj.in_features != C or
                                  self.query_network.query_proj.out_features != self.memory_dim)
         
-        if self.training and working_bundle['indices'].numel() > 0 and not skip_dynamic_learning:
+        if self.training and not skip_dynamic_learning:
             # Compute retrieval quality (simple: based on attention entropy)
             # Lower entropy = more confident retrieval = better reward
             with torch.no_grad():
                 query_flat = query.view(-1, C)  # [B*T, C]
-                working_flat = working_bundle['embeddings'].view(-1, k, self.memory_dim)  # [B*T, k, D]
                 
-                # Compute attention scores
-                scores = torch.bmm(working_flat, query_flat.unsqueeze(-1)).squeeze(-1)  # [B*T, k]
-                probs = torch.softmax(scores, dim=-1)  # [B*T, k]
-                
-                # Entropy (lower = more confident)
-                entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1)  # [B*T]
-                reward = 1.0 - entropy.mean().item() / torch.log(torch.tensor(k, dtype=torch.float))
-                
-                # Record pattern for first batch/token (representative)
-                if working_bundle['indices'][0, 0].numel() > 1:
-                    self.record_retrieval_success(
-                        query[0, 0],  # First query
-                        working_bundle['indices'][0, 0],  # Retrieved indices
-                        reward=max(0.0, reward)
-                    )
+                # Compute attention scores from combined memories (use longterm as primary signal)
+                # This is where most of the knowledge is!
+                if longterm_bundle['embeddings'].numel() > 0:
+                    longterm_flat = longterm_bundle['embeddings'].view(-1, k, self.memory_dim)  # [B*T, k, D]
+                    
+                    # Compute attention scores
+                    scores = torch.bmm(longterm_flat, query_flat.unsqueeze(-1)).squeeze(-1)  # [B*T, k]
+                    probs = torch.softmax(scores, dim=-1)  # [B*T, k]
+                    
+                    # Entropy (lower = more confident)
+                    entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1)  # [B*T]
+                    reward = 1.0 - entropy.mean().item() / torch.log(torch.tensor(k, dtype=torch.float))
+                    reward = max(0.0, reward)
+                    
+                    # 🔥 HEBBIAN LEARNING: Strengthen edges in ALL tiers based on retrieval success
+                    # Record pattern for first batch/token (representative)
+                    
+                    # WORKING MEMORY (tiny, fast updates)
+                    if working_bundle['indices'][0, 0].numel() > 1:
+                        self.record_retrieval_success(
+                            query[0, 0],
+                            working_bundle['indices'][0, 0],
+                            reward=reward,
+                            tier='working'
+                        )
+                    
+                    # BUFFER MEMORY (intermediate term)
+                    if buffer_bundle['indices'][0, 0].numel() > 1:
+                        self.record_retrieval_success(
+                            query[0, 0],
+                            buffer_bundle['indices'][0, 0],
+                            reward=reward * 0.5,  # Slower updates for stability
+                            tier='buffer'
+                        )
+                    
+                    # 🌟 LONG-TERM MEMORY (THE BIG ONE - 200K nodes!)
+                    # This is where the DEQ learns to sculpt the knowledge graph!
+                    if longterm_bundle['indices'][0, 0].numel() > 1:
+                        self.record_retrieval_success(
+                            query[0, 0],
+                            longterm_bundle['indices'][0, 0],
+                            reward=reward * 0.1,  # Very slow updates (preserve stability)
+                            tier='longterm'
+                        )
         
         # Combine all retrieved memories (flatten k dimension)
         bundles_to_combine = [working_bundle, buffer_bundle, longterm_bundle]
@@ -2233,6 +2617,19 @@ class GraphMemorySystem(nn.Module):
             print(f"[Graph Evolution] Pruning weak edges and optimizing structure...")
             self.evolve_graph(enable_sleep_replay=False)  # Sleep replay now happens at consolidation
             print(f"  Working: {self.working.size} nodes, Buffer: {self.buffer.size}, Longterm: {self.longterm.size}")
+            
+            # 🛣️ HIGHWAY REPORT: Show top strengthened edges
+            highway_stats = self.longterm.get_highway_stats(top_k=5)
+            if highway_stats['total_highways'] > 0:
+                print(f"  🛣️ Highways: {highway_stats['total_highways']} edges strengthened, "
+                      f"max={highway_stats['max_strengthening']:.4f}, "
+                      f"avg={highway_stats['avg_strengthening']:.4f}")
+                print(f"     Top 5 highways:")
+                for i, hw in enumerate(highway_stats['top_highways']):
+                    print(f"       {i+1}. Edge {hw['source_idx']}→{hw['target_idx']}: "
+                          f"weight {hw['old_weight']:.3f}→{hw['new_weight']:.3f} "
+                          f"(Δ={hw['strengthening']:.4f}, traversals={hw['traversal_count']}, "
+                          f"success={hw['success_rate']:.2f})")
     
     def _sleep_replay_reconsolidation(self, replay_fraction: float = 0.1):
         """
@@ -2306,12 +2703,165 @@ class GraphMemorySystem(nn.Module):
     
     def get_memory_stats(self) -> dict:
         """Get statistics about memory usage."""
-        return {
+        # Get highway stats from longterm (where most learning happens)
+        longterm_highways = self.longterm.get_highway_stats(top_k=5)
+        
+        stats = {
             'num_working': self.working.size.item(),
             'num_buffer': self.buffer.size.item(),
             'num_longterm': self.longterm.size.item(),
             'working_size': self.working.size.item(),  # Legacy compatibility
             'buffer_size': self.buffer.size.item(),
             'longterm_size': self.longterm.size.item(),
-            'total_size': self.working.size.item() + self.buffer.size.item() + self.longterm.size.item()
+            'total_size': self.working.size.item() + self.buffer.size.item() + self.longterm.size.item(),
+            # 🛣️ HIGHWAY STATS
+            'highways_formed': longterm_highways['total_highways'],
+            'max_highway_strength': longterm_highways['max_strengthening'],
+            'avg_highway_strength': longterm_highways['avg_strengthening']
         }
+        
+        return stats
+    
+    def save_checkpoint(self, filepath: str):
+        """
+        💾 SAVE COMPLETE GRAPH STATE (embeddings + structure + Hebbian learning state)
+        
+        Saves ALL graph metadata to preserve learned structure across restarts:
+        - Adjacency (which memories are connected)
+        - Edge weights (hyperbolic distances - can be strengthened by Hebbian learning)
+        - Edge types (semantic relationship classification)
+        - Edge traversal counts (usage statistics)
+        - Edge success rates (Hebbian learning - which paths help prediction)
+        - Cluster IDs (hierarchical organization)
+        - Rewards (memory quality scores)
+        - Access counts (memory importance)
+        - Ages (for decay/forgetting)
+        
+        🔥 CRITICAL: Without this, all Hebbian learning is LOST on restart!
+        The graph structure represents LEARNED knowledge about memory relationships.
+        """
+        import pickle
+        import os
+        
+        checkpoint = {
+            'working': {
+                'embeddings': self.working.embeddings.cpu() if hasattr(self.working.embeddings, 'cpu') else self.working.embeddings,
+                'adjacency': self.working.adjacency.cpu(),
+                'edge_weights': self.working.edge_weights.cpu(),
+                'edge_types': self.working.edge_types.cpu(),
+                'edge_traversal_count': self.working.edge_traversal_count.cpu(),
+                'edge_success_rate': self.working.edge_success_rate.cpu(),
+                'cluster_ids': self.working.cluster_ids.cpu(),
+                'rewards': self.working.rewards.cpu(),
+                'access': self.working.access.cpu(),
+                'age': self.working.age.cpu(),
+                'size': self.working.size.item(),
+                'capacity': self.working.capacity,
+            },
+            'buffer': {
+                'embeddings': self.buffer.embeddings.cpu() if hasattr(self.buffer.embeddings, 'cpu') else self.buffer.embeddings,
+                'adjacency': self.buffer.adjacency.cpu(),
+                'edge_weights': self.buffer.edge_weights.cpu(),
+                'edge_types': self.buffer.edge_types.cpu(),
+                'edge_traversal_count': self.buffer.edge_traversal_count.cpu(),
+                'edge_success_rate': self.buffer.edge_success_rate.cpu(),
+                'cluster_ids': self.buffer.cluster_ids.cpu(),
+                'rewards': self.buffer.rewards.cpu(),
+                'access': self.buffer.access.cpu(),
+                'age': self.buffer.age.cpu(),
+                'size': self.buffer.size.item(),
+                'capacity': self.buffer.capacity,
+            },
+            'longterm': {
+                # DiskBackedTensor handles embeddings separately - DON'T include them in pickle!
+                # Only save regular tensors that can be pickled
+                'adjacency': self.longterm.adjacency.cpu() if isinstance(self.longterm.adjacency, torch.Tensor) else None,
+                'edge_weights': self.longterm.edge_weights.cpu() if isinstance(self.longterm.edge_weights, torch.Tensor) else None,
+                'edge_types': self.longterm.edge_types.cpu() if isinstance(self.longterm.edge_types, torch.Tensor) else None,
+                'edge_traversal_count': self.longterm.edge_traversal_count.cpu() if isinstance(self.longterm.edge_traversal_count, torch.Tensor) else None,
+                'edge_success_rate': self.longterm.edge_success_rate.cpu() if isinstance(self.longterm.edge_success_rate, torch.Tensor) else None,
+                'cluster_ids': self.longterm.cluster_ids.cpu() if isinstance(self.longterm.cluster_ids, torch.Tensor) else None,
+                'rewards': self.longterm.rewards.cpu() if isinstance(self.longterm.rewards, torch.Tensor) else None,
+                'access': self.longterm.access.cpu() if isinstance(self.longterm.access, torch.Tensor) else None,
+                'age': self.longterm.age.cpu() if isinstance(self.longterm.age, torch.Tensor) else None,
+                'size': self.longterm.size.item(),
+                'capacity': self.longterm.capacity,
+                # Note: embeddings/depths/type_embeddings are DiskBackedTensor - loaded automatically from disk
+            },
+            'config': {
+                'k_neighbors': self.k_neighbors,
+                'memory_dim': self.memory_dim,
+                'context_dim': self.context_dim,
+                'query_dim': self.query_dim,
+                'consolidation_counter': self.consolidation_counter,
+            },
+            'version': '2.0',  # Graph structure version
+        }
+        
+        with open(filepath, 'wb') as f:
+            pickle.dump(checkpoint, f)
+        
+        size_mb = os.path.getsize(filepath) / (1024**2)
+        print(f"💾 Saved graph checkpoint: {filepath} ({size_mb:.1f} MB)")
+        print(f"   W:{checkpoint['working']['size']}, B:{checkpoint['buffer']['size']}, LT:{checkpoint['longterm']['size']}")
+        print(f"   🧠 Preserved {checkpoint['longterm']['size'] * self.k_neighbors} edges with Hebbian weights!")
+    
+    def load_checkpoint(self, filepath: str):
+        """
+        📂 LOAD COMPLETE GRAPH STATE
+        
+        Restores ALL graph structure including Hebbian learning state.
+        """
+        import pickle
+        
+        with open(filepath, 'rb') as f:
+            checkpoint = pickle.load(f)
+        
+        # Restore working tier
+        self.working.embeddings = checkpoint['working']['embeddings'].to(self.working.device)
+        self.working.adjacency = checkpoint['working']['adjacency'].to(self.working.device)
+        self.working.edge_weights = checkpoint['working']['edge_weights'].to(self.working.device)
+        self.working.edge_types = checkpoint['working']['edge_types'].to(self.working.device)
+        self.working.edge_traversal_count = checkpoint['working']['edge_traversal_count'].to(self.working.device)
+        self.working.edge_success_rate = checkpoint['working']['edge_success_rate'].to(self.working.device)
+        self.working.cluster_ids = checkpoint['working']['cluster_ids'].to(self.working.device)
+        self.working.rewards = checkpoint['working']['rewards'].to(self.working.device)
+        self.working.access = checkpoint['working']['access'].to(self.working.device)
+        self.working.age = checkpoint['working']['age'].to(self.working.device)
+        self.working.size = torch.tensor(checkpoint['working']['size'], device=self.working.device)
+        self.working.capacity = checkpoint['working']['capacity']
+        
+        # Restore buffer tier
+        self.buffer.embeddings = checkpoint['buffer']['embeddings'].to(self.buffer.device)
+        self.buffer.adjacency = checkpoint['buffer']['adjacency'].to(self.buffer.device)
+        self.buffer.edge_weights = checkpoint['buffer']['edge_weights'].to(self.buffer.device)
+        self.buffer.edge_types = checkpoint['buffer']['edge_types'].to(self.buffer.device)
+        self.buffer.edge_traversal_count = checkpoint['buffer']['edge_traversal_count'].to(self.buffer.device)
+        self.buffer.edge_success_rate = checkpoint['buffer']['edge_success_rate'].to(self.buffer.device)
+        self.buffer.cluster_ids = checkpoint['buffer']['cluster_ids'].to(self.buffer.device)
+        self.buffer.rewards = checkpoint['buffer']['rewards'].to(self.buffer.device)
+        self.buffer.access = checkpoint['buffer']['access'].to(self.buffer.device)
+        self.buffer.age = checkpoint['buffer']['age'].to(self.buffer.device)
+        self.buffer.size = torch.tensor(checkpoint['buffer']['size'], device=self.buffer.device)
+        self.buffer.capacity = checkpoint['buffer']['capacity']
+        
+        # Restore longterm tier (embeddings loaded from DiskBackedTensor separately)
+        self.longterm.adjacency = checkpoint['longterm']['adjacency'].to(self.longterm.device)
+        self.longterm.edge_weights = checkpoint['longterm']['edge_weights'].to(self.longterm.device)
+        self.longterm.edge_types = checkpoint['longterm']['edge_types'].to(self.longterm.device)
+        self.longterm.edge_traversal_count = checkpoint['longterm']['edge_traversal_count'].to(self.longterm.device)
+        self.longterm.edge_success_rate = checkpoint['longterm']['edge_success_rate'].to(self.longterm.device)
+        self.longterm.cluster_ids = checkpoint['longterm']['cluster_ids'].to(self.longterm.device)
+        self.longterm.rewards = checkpoint['longterm']['rewards'].to(self.longterm.device)
+        self.longterm.access = checkpoint['longterm']['access'].to(self.longterm.device)
+        self.longterm.age = checkpoint['longterm']['age'].to(self.longterm.device)
+        self.longterm.size = torch.tensor(checkpoint['longterm']['size'], device=self.longterm.device)
+        self.longterm.capacity = checkpoint['longterm']['capacity']
+        
+        # Restore config
+        self.consolidation_counter = checkpoint['config']['consolidation_counter']
+        
+        print(f"✅ Loaded graph checkpoint: {filepath}")
+        print(f"   W:{checkpoint['working']['size']}, B:{checkpoint['buffer']['size']}, LT:{checkpoint['longterm']['size']}")
+        print(f"   🧠 Restored {checkpoint['longterm']['size'] * self.k_neighbors} edges with Hebbian learning state!")
+

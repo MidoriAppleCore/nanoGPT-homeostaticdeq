@@ -886,7 +886,8 @@ class ReflexModule(nn.Module):
             # Graph system uses GNN-based query and integration
             if self.memory_mode == 'hybrid':
                 # Retrieve using GNN query network and integrate with cross-attention
-                memory_result = self.memory_retrieval.retrieve(reflex, k=20)
+                # Use the k value the graph was built with (from config.memory_k)
+                memory_result = self.memory_retrieval.retrieve(reflex)  # Uses internal k_neighbors
                 
                 # Extract enhanced context and structure bundle
                 reflex_out = memory_result['enhanced_context']  # [B, T, C]
@@ -1698,7 +1699,14 @@ class DEQOperator(nn.Module):
             edge_importance = (edge_types * type_weights.view(1, 1, 1, 1, -1)).sum(dim=-1)
             
             # Distance similarity (closer = better)
-            distance_sim = torch.exp(-edge_weights * 0.5)  # [B, T, M, k]
+            # Normalize edge weights per memory to prevent magnitude explosions from Hebbian highways
+            # This makes exp() numerically stable and lets the network see relative rankings
+            edge_weights_min = edge_weights.min(dim=-1, keepdim=True)[0]  # [B, T, M, 1]
+            edge_weights_max = edge_weights.max(dim=-1, keepdim=True)[0]  # [B, T, M, 1]
+            edge_weights_range = edge_weights_max - edge_weights_min + 1e-8
+            edge_weights_norm = (edge_weights - edge_weights_min) / edge_weights_range  # [0, 1] per memory
+            
+            distance_sim = torch.exp(-edge_weights_norm * 2.0)  # [B, T, M, k] - scaled by 2 for steeper decay
             
             # Final score: type match × proximity
             edge_scores = edge_importance * distance_sim  # [B, T, M, k]

@@ -201,24 +201,28 @@ def preload_memories_from_dataset(
     
     memory_system = model.reflex.memory_retrieval
     
-    # Check for cached preload
-    cache_path = get_preload_cache_path(data_dir, num_samples, chunk_size)
+    # DEPRECATED: Old hardcoded cache system (replaced by --create-clean-to / --copy-clean-from)
+    # The new workflow uses DiskBackedTensor persistence which is more flexible
+    # cache_path = get_preload_cache_path(data_dir, num_samples, chunk_size)
+    # 
+    # if os.path.exists(cache_path):
+    #     if verbose:
+    #         print(f"🎯 Found cached preload! Loading from cache...")
+    #     
+    #     if load_cached_preload(cache_path, memory_system, verbose=verbose):
+    #         if verbose:
+    #             print("=" * 70 + "\n")
+    #         return memory_system.longterm.size.item() if hasattr(memory_system, 'longterm') else 0
+    #     else:
+    #         if verbose:
+    #             print("⚠️  Cache load failed, will rebuild from scratch")
+    # else:
+    #     if verbose:
+    #         print(f"📊 No cache found at: {cache_path}")
+    #         print(f"   Will build fresh preload (this will take ~10 minutes for 10K memories)")
     
-    if os.path.exists(cache_path):
-        if verbose:
-            print(f"🎯 Found cached preload! Loading from cache...")
-        
-        if load_cached_preload(cache_path, memory_system, verbose=verbose):
-            if verbose:
-                print("=" * 70 + "\n")
-            return memory_system.longterm.size.item() if hasattr(memory_system, 'longterm') else 0
-        else:
-            if verbose:
-                print("⚠️  Cache load failed, will rebuild from scratch")
-    else:
-        if verbose:
-            print(f"📊 No cache found at: {cache_path}")
-            print(f"   Will build fresh preload (this will take ~10 minutes for 10K memories)")
+    if verbose:
+        print(f"🔨 Building fresh preload (no cache - use --create-clean-to to save, --copy-clean-from to reuse)")
     
     # Load training data
     # data_dir is already 'data/dataset_name', so just append 'train.bin'
@@ -275,50 +279,79 @@ def preload_memories_from_dataset(
     positions = positions[:num_samples]  # Ensure exact count
     np.random.shuffle(positions)  # Shuffle to avoid sequential order
     
-    # TWO-PASS SMART SAMPLING (CPU-only, no model needed)
-    # Pass 1: Build token co-occurrence graph to find "hub" tokens
-    # Pass 2: Prioritize chunks containing highly-connected tokens
+    # TWO-PASS PMI-BASED SAMPLING (Research-backed: Church & Hanks 1990)
+    # Pass 1: Build PMI matrix to find semantically meaningful associations
+    # Pass 2: Prioritize chunks with high PMI scores (strong semantic content)
     
     if verbose:
-        print(f"\n� PASS 1: Analyzing token connectivity (CPU)...")
+        print(f"\n📊 PASS 1: Computing PMI scores (semantic associations)...")
     
     from collections import defaultdict
-    token_connections = defaultdict(int)  # Count of unique co-occurring tokens
+    import math
     
-    # Sample 10% of positions for connectivity analysis
-    sample_size = min(len(positions) // 10, 10000)
+    # Build co-occurrence matrix with sliding window
+    window_size = 5  # Context window (Word2Vec style)
+    co_occur = defaultdict(lambda: defaultdict(int))
+    word_freq = defaultdict(int)
+    total_pairs = 0
+    
+    # Sample 20% of positions for PMI analysis (more samples = better statistics)
+    sample_size = min(len(positions) // 5, 20000)
     sample_positions = np.random.choice(positions, size=sample_size, replace=False)
     
-    for pos in tqdm(sample_positions, desc="Building co-occurrence graph", disable=not verbose):
+    for pos in tqdm(sample_positions, desc="Building PMI matrix", disable=not verbose):
         chunk = train_data[pos:pos+chunk_size]
         if len(chunk) < chunk_size:
             continue
         
-        # Count unique tokens in this chunk
-        unique_tokens = set(chunk.tolist())
-        
-        # Each token gets credit for co-occurring with others
-        for tok in unique_tokens:
-            token_connections[tok] += len(unique_tokens) - 1  # Connected to N-1 other unique tokens
+        # Count word frequencies and co-occurrences within window
+        for i, w1 in enumerate(chunk.tolist()):
+            word_freq[w1] += 1
+            # Look at context words within window
+            for offset in range(1, window_size + 1):
+                if i + offset < len(chunk):
+                    w2 = chunk[i + offset].item()
+                    co_occur[w1][w2] += 1
+                    co_occur[w2][w1] += 1  # Symmetric
+                    total_pairs += 2
     
-    # Find hub tokens (top 20% by connectivity)
-    if len(token_connections) > 0:
-        connection_values = list(token_connections.values())
-        hub_threshold = np.percentile(connection_values, 80)
-        hub_tokens = {tok for tok, score in token_connections.items() if score >= hub_threshold}
-        
-        if verbose:
-            print(f"   Found {len(hub_tokens)} hub tokens (threshold: {hub_threshold:.0f} connections)")
-            top_hubs = sorted(token_connections.items(), key=lambda x: -x[1])[:5]
-            print(f"   Top 5 hubs: {[(tok, cnt) for tok, cnt in top_hubs]}")
-    else:
-        hub_tokens = set()
-        if verbose:
-            print("   No hub tokens found, will use random ordering")
+    # Compute PPMI (Positive PMI) scores
+    total_words = sum(word_freq.values())
+    pmi_scores = {}
     
-    # Pass 2: Score all chunks by hub token presence
     if verbose:
-        print(f"\n📊 PASS 2: Scoring chunks by hub presence...")
+        print(f"   Computing PPMI for {len(word_freq)} unique tokens...")
+    
+    for w1 in co_occur:
+        pmi_scores[w1] = {}
+        for w2 in co_occur[w1]:
+            # PMI = log(P(w1,w2) / (P(w1) * P(w2)))
+            p_w1_w2 = co_occur[w1][w2] / (total_pairs + 1e-10)
+            p_w1 = word_freq[w1] / total_words
+            p_w2 = word_freq[w2] / total_words
+            pmi = math.log((p_w1_w2 / (p_w1 * p_w2 + 1e-10)) + 1e-10)
+            # PPMI: only keep positive associations (filter noise)
+            pmi_scores[w1][w2] = max(0, pmi)
+    
+    # Identify high-PMI tokens (semantically rich)
+    token_pmi_sum = {tok: sum(pmi_scores.get(tok, {}).values()) for tok in word_freq}
+    
+    if len(token_pmi_sum) > 0:
+        pmi_values = list(token_pmi_sum.values())
+        pmi_threshold = np.percentile(pmi_values, 80) if len(pmi_values) > 0 else 0
+        
+        if verbose:
+            print(f"   PMI threshold (top 20%): {pmi_threshold:.2f}")
+            top_pmi = sorted(token_pmi_sum.items(), key=lambda x: -x[1])[:5]
+            print(f"   Top 5 by PMI: {[(tok, f'{score:.2f}') for tok, score in top_pmi]}")
+    else:
+        pmi_threshold = 0
+        if verbose:
+            print("   No PMI scores computed, will use random ordering")
+    
+    # Pass 2: Score all chunks by PMI-weighted token importance
+    if verbose:
+        print(f"\n📊 PASS 2: Scoring chunks by PMI (semantic richness)...")
     
     chunk_scores = []
     for pos in tqdm(positions, desc="Scoring chunks", disable=not verbose):
@@ -327,18 +360,18 @@ def preload_memories_from_dataset(
             chunk_scores.append((0, pos))
             continue
         
-        # Score = sum of connection counts for tokens in chunk
-        score = sum(token_connections.get(tok, 0) for tok in chunk.tolist())
+        # Score = sum of PMI scores for tokens in chunk
+        score = sum(token_pmi_sum.get(tok, 0) for tok in chunk.tolist())
         chunk_scores.append((score, pos))
     
-    # Sort by score (highest first) - prioritize well-connected chunks
+    # Sort by score (highest first) - prioritize semantically rich chunks
     chunk_scores.sort(reverse=True)
     positions = [pos for score, pos in chunk_scores]
     
     if verbose:
         if len(chunk_scores) > 0:
             print(f"   Scored {len(chunk_scores)} chunks")
-            print(f"   Score range: {chunk_scores[-1][0]:.0f} (lowest) to {chunk_scores[0][0]:.0f} (highest)")
+            print(f"   PMI Score range: {chunk_scores[-1][0]:.2f} (lowest) to {chunk_scores[0][0]:.2f} (highest)")
             print(f"   Will process high-connectivity chunks first")
     
     if verbose:
@@ -484,9 +517,9 @@ def preload_memories_from_dataset(
     
     model.train()
     
-    # Save to cache for future runs
-    if memories_added > 0:
-        save_preload_cache(cache_path, memory_system, verbose=verbose)
+    # DEPRECATED: Old cache saving (replaced by --create-clean-to which saves DiskBackedTensor)
+    # if memories_added > 0:
+    #     save_preload_cache(cache_path, memory_system, verbose=verbose)
     
     return memories_added
 

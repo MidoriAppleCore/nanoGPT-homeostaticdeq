@@ -316,6 +316,23 @@ exec(open('configurator.py').read()) # overrides from command line or config fil
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
+# 🧠 MEMORY FLAGS: Special handling for command-line memory control
+# --clean-memory: Start with fresh memory (ignore existing disk storage)
+# --memory-path=<path>: Use specific memory file (for resuming/sharing)
+# --copy-clean-from=<path>: Copy from clean/reference memory (e.g., preloaded cache)
+# --create-clean-to=<path>: After preload, save a clean copy to this path (for reuse)
+clean_memory = '--clean-memory' in sys.argv
+memory_path_override = None
+copy_clean_from = None
+create_clean_to = None
+for arg in sys.argv:
+    if arg.startswith('--memory-path='):
+        memory_path_override = arg.split('=', 1)[1]
+    elif arg.startswith('--copy-clean-from='):
+        copy_clean_from = arg.split('=', 1)[1]
+    elif arg.startswith('--create-clean-to='):
+        create_clean_to = arg.split('=', 1)[1]
+
 # Initialize profiler (after config loaded)
 profiler = TrainingProfiler(enabled=globals().get('enable_profiling', True))
 
@@ -352,6 +369,54 @@ if master_process:
         out_dir = os.path.join(os.path.dirname(out_dir) if os.path.dirname(out_dir) else '.', run_name)
         print(f"📁 Creating new run directory: {out_dir}")
     os.makedirs(out_dir, exist_ok=True)
+    
+    # 🧠 SET MEMORY PATH: Use run-specific path by default (isolated per run)
+    if memory_path_override:
+        # User specified explicit path (e.g., to resume from specific memory)
+        final_memory_path = memory_path_override
+        print(f"🧠 Using custom memory path: {final_memory_path}")
+    elif 'longterm_disk_path' in globals() and globals()['longterm_disk_path']:
+        # Config specified a path (legacy behavior)
+        final_memory_path = globals()['longterm_disk_path']
+    else:
+        # Default: Run-specific memory DIRECTORY (NEW - each run isolated!)
+        final_memory_path = os.path.join(out_dir, 'memory')
+        print(f"🧠 Memory directory: {final_memory_path}")
+    
+    # Apply --clean-memory flag (handle both file and directory)
+    import shutil
+    if clean_memory:
+        if os.path.exists(final_memory_path):
+            if os.path.isdir(final_memory_path):
+                shutil.rmtree(final_memory_path)
+                print(f"🧹 Cleaned old memory directory (--clean-memory flag)")
+            else:
+                os.remove(final_memory_path)
+                print(f"🧹 Cleaned old memory file (--clean-memory flag)")
+    
+    # Apply --copy-clean-from flag (copy reference memory to this run)
+    if copy_clean_from:
+        if not os.path.exists(copy_clean_from):
+            raise FileNotFoundError(f"❌ --copy-clean-from path doesn't exist: {copy_clean_from}")
+        
+        # Remove existing memory first (if any)
+        if os.path.exists(final_memory_path):
+            if os.path.isdir(final_memory_path):
+                shutil.rmtree(final_memory_path)
+            else:
+                os.remove(final_memory_path)
+        
+        # Copy the clean/reference memory
+        if os.path.isdir(copy_clean_from):
+            shutil.copytree(copy_clean_from, final_memory_path)
+            print(f"📋 Copied clean memory directory: {copy_clean_from} → {final_memory_path}")
+        else:
+            # Legacy: single file memory
+            shutil.copy(copy_clean_from, final_memory_path)
+            print(f"📋 Copied clean memory file: {copy_clean_from} → {final_memory_path}")
+    
+    # Override config with final path
+    globals()['longterm_disk_path'] = final_memory_path
 torch.manual_seed(1337 + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
@@ -382,6 +447,17 @@ def get_batch(split):
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
+
+# 🚨 PLATEAU DETECTION & INTERVENTION
+# Track loss history for gradient plateau detection
+loss_history = []  # Rolling window of recent losses
+loss_window_size = 20  # Window for computing loss gradient
+plateau_threshold = 1e-4  # If loss gradient < this for N iters, plateau detected
+plateau_counter = 0  # How many consecutive iters we've been plateaued
+plateau_intervention_trigger = 30  # Soft intervention after 30 plateau iters
+plateau_hard_trigger = 100  # Hard intervention after 100 plateau iters
+last_intervention_iter = -1000  # Track when we last intervened (cooldown)
+intervention_cooldown = 50  # Don't intervene more than once per 50 iters
 
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
@@ -452,7 +528,7 @@ if use_memory_manifold:
         model_args['working_memory_capacity'] = working_memory_capacity
         model_args['working_memory_decay'] = working_memory_decay
         model_args['longterm_memory_capacity'] = longterm_memory_capacity
-        model_args['longterm_disk_path'] = longterm_disk_path if 'longterm_disk_path' in locals() else None  # NEW
+        model_args['longterm_disk_path'] = globals().get('longterm_disk_path', None)  # FIXED: use globals()
         model_args['longterm_memory_decay'] = longterm_memory_decay
         model_args['memory_promotion_threshold'] = memory_promotion_threshold
         model_args['memory_promotion_interval'] = memory_promotion_interval
@@ -709,7 +785,27 @@ if init_from == 'resume' and use_memory_manifold and hasattr(model.reflex, 'load
 
 if use_memory_manifold and init_from == 'scratch':
     # Check if we should preload (memory empty or nearly empty)
-    if should_preload_memories(model, min_memories=50):
+    needs_preload = should_preload_memories(model, min_memories=50)
+    current_mem_size = model.reflex.memory_retrieval.longterm.size.item() if hasattr(model.reflex, 'memory_retrieval') else 0
+    print(f"\n🔍 Preload check: current_size={current_mem_size}, needs_preload={needs_preload}")
+    
+    # Note: cluster_ids, depths, type_embeddings are now DiskBackedTensor
+    # They auto-load from disk when --copy-clean-from is used. No manual loading needed!
+    
+    # CRITICAL: Resize RAM-only buffers (rewards, age, access) to match disk-backed size
+    # When loading from golden checkpoint, DiskBackedTensors auto-restore their size,
+    # but regular buffers (rewards/age/access) stay at size 0 since they don't persist
+    if current_mem_size > 0 and hasattr(model.reflex, 'memory_retrieval'):
+        longterm = model.reflex.memory_retrieval.longterm
+        if hasattr(longterm, 'rewards') and longterm.rewards.size(0) == 0:
+            # Initialize to zeros matching the loaded memory size
+            longterm.rewards = torch.zeros(current_mem_size, device=longterm.device)
+            longterm.age = torch.zeros(current_mem_size, device=longterm.device)
+            longterm.access = torch.zeros(current_mem_size, device=longterm.device)
+            if master_process:
+                print(f"✅ Resized RAM buffers (rewards/age/access) to {current_mem_size} to match loaded memories")
+    
+    if needs_preload:
         print("\n" + "=" * 70)
         print("🗂️  MEMORY PRELOADING - Seeding from dataset")
         print("=" * 70)
@@ -733,6 +829,48 @@ if use_memory_manifold and init_from == 'scratch':
         if num_added > 0 and master_process:
             print(f"✅ Preloaded {num_added} semantic chunks into memory")
             print(f"🎯 Supervised navigation can start immediately!")
+            
+            # Apply --create-clean-to flag (save clean copy after preload)
+            if create_clean_to:
+                import shutil
+                from disk_backed_tensor import DiskBackedTensor
+                
+                # CRITICAL: Flush all disk-backed tensors to ensure ALL data is on disk
+                print("💾 Flushing all memory tensors to disk before snapshot...")
+                if hasattr(model.reflex, 'memory_retrieval') and hasattr(model.reflex.memory_retrieval, 'longterm'):
+                    longterm = model.reflex.memory_retrieval.longterm
+                    # Flush ALL disk-backed tensors (graph structure + metadata)
+                    tensor_names = [
+                        'embeddings', 'adjacency', 'edge_weights', 'edge_types',
+                        'edge_traversal_count', 'edge_success_rate',
+                        'cluster_ids', 'depths', 'type_embeddings'  # Metadata now disk-backed too!
+                    ]
+                    for tensor_name in tensor_names:
+                        if hasattr(longterm, tensor_name):
+                            tensor = getattr(longterm, tensor_name)
+                            if isinstance(tensor, DiskBackedTensor):
+                                tensor.flush()
+                                print(f"   ✓ Flushed {tensor_name}")
+                print("   ✅ All tensors flushed to disk")
+                
+                # Remove existing clean copy first (if any)
+                if os.path.exists(create_clean_to):
+                    if os.path.isdir(create_clean_to):
+                        shutil.rmtree(create_clean_to)
+                    else:
+                        os.remove(create_clean_to)
+                
+                # Copy the freshly preloaded memory
+                final_memory_path = globals().get('longterm_disk_path')
+                if final_memory_path and os.path.exists(final_memory_path):
+                    if os.path.isdir(final_memory_path):
+                        shutil.copytree(final_memory_path, create_clean_to)
+                        print(f"💾 Saved clean memory snapshot: {final_memory_path} → {create_clean_to}")
+                        print(f"   Use --copy-clean-from={create_clean_to} to reuse this preload!")
+                    else:
+                        shutil.copy(final_memory_path, create_clean_to)
+                        print(f"💾 Saved clean memory file: {final_memory_path} → {create_clean_to}")
+        
         print("=" * 70 + "\n")
     else:
         if master_process:
@@ -1828,7 +1966,18 @@ while True:
     profiler.start('grad_clip')
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        metrics['grad_norm'] = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+    else:
+        # Still compute grad norm even without clipping
+        scaler.unscale_(optimizer)
+        total_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        grad_norm = total_norm ** 0.5
+        metrics['grad_norm'] = grad_norm
     profiler.stop('grad_clip')
     
     # 🔬 BALANCER PARAMETER TRACKING (Every 10 iters - lightweight check)
@@ -1989,6 +2138,41 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
+        
+        # 🚨 PLATEAU DETECTION: Track loss history and detect stagnation
+        loss_history.append(lossf)
+        if len(loss_history) > loss_window_size:
+            loss_history.pop(0)
+        
+        # Compute loss gradient (rate of change) if we have enough history
+        if len(loss_history) >= loss_window_size and iter_num > 100:
+            # Linear regression slope of recent losses (numerical gradient)
+            x = np.arange(len(loss_history))
+            y = np.array(loss_history)
+            loss_gradient = np.polyfit(x, y, 1)[0]  # Slope of best-fit line
+            
+            # Plateau detection: gradient near zero means stuck
+            if abs(loss_gradient) < plateau_threshold:
+                plateau_counter += 1
+            else:
+                plateau_counter = 0  # Reset if making progress
+            
+            # Soft intervention: boost exploration when plateaued
+            if plateau_counter >= plateau_intervention_trigger and (iter_num - last_intervention_iter) > intervention_cooldown:
+                print(f"\n⚠️  PLATEAU DETECTED (iter {iter_num}): Loss gradient {loss_gradient:.6f} < {plateau_threshold}")
+                print(f"   Plateau duration: {plateau_counter} iterations")
+                print(f"   🔧 SOFT INTERVENTION: Boosting exploration...")
+                
+                # Temporarily increase novelty weight in balancer
+                if hasattr(balancer, 'log_vars'):
+                    with torch.no_grad():
+                        # Reduce novelty uncertainty → increase weight
+                        balancer.log_vars.data[2] -= 0.5  # Index 2 is novelty
+                    print(f"      ✓ Increased novelty drive weight")
+                
+                last_intervention_iter = iter_num
+                plateau_counter = 0  # Reset after intervention
+        
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
@@ -2078,7 +2262,11 @@ while True:
         if use_memory_manifold and hasattr(raw_model.reflex, 'get_memory_stats'):
             mem_stats = raw_model.reflex.get_memory_stats()
             if mem_stats:
+                # Basic tier stats
                 memory_stats_str = f", mem=[W:{mem_stats.get('num_working', 0)}/B:{mem_stats.get('num_buffer', 0)}/LT:{mem_stats.get('num_longterm', 0)}]"
+                # Add highway stats if available (compact format)
+                if mem_stats.get('highways_formed', 0) > 0:
+                    memory_stats_str += f", 🛣️{mem_stats['highways_formed']}"
         
         # LOSS BREAKDOWN: Merge into main line
         loss_breakdown_str = ""
@@ -2088,6 +2276,29 @@ while True:
         
         # Log line with NOVELTY/EXPLORATION DRIVE (ℂ), chaos breakdown, Bayesian balancer, reflex gate, and memory state
         print(f"iter {iter_num}: loss {lossf:.4f}, time {time_ms:.2f}ms, mfu {running_mfu*100:.2f}%, deq_iters={deq_iters}, lr={lr:.2e}, chaos={chaos_score:.3f}{chaos_breakdown}, res={raw_residual:.2e}, ℂ={novelty_drive:.3e}, {gate_phase}{memory_stats_str}{loss_breakdown_str}")
+        
+        # 🛣️ HIGHWAY REPORT: Every 100 iters, show detailed Hebbian learning stats
+        if iter_num % 100 == 0 and iter_num > 0 and master_process and use_memory_manifold:
+            if hasattr(raw_model.reflex, 'get_memory_stats'):
+                mem_stats = raw_model.reflex.get_memory_stats()
+                if mem_stats.get('highways_formed', 0) > 0:
+                    print(f"\n🛣️  HEBBIAN HIGHWAYS (iter {iter_num})")
+                    print(f"   Total strengthened: {mem_stats['highways_formed']} edges")
+                    print(f"   Max strengthening: {mem_stats.get('max_highway_strength', 0):.4f}")
+                    print(f"   Avg strengthening: {mem_stats.get('avg_highway_strength', 0):.4f}")
+                    
+                    # Get top-5 highways if available
+                    if hasattr(raw_model.reflex.memory_retrieval, 'longterm'):
+                        highway_details = raw_model.reflex.memory_retrieval.longterm.get_highway_stats(top_k=5)
+                        if highway_details.get('top_highways'):
+                            print(f"   Top 5 highways:")
+                            for i, hw in enumerate(highway_details['top_highways'][:5], 1):
+                                print(f"      {i}. Edge {hw['source']}→{hw['target']}: "
+                                      f"weight {hw['old_weight']:.3f}→{hw['new_weight']:.3f} "
+                                      f"(Δ={hw['strengthening']:.4f}, "
+                                      f"traversals={hw.get('traversal_count', 0)}, "
+                                      f"success={hw.get('success_rate', 0):.2f})")
+                    print()
         
         # Save profiling stats to CSV (silent mode - no console spam)
         if enable_profiling and iter_num % profile_interval == 0 and iter_num > 0 and master_process:

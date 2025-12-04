@@ -35,8 +35,8 @@ plot_interval = 100  # Only plot every 100 iters (was every 20)
 
 # Data
 dataset = 'oasst'
-gradient_accumulation_steps = 6  # INCREASED: 6 to compensate for smaller batch (effective=12)
-batch_size = 2  # REDUCED: 2 for GNN+2048d DEQ (multi-hop reasoning needs VRAM)
+gradient_accumulation_steps = 6  # RESTORED: 6 steps (batch=1 × 6 accum = effective 6)
+batch_size = 1  # EMERGENCY: 1 for 6GB OOM - AGENT MODE (sequential learning like a human!)
 block_size = 256  # REDUCED from 384 - 2/3 context, faster! Still ~200 words
 
 # Model - SCALED INTELLIGENCE ARCHITECTURE
@@ -78,9 +78,9 @@ use_memory_manifold = True
 memory_mode = 'hybrid'  # Three-tier: working (GPU) + buffer (GPU) + long-term (CPU)
 
 # Graph memory parameters - SCALED FOR INTELLIGENCE
-memory_k = 12  # k-NN neighbors (REDUCED from 20 - fewer edges = less message passing)
-gnn_hidden_dim = 256  # MICRO-GNN (REDUCED from 512 - 50% params)
-enable_gnn = True  # ENABLED: Micro-GNN with gradient checkpointing (~150-200MB VRAM)
+memory_k = 12  # k-NN neighbors (MUST match preload cache! Cache has k=12)
+gnn_hidden_dim = 128  # Ultra-Micro-GNN (128 for 6GB GPU)
+enable_gnn = True  # ENABLED: Ultra-Micro-GNN with gradient checkpointing (~80-100MB VRAM)
 
 # HIERARCHICAL RETRIEVAL & DEQ RE-QUERYING (New features to escape meta-token basin)
 use_hierarchical_retrieval = True  # Use cluster→node 2-stage retrieval (better scaling)
@@ -97,8 +97,8 @@ consolidation_buffer_size = 100  # Staging area before long-term consolidation
 
 # Long-term memory: Consolidated knowledge with graph structure
 longterm_memory_capacity = 50000  # Hot tier: 50K nodes in CPU RAM (~1.5 GB with graph structure)
-longterm_disk_path = 'out-oasst-hybrid-memory/disk_memories'  # Cold tier: Up to 500K on disk (lazy loading)
-longterm_max_disk_size = 500000  # Maximum memories (hot + cold disk storage)
+longterm_disk_path = None  # Will be set to {out_dir}/graph_memory.pt automatically (or use --memory-path)
+longterm_max_disk_size = 500000  # Maximum memories (hot + cold disk storage) - 500K for full dataset coverage
 longterm_learning_rate_multiplier = 0.1  # Slow consolidation
 longterm_decay_rate = 0.999  # 0.1% decay - persistent memory
 
@@ -117,11 +117,15 @@ memory_dim = 768  # CRITICAL: Must match n_embd to avoid dimension mismatch
 hyperbolic_curvature = 1.0
 
 # 🗄️ Memory Preloading (seed memory from dataset before training)
-# Densely scans training data to "stuff" hyperbolic space with patterns
-# Strategy: Sample random starting points, then extract overlapping chunks
-# Benefits: Repeated patterns get multiple memories, better generalization
-preload_num_samples = 200000  # MASSIVE WORLD: 200K chunks = rich linguistic landscape (~10-20% of dataset)
-preload_chunk_size = 32      # Tokens per chunk (~25 words of context)
+# PMI-BASED SEMANTIC PRELOADING (Church & Hanks 1990)
+# Scans entire dataset with intelligent sampling to build semantically-rich initial graph
+# Dataset: ~7.9M tokens → ~493K possible chunks (32 tokens, stride 16)
+# Strategy: PMI scoring prioritizes chunks with statistically significant associations
+# Benefits: Better initial graph structure, highways form faster, improved retrieval
+preload_num_samples = 200000  # � FULL SCALE: 200K memories (~40% dataset coverage, ~6GB disk)
+                              # Each memory is 32 tokens (~25 words) with 50% overlap
+                              # Covers most important semantic patterns in dataset
+preload_chunk_size = 32       # Tokens per chunk (~25 words of context)
 
 # 🧠 Memory Navigation Rewards (enable dopamine system)
 enable_nav_rewards = True

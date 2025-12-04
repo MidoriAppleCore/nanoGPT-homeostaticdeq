@@ -748,6 +748,12 @@ class ReflexModule(nn.Module):
                 n_head = getattr(config, 'n_head', 8)
                 enable_gnn = getattr(config, 'enable_gnn', True)  # Can disable for VRAM constraints
                 
+                # 🔥 NEW: Configurable highway learning rate
+                highway_learning_rate = getattr(config, 'highway_learning_rate', 0.3)
+                
+                # 🌀 NEW: Full hyperbolic GNN vs hybrid
+                use_full_hyperbolic_gnn = getattr(config, 'use_full_hyperbolic_gnn', False)
+                
                 self.memory_retrieval = GraphMemorySystem(
                     memory_dim=memory_dim,
                     query_dim=config.n_embd,
@@ -760,7 +766,9 @@ class ReflexModule(nn.Module):
                     k_neighbors=k_neighbors,
                     gnn_hidden_dim=gnn_hidden_dim,
                     n_head=n_head,
-                    enable_gnn=enable_gnn
+                    enable_gnn=enable_gnn,
+                    highway_learning_rate=highway_learning_rate,
+                    use_full_hyperbolic_gnn=use_full_hyperbolic_gnn
                 )
                 
                 print(f"[Reflex] Graph-structured memory enabled")
@@ -771,6 +779,7 @@ class ReflexModule(nn.Module):
                 else:
                     print(f"  Long-term: {longterm_capacity} on CPU")
                 print(f"  k_neighbors: {k_neighbors}, GNN hidden: {gnn_hidden_dim}")
+                print(f"  🛣️ Highway learning rate: {highway_learning_rate}")  # Show new param!
                 
             elif self.memory_mode == 'hyperbolic':
                 from hyperbolic_memory import HyperbolicMemoryRetrieval
@@ -1139,12 +1148,11 @@ class Stabilizer(nn.Module):
             if (self.trajectory_buffer.shape[0] != B or 
                 self.trajectory_buffer.shape[1] != T or 
                 self.trajectory_buffer.shape[3] != C):
-                # CRITICAL: Use register_buffer to recreate, not direct assignment
-                # Direct assignment during forward creates graph dependencies
+                # Re-register buffer with correct size
+                # CRITICAL: Must use register_buffer, not resize_as_
                 new_buffer = torch.zeros(B, T, self.history_size, C, 
                                         device=z.device, dtype=z.dtype)
-                # Copy into existing registered buffer (in-place, no graph)
-                self.trajectory_buffer.resize_as_(new_buffer).zero_()
+                self.register_buffer('trajectory_buffer', new_buffer, persistent=False)
                 self.buffer_ptr.fill_(0)  # Reset pointer
             
             # Update trajectory buffer (ring buffer, only during training)
@@ -1502,6 +1510,22 @@ class DEQOperator(nn.Module):
         # Import enhanced modules
         from enhanced_deq_operator import RMSNorm, GroupedQueryAttention, SwiGLU
         
+        # 🚀 INPUT INJECTION: Initialize DEQ search AT the prompt, not at zero!
+        # This is the "Ferrari in 1st gear" fix - start thinking FROM the observation
+        # Robot Arm insight: z₀ = ctx prevents having to "invent the universe" each step
+        self.z_injector = nn.Linear(config.n_embd, config.n_embd)
+        nn.init.eye_(self.z_injector.weight)  # Identity initialization (pass-through)
+        nn.init.zeros_(self.z_injector.bias)
+        
+        # 🎲 JAGGED STABILIZER: Break symmetry with non-uniform bias
+        # Some dimensions fast (α→0.9), some slow (α→0.1) = instant manifold formation
+        # This prevents the "damp sponge" effect where all dims relax uniformly
+        self.jagged_bias = nn.Parameter(torch.zeros(config.n_embd))
+        nn.init.uniform_(self.jagged_bias, -2.0, 2.0)  # Wide range → diverse relaxation rates
+        
+        print(f"[Input Injection] z₀ = injector(u) - DEQ starts FROM the prompt!")
+        print(f"[Jagged Stabilizer] Anisotropic initialization - instant manifold formation")
+        
         # GQA instead of standard MHA (3× faster, 90% quality)
         # 8 query heads, 2 KV heads = 4 groups
         num_kv_heads = max(1, config.n_head // 4)
@@ -1509,8 +1533,30 @@ class DEQOperator(nn.Module):
         # RMSNorm (20% faster than LayerNorm)
         self.ln_1 = RMSNorm(config.n_embd)
         
-        # Grouped Query Attention with RoPE
-        self.attn = GroupedQueryAttention(
+        # Self-Attention (iterative state refinement)
+        self.ln_1 = RMSNorm(config.n_embd)
+        self.self_attn = GroupedQueryAttention(
+            dim=config.n_embd,
+            num_heads=config.n_head,
+            num_kv_heads=num_kv_heads,
+            dropout=config.dropout,
+            bias=config.bias
+        )
+        
+        # Cross-Attention to Input Context (like Transformer Decoder!)
+        # This allows z to QUERY u for relevant information
+        self.ln_cross_ctx = RMSNorm(config.n_embd)
+        self.cross_attn_ctx = GroupedQueryAttention(
+            dim=config.n_embd,
+            num_heads=config.n_head,
+            num_kv_heads=num_kv_heads,
+            dropout=config.dropout,
+            bias=config.bias
+        )
+        
+        # Cross-Attention to Memory (graph-aware querying)
+        self.ln_cross_mem = RMSNorm(config.n_embd)
+        self.cross_attn_mem = GroupedQueryAttention(
             dim=config.n_embd,
             num_heads=config.n_head,
             num_kv_heads=num_kv_heads,
@@ -1531,6 +1577,7 @@ class DEQOperator(nn.Module):
         print(f"[Enhanced DEQ] Intelligence upgrades:")
         print(f"  - RMSNorm (20% faster than LayerNorm)")
         print(f"  - GQA: {config.n_head} query heads, {num_kv_heads} KV heads")
+        print(f"  - Self-Attention + Cross-Attention (Decoder architecture!)")
         print(f"  - SwiGLU activation (GPT-4 architecture)")
         print(f"  - RoPE position encoding (better extrapolation)")
         
@@ -1717,28 +1764,58 @@ class DEQOperator(nn.Module):
             # Normalize memory importance
             memory_attention = torch.softmax(memory_scores, dim=-1)  # [B, T, M]
             
-            # 🎯 INTEGRATE MEMORY CONTENT
-            # Weighted sum of memory embeddings
-            graph_context = torch.einsum('btm,btmc->btc', memory_attention, mem_embeddings)
-            
-            # Adaptive blending (more memory influence in later iterations)
-            mix_ratio = 0.1 + iter_ratio * 0.15  # 0.1→0.25
-            z_ctx = z_path_aware + u + graph_context * mix_ratio
+            # 🎯 PREPARE MEMORY FOR CROSS-ATTENTION
+            # Weighted sum of memory embeddings to create memory context
+            graph_context = torch.einsum('btm,btmc->btc', memory_attention, mem_embeddings)  # [B, T, C]
         else:
-            z_ctx = z_temporal + u
+            graph_context = None
         
-        # Attention with GQA + RoPE (z_ctx already has graph context integrated!)
-        attn_out = self.attn(
-            self.ln_1(z_ctx),
+        # ════════════════════════════════════════════════════════════════════
+        # TRANSFORMER DECODER ARCHITECTURE: Self + Cross Attention
+        # ════════════════════════════════════════════════════════════════════
+        # Unlike encoder (self-attn only), decoder can QUERY external sources
+        
+        # 1. SELF-ATTENTION: Refine internal state
+        z_self = self.self_attn(
+            self.ln_1(z_temporal),  # Use iteration-aware state
             mask=mask
         )
-        z_attn = z + attn_out
+        z = z + z_self  # Residual
         
-        # MLP
-        z_mlp = z_attn + self.mlp(self.ln_2(z_attn))
+        # 2. CROSS-ATTENTION TO INPUT CONTEXT: Query what's relevant from u
+        # This allows z to selectively attend to different parts of input
+        # Early iterations: might focus on syntax
+        # Late iterations: might focus on semantics
+        z_cross_ctx = self.cross_attn_ctx(
+            query=self.ln_cross_ctx(z),  # Current state asks questions
+            key=u,                        # Input context provides answers
+            value=u,
+            mask=None  # No causal mask for cross-attention
+        )
+        z = z + z_cross_ctx  # Residual
         
-        # Return delta (residual from current state)
-        delta_z = z_mlp - z
+        # 3. CROSS-ATTENTION TO MEMORY: Query relevant memories
+        # Only if we have memory context
+        if graph_context is not None:
+            # Expand graph_context for cross-attention
+            # We want z to query the graph-integrated memory
+            z_cross_mem = self.cross_attn_mem(
+                query=self.ln_cross_mem(z),      # Current state queries
+                key=graph_context,                # Memory context provides answers
+                value=graph_context,
+                mask=None  # No mask for memory
+            )
+            
+            # Adaptive blending based on iteration
+            iter_ratio = min(iteration / 10.0, 1.0) if iteration is not None else 0.5
+            mix_ratio = 0.1 + iter_ratio * 0.2  # 0.1→0.3 (more memory in late iterations)
+            z = z + mix_ratio * z_cross_mem  # Scaled residual
+        
+        # 4. MLP: Final transformation
+        z_mlp = z + self.mlp(self.ln_2(z))
+        
+        # Return delta (residual from ORIGINAL z_temporal)
+        delta_z = z_mlp - z_temporal
         return delta_z
     
     def reset_path_memory(self):
@@ -2090,8 +2167,12 @@ class DEQBrain(nn.Module):
                 mem_emb_proj = self.projector.project_up(mem_emb_flat)  # → 2048d
                 memory_bundle['embeddings'] = mem_emb_proj.view(*orig_shape[:-1], -1)  # [B, T, M, 2048]
         
-        # Initialize z₀ = u (warm start from context)
-        z = u.clone()
+        # 🚀 INPUT INJECTION: Initialize equilibrium search AT the prompt
+        # OLD: z = u.clone()  (passive copy)
+        # NEW: z = injector(u)  (learnable warm start with jagged anisotropy)
+        # This prevents the DEQ from hallucinating context out of the void.
+        # The operator.z_injector creates an initial manifold with diverse relaxation rates.
+        z = self.operator.z_injector(u) + self.operator.jagged_bias.view(1, 1, -1)
         z_prev = None
         
         # Anderson acceleration (with optional learned mixing)
@@ -3104,7 +3185,7 @@ class GrayBoxConfig:
     
     # Graph memory parameters (for graph-structured retrieval)
     gnn_hidden_dim: int = 512              # Hidden dimension for hyperbolic GNN
-    enable_gnn: bool = False               # DISABLED until we optimize hyperbolic ops for VRAM
+    enable_gnn: bool = True                # ✅ ENABLED - hyperbolic GNN for intelligent graph navigation
     
     # 🧠 MEMORY NAVIGATION REWARDS (Dopamine for graph exploration!)
     enable_nav_rewards: bool = True        # Reward DEQ for intelligent memory traversal
@@ -3116,6 +3197,11 @@ class GrayBoxConfig:
     # Consolidation
     memory_promotion_threshold: float = 0.4  # Lower for easier promotion
     memory_promotion_interval: int = 50      # More frequent
+    
+    # 🛣️ HIGHWAY LEARNING (Hebbian plasticity for graph edges)
+    highway_learning_rate: float = 0.3       # How fast highways strengthen (0.1=slow, 0.5=fast)
+                                              # Working uses this directly
+                                              # Buffer uses 0.7x, Longterm uses 0.2x
     # ═══════════════════════════════════════════════════════════════════════
     
     def __post_init__(self):
@@ -3265,13 +3351,24 @@ class GrayBoxDEQ(nn.Module):
         
         # Loss with Jacobian regularization for DEQ stability
         loss = None
+        loss_per_token = None  # For highway strengthening
         if targets is not None:
-            # Standard cross-entropy loss
+            # Standard cross-entropy loss (averaged for training)
             loss_ce = F.cross_entropy(
                 logits.view(-1, logits.size(-1)),
                 targets.view(-1),
                 ignore_index=-1
             )
+            
+            # Per-token loss (for highway strengthening - NO averaging!)
+            loss_per_token_flat = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1,
+                reduction='none'  # Keep per-token losses!
+            )
+            # Reshape to [B, T]
+            loss_per_token = loss_per_token_flat.view(logits.size(0), logits.size(1))
             
             # JACOBIAN REGULARIZATION (Critical for DEQ stability)
             # Penalize ||∇_z f(z*, u)||_F^2 to prevent singular Jacobians
@@ -3334,6 +3431,8 @@ class GrayBoxDEQ(nn.Module):
                     'prediction': loss_ce if targets is not None else torch.tensor(0.0),
                     'jacobian': jacobian_reg if targets is not None else torch.tensor(0.0),
                 },
+                # Per-token loss for highway strengthening
+                'loss_per_token': loss_per_token if targets is not None else None,
             }
             return logits, loss, metrics
         else:

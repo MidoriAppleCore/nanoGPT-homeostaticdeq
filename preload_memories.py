@@ -383,6 +383,7 @@ def preload_memories_from_dataset(
     # STREAMING MODE: Encode + insert in small batches to keep RAM low
     streaming_batch_size = 256  # Encode 256 chunks at a time
     batch_embeddings = []
+    chunk_tokens_list = []  # 🔥 Store tokens for PMI-based edge initialization
     memories_added = 0
     
     from hyperbolic_memory import PoincareManifold
@@ -402,6 +403,9 @@ def preload_memories_from_dataset(
             chunk = train_data[pos:pos+chunk_size]
             if len(chunk) < chunk_size:
                 continue
+            
+            # 🔥 Store chunk tokens for PMI-based edge building
+            chunk_tokens_list.append(chunk.tolist())
             
             # Convert to tensor
             x = torch.from_numpy(chunk.astype(np.int64)).to(device)
@@ -505,7 +509,13 @@ def preload_memories_from_dataset(
             print("=" * 70)
         
         try:
-            _build_preload_edges_cpu(memory_system, n_hot, verbose=verbose)
+            _build_preload_edges_cpu(
+                memory_system, 
+                n_hot, 
+                verbose=verbose,
+                chunk_tokens=chunk_tokens_list,  # 🔥 Pass tokens for PMI-based edges
+                pmi_scores=pmi_scores  # 🔥 Pass PMI scores for semantic similarity
+            )
         except Exception as e:
             if verbose:
                 print(f"⚠️  Could not build edges: {e}")
@@ -524,13 +534,20 @@ def preload_memories_from_dataset(
     return memories_added
 
 
-def _build_preload_edges_cpu(memory_system, n_memories, verbose=True):
+def _build_preload_edges_cpu(memory_system, n_memories, verbose=True, chunk_tokens=None, pmi_scores=None):
     """
     Build graph edges between preloaded memories (all on CPU).
     
     Creates:
-    - Proximity edges: k-NN in Euclidean space
-    - Semantic edges: High cosine similarity
+    - Proximity edges: k-NN based on token overlap and PMI similarity
+    - Semantic edges: High cosine similarity (if model is trained)
+    
+    Args:
+        memory_system: The memory system
+        n_memories: Number of memories to build edges for
+        verbose: Print progress
+        chunk_tokens: List of token lists for each chunk (for PMI-based edges)
+        pmi_scores: Dict of token->token PMI scores (for semantic similarity)
     """
     import torch.nn.functional as F
     
@@ -541,6 +558,15 @@ def _build_preload_edges_cpu(memory_system, n_memories, verbose=True):
     
     # Get all memory embeddings (on CPU)
     embeddings = lt_mem.embeddings[:n_memories]  # [N, dim]
+    
+    # 🔥 FIX: For INITIAL preload (empty memory), ALWAYS use PMI edges
+    # The model hasn't learned anything yet, so hyperbolic distances are meaningless
+    is_initial_preload = (lt_mem.size.item() == n_memories)  # Memory was empty before this preload
+    use_pmi_edges = is_initial_preload and (chunk_tokens is not None) and (pmi_scores is not None)
+    
+    if use_pmi_edges and verbose:
+        print(f"🔄 Using PMI-based edge initialization (untrained model)")
+        print(f"   (Edges will be refined as model trains)")
     
     # Check if we have adjacency structure
     if not hasattr(lt_mem, 'adjacency'):
@@ -557,16 +583,28 @@ def _build_preload_edges_cpu(memory_system, n_memories, verbose=True):
         if verbose:
             print(f"📈 Expanding adjacency from {lt_mem.adjacency.size(0)} to {n_memories}")
         k = lt_mem.adjacency.size(1)
-        new_adjacency = torch.full((n_memories, k), -1, dtype=torch.long, device='cpu')
-        new_edge_weights = torch.zeros(n_memories, k, device='cpu')
         
-        # Copy existing
+        # 🔥 CRITICAL FIX: Don't replace DiskBackedTensor with regular tensor!
+        # DiskBackedTensor handles expansion internally via __setitem__
+        # Just ensure size is updated (DiskBackedTensor auto-expands on write)
         old_size = lt_mem.adjacency.size(0)
-        new_adjacency[:old_size] = lt_mem.adjacency
-        new_edge_weights[:old_size] = lt_mem.edge_weights
         
-        lt_mem.adjacency = new_adjacency
-        lt_mem.edge_weights = new_edge_weights
+        # For regular tensors, we need to expand them
+        from disk_backed_tensor import DiskBackedTensor
+        is_disk_backed = isinstance(lt_mem.adjacency, DiskBackedTensor)
+        
+        if not is_disk_backed:
+            # Regular tensor - expand manually
+            new_adjacency = torch.full((n_memories, k), -1, dtype=torch.long, device='cpu')
+            new_edge_weights = torch.zeros(n_memories, k, device='cpu')
+            
+            # Copy existing
+            new_adjacency[:old_size] = lt_mem.adjacency
+            new_edge_weights[:old_size] = lt_mem.edge_weights
+            
+            lt_mem.adjacency = new_adjacency
+            lt_mem.edge_weights = new_edge_weights
+        # else: DiskBackedTensor will auto-expand on indexed writes, nothing to do!
         
         if hasattr(lt_mem, 'edge_types') and lt_mem.edge_types is not None:
             new_edge_types = torch.zeros(n_memories, k, lt_mem.num_edge_types, device='cpu')
@@ -609,43 +647,125 @@ def _build_preload_edges_cpu(memory_system, n_memories, verbose=True):
     
     if verbose:
         print(f"📊 Building edges for {n_memories} memories (k={k_actual})")
-        print(f"⚠️  This will compute ~{(n_memories * n_memories) / 1e6:.1f}M distances - may take several minutes...")
     
-    # 1. PROXIMITY EDGES: k-NN in Euclidean space
-    # Batched distance computation for speed (process in chunks to avoid OOM)
+    # 1. PROXIMITY EDGES: k-NN based on PMI or hyperbolic distance
     with torch.no_grad():
         edges_added = 0
         batch_size = 1000  # Process 1000 nodes at a time
         
         from tqdm import tqdm
-        for batch_start in tqdm(range(0, n_memories, batch_size), 
-                                desc="Building k-NN edges",
-                                disable=not verbose):
-            batch_end = min(batch_start + batch_size, n_memories)
-            batch_embeddings = embeddings[batch_start:batch_end]  # [batch, dim]
+        
+        if use_pmi_edges:
+            # ═══════════════════════════════════════════════════════════
+            # PMI-BASED EDGE INITIALIZATION (for untrained models)
+            # ═══════════════════════════════════════════════════════════
+            if verbose:
+                print("🔤 Computing PMI-based similarity matrix...")
             
-            # Compute distances from batch to ALL nodes
-            # Using batched norm: ||a - b||^2 = ||a||^2 + ||b||^2 - 2*a·b
-            batch_norms = (batch_embeddings ** 2).sum(dim=1, keepdim=True)  # [batch, 1]
-            all_norms = (embeddings ** 2).sum(dim=1, keepdim=True).T  # [1, N]
-            dot_products = torch.mm(batch_embeddings, embeddings.T)  # [batch, N]
-            dists = batch_norms + all_norms - 2 * dot_products  # [batch, N]
-            dists = torch.sqrt(torch.clamp(dists, min=1e-8))  # Numerical stability
+            # Compute pairwise PMI similarity
+            pmi_similarity = torch.zeros(n_memories, n_memories)
             
-            # For each node in batch, get k nearest neighbors
-            for local_i, i in enumerate(range(batch_start, batch_end)):
-                node_dists = dists[local_i]  # [N]
+            for i in tqdm(range(n_memories), desc="PMI similarity", disable=not verbose):
+                tokens_i = set(chunk_tokens[i]) if i < len(chunk_tokens) else set()
+                for j in range(i + 1, n_memories):
+                    tokens_j = set(chunk_tokens[j]) if j < len(chunk_tokens) else set()
+                    
+                    # Compute shared high-PMI token score
+                    shared_pmi = 0.0
+                    for t1 in tokens_i:
+                        if t1 in pmi_scores:
+                            for t2 in tokens_j:
+                                shared_pmi += pmi_scores[t1].get(t2, 0)
+                    
+                    # Normalize by chunk sizes
+                    if len(tokens_i) > 0 and len(tokens_j) > 0:
+                        shared_pmi /= (len(tokens_i) * len(tokens_j)) ** 0.5
+                    
+                    pmi_similarity[i, j] = shared_pmi
+                    pmi_similarity[j, i] = shared_pmi
+            
+            # Convert similarity to distance (higher similarity = lower distance)
+            max_sim = pmi_similarity.max() + 1e-6
+            pmi_dist = 1.0 - (pmi_similarity / max_sim)
+            
+            # Build k-NN from PMI distances
+            for i in tqdm(range(n_memories), desc="Building PMI k-NN", disable=not verbose):
+                node_dists = pmi_dist[i]
                 
-                # Get k+1 nearest (including self), then exclude self
+                # Get k nearest neighbors
                 _, indices = node_dists.topk(k_actual + 1, largest=False)
-                neighbors = indices[1:]  # Skip self (index 0)
+                neighbors = indices[1:]  # Skip self
                 neighbor_dists = node_dists[neighbors]
                 
-                # Store in adjacency matrix
+                # Ensure non-zero weights (add small epsilon)
+                neighbor_dists = torch.clamp(neighbor_dists, min=0.1, max=2.0)
+                
+                # Store edges
                 lt_mem.adjacency[i, :k_actual] = neighbors
                 lt_mem.edge_weights[i, :k_actual] = neighbor_dists
                 
                 # Mark as proximity edges (type 0)
+                if hasattr(lt_mem, 'edge_types'):
+                    lt_mem.edge_types[i, :k_actual, 0] = 1.0
+                
+                edges_added += k_actual
+        
+        else:
+            # ═══════════════════════════════════════════════════════════
+            # HYPERBOLIC-BASED EDGE INITIALIZATION (for trained models)
+            # ═══════════════════════════════════════════════════════════
+            if verbose:
+                print("🌀 Mapping embeddings to hyperbolic space (Poincaré ball)...")
+        
+            from hyperbolic_memory import PoincareManifold
+            poincare = PoincareManifold(dim=embeddings.shape[1], c=1.0)
+            
+            origin = torch.zeros_like(embeddings)
+            hyp_embeddings = poincare.exponential_map(origin, embeddings)  # [N, dim]
+            
+            if verbose:
+                print(f"✅ Mapped {n_memories} embeddings to hyperbolic space")
+            
+            # Batched distance computation for speed (process in chunks to avoid OOM)
+            # edges_added already initialized above - don't reset!
+            batch_size = 1000  # Process 1000 nodes at a time
+        
+            from tqdm import tqdm
+            for batch_start in tqdm(range(0, n_memories, batch_size), 
+                                    desc="Building k-NN edges",
+                                    disable=not verbose):
+                batch_end = min(batch_start + batch_size, n_memories)
+                batch_hyp_embeddings = hyp_embeddings[batch_start:batch_end]  # [batch, dim]
+                
+                # Compute HYPERBOLIC distances from batch to ALL nodes
+                # Using batched poincare.distance()
+                dists = poincare.distance(
+                    batch_hyp_embeddings.unsqueeze(1),  # [batch, 1, dim]
+                    hyp_embeddings.unsqueeze(0)          # [1, N, dim]
+                ).squeeze(-1)  # [batch, N] - HYPERBOLIC DISTANCES!
+                
+                # For each node in batch, get k nearest neighbors
+                for local_i, i in enumerate(range(batch_start, batch_end)):
+                    node_dists = dists[local_i]  # [N]
+                    
+                    # Get k+1 nearest (including self), then exclude self
+                    _, indices = node_dists.topk(k_actual + 1, largest=False)
+                    neighbors = indices[1:]  # Skip self (index 0)
+                    neighbor_dists = node_dists[neighbors]
+                    
+                    # � FIX: If embeddings are all zero (untrained model), distances will be zero
+                    # Initialize to small non-zero value so Hebbian learning can work
+                    neighbor_dists = torch.where(
+                        neighbor_dists < 1e-6,
+                        torch.ones_like(neighbor_dists) * 0.5,  # Default hyperbolic distance
+                        neighbor_dists
+                    )
+                    
+                    # Store in adjacency matrix
+                    lt_mem.adjacency[i, :k_actual] = neighbors
+                    lt_mem.edge_weights[i, :k_actual] = neighbor_dists
+                    
+                    # Mark as proximity edges (type 0)
                 if hasattr(lt_mem, 'edge_types'):
                     lt_mem.edge_types[i, :k_actual, 0] = 1.0
                 
@@ -705,6 +825,18 @@ def _build_preload_edges_cpu(memory_system, n_memories, verbose=True):
     if verbose:
         print(f"✅ Added {semantic_edges_added} semantic edges (high similarity)")
         print(f"📊 Total: {edges_added + semantic_edges_added} edges in preloaded graph")
+    
+    # 🔥 CRITICAL: Flush DiskBackedTensors to ensure edges are persisted!
+    from disk_backed_tensor import DiskBackedTensor
+    if isinstance(lt_mem.adjacency, DiskBackedTensor):
+        if verbose:
+            print("💾 Flushing graph structure to disk...")
+        lt_mem.adjacency.flush()
+        lt_mem.edge_weights.flush()
+        if hasattr(lt_mem, 'edge_types') and isinstance(lt_mem.edge_types, DiskBackedTensor):
+            lt_mem.edge_types.flush()
+        if verbose:
+            print("✅ Graph structure flushed to disk")
 
 
 def should_preload_memories(model, min_memories=50):

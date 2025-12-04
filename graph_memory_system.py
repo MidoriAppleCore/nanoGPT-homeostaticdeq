@@ -63,16 +63,32 @@ class GraphMemoryTier(nn.Module):
             from hyperbolic_memory import PoincareManifold
             
             poincare = PoincareManifold(dim=memory_dim, c=1.0)
-            cache_capacity = min(2000, capacity // 2)  # Keep half in RAM
+            
+            # Cache sizing: HARD LIMIT based on available RAM, not dataset size!
+            # Philosophy: Cache is a fixed resource constraint, dataset can be infinite
+            # 
+            # For 6GB GPU typical consumer setup:
+            # - Embeddings: ~100-500 entries × 128 dim × 4 bytes = 50-250 KB (tiny!)
+            # - Graph metadata: even smaller (just indices/weights)
+            # 
+            # These limits work for ANY dataset size (100 to 1M+ memories)
+            embedding_cache = 100  # ~50KB for dim=128 (working set for one batch + neighbors)
+            graph_cache = 50       # ~2KB (adjacency/weights for active nodes)
+            
+            print(f"💾 Disk-backed tier: {disk_path}")
+            print(f"   Max size: {max_disk_size} memories")
+            print(f"   Hot cache: {embedding_cache} entries per tensor (~{embedding_cache * memory_dim * 4 // 1024}KB)")
+            print(f"   🔥 GRAPH STRUCTURE ON DISK (scales to millions!)")
+            print(f"   Strategy: Transparent write-back cache with async I/O")
             
             # 🔥 DISK-BACKED EVERYTHING (enables scaling to millions of memories!)
-            # Embeddings
+            # Embeddings (larger cache for graph traversal efficiency)
             self.embeddings = DiskBackedTensor(
                 shape=(max_disk_size, memory_dim),
                 dtype=torch.float32,
                 device=device,
                 disk_path=os.path.join(disk_path, 'embeddings'),
-                hot_capacity=cache_capacity,
+                hot_capacity=embedding_cache,
                 poincare=poincare,
                 flush_interval=5.0,
                 enable_async=True
@@ -84,7 +100,7 @@ class GraphMemoryTier(nn.Module):
                 dtype=torch.int64,
                 device=device,
                 disk_path=os.path.join(disk_path, 'adjacency'),
-                hot_capacity=cache_capacity,
+                hot_capacity=graph_cache,
                 flush_interval=5.0,
                 enable_async=True
             )
@@ -95,7 +111,7 @@ class GraphMemoryTier(nn.Module):
                 dtype=torch.float32,
                 device=device,
                 disk_path=os.path.join(disk_path, 'edge_weights'),
-                hot_capacity=cache_capacity,
+                hot_capacity=graph_cache,
                 flush_interval=5.0,
                 enable_async=True
             )
@@ -106,7 +122,7 @@ class GraphMemoryTier(nn.Module):
                 dtype=torch.float32,
                 device=device,
                 disk_path=os.path.join(disk_path, 'edge_types'),
-                hot_capacity=cache_capacity,
+                hot_capacity=graph_cache,
                 flush_interval=5.0,
                 enable_async=True
             )
@@ -117,7 +133,7 @@ class GraphMemoryTier(nn.Module):
                 dtype=torch.float32,
                 device=device,
                 disk_path=os.path.join(disk_path, 'edge_traversal_count'),
-                hot_capacity=cache_capacity,
+                hot_capacity=graph_cache,
                 flush_interval=5.0,
                 enable_async=True
             )
@@ -127,7 +143,7 @@ class GraphMemoryTier(nn.Module):
                 dtype=torch.float32,
                 device=device,
                 disk_path=os.path.join(disk_path, 'edge_success_rate'),
-                hot_capacity=cache_capacity,
+                hot_capacity=graph_cache,
                 flush_interval=5.0,
                 enable_async=True
             )
@@ -138,7 +154,7 @@ class GraphMemoryTier(nn.Module):
                 dtype=torch.int64,
                 device=device,
                 disk_path=os.path.join(disk_path, 'cluster_ids'),
-                hot_capacity=cache_capacity,
+                hot_capacity=graph_cache,
                 flush_interval=5.0,
                 enable_async=True
             )
@@ -148,7 +164,7 @@ class GraphMemoryTier(nn.Module):
                 dtype=torch.float32,
                 device=device,
                 disk_path=os.path.join(disk_path, 'depths'),
-                hot_capacity=cache_capacity,
+                hot_capacity=graph_cache,
                 flush_interval=5.0,
                 enable_async=True
             )
@@ -160,14 +176,14 @@ class GraphMemoryTier(nn.Module):
                     dtype=torch.float32,
                     device=device,
                     disk_path=os.path.join(disk_path, 'type_embeddings'),
-                    hot_capacity=cache_capacity,
+                    hot_capacity=graph_cache,
                     flush_interval=5.0,
                     enable_async=True
                 )
             
             print(f"💾 Disk-backed tier: {disk_path}")
             print(f"   Max size: {max_disk_size} memories")
-            print(f"   Hot cache: {cache_capacity} in RAM per tensor")
+            print(f"   Hot cache: {graph_cache} in RAM per tensor")
             print(f"   🔥 GRAPH STRUCTURE ON DISK (scales to millions!)")
             print(f"   Strategy: Transparent write-back cache with async I/O")
         else:
@@ -845,13 +861,19 @@ class GraphMemoryTier(nn.Module):
         
         return added_count
     
-    def strengthen_edge(self, source_idx: int, target_idx: int, reward: float = 1.0):
+    def strengthen_edge(self, source_idx: int, target_idx: int, reward: float = 1.0, learning_rate: float = 0.3):
         """
         Hebbian learning: Strengthen edges that are traversed successfully.
         
         "Paths that traverse together strengthen together!"
         Creates "highways" in the memory graph.
         Also updates edge types to mark CO_RETRIEVED relationships.
+        
+        Args:
+            source_idx: Source node index
+            target_idx: Target node index
+            reward: How useful this traversal was (0-2)
+            learning_rate: How fast to update (0.1=slow/stable, 0.5=fast/adaptive)
         """
         # Bounds check: ensure indices are valid
         if self.size == 0:
@@ -876,10 +898,36 @@ class GraphMemoryTier(nn.Module):
             old_count = self.edge_traversal_count[source_idx, edge_slot]
             self.edge_traversal_count[source_idx, edge_slot] = old_count + 1
             
-            # Exponential moving average of success rate (already uses =, OK!)
+            # 🔥 HYPERBOLIC HEBBIAN NORMALIZATION
+            # Problem: Uniform updates create "Super-Node" collapse (rich-get-richer)
+            # Solution: Scale learning by hyperbolic radius (distance from origin)
+            #   - Center nodes (generic concepts): SMALL updates (already well-connected)
+            #   - Edge nodes (specific concepts): LARGE updates (rare valuable paths)
+            # 
+            # Theory: sinh(radius) naturally scales with hyperbolic metric
+            # - Near origin (r≈0): sinh(r) ≈ r (small)
+            # - Far from origin (r≈3): sinh(r) ≈ e^r (exponential boost)
+            
+            # Compute hyperbolic radius of source node (Euclidean norm in tangent space)
+            source_embedding = self.embeddings[source_idx]  # [hidden_dim]
+            radius = torch.norm(source_embedding, p=2).item()  # L2 norm = hyperbolic radius
+            
+            # Scale factor: sinh(r) with clamping to prevent explosion/collapse
+            # Clamp to [0.1, 10.0] ensures:
+            # - Central nodes: min 10% learning (don't freeze completely)
+            # - Leaf nodes: max 10× boost (don't explode)
+            hyperbolic_scale = torch.sinh(torch.tensor(radius)).item()
+            hyperbolic_scale = max(0.1, min(10.0, hyperbolic_scale))
+            
+            # Apply scaled Hebbian update
+            # Effective LR: learning_rate * hyperbolic_scale
+            # - Generic paths (r<1): slow learning, stable
+            # - Specific paths (r>2): fast learning, cementing rare connections
+            scaled_lr = learning_rate * hyperbolic_scale
+            
             old_success = self.edge_success_rate[source_idx, edge_slot]
             self.edge_success_rate[source_idx, edge_slot] = (
-                0.9 * old_success + 0.1 * reward
+                (1.0 - scaled_lr) * old_success + scaled_lr * reward
             )
             
             # Mark edge as CO_RETRIEVED (type 4)
@@ -890,11 +938,48 @@ class GraphMemoryTier(nn.Module):
             old_edge_type[4] = co_retrieval_strength
             self.edge_types[source_idx, edge_slot] = old_edge_type
             
-            # Reduce hyperbolic distance proportional to success
-            # (Make "highway" between frequently co-retrieved memories)
-            α = 0.01  # Learning rate
+            # 🔥 STRENGTHEN HIGHWAY: Reduce hyperbolic distance proportional to reward
+            # Higher reward → smaller distance → stronger connection!
+            # Use configurable learning_rate for fast highway formation
             old_weight = self.edge_weights[source_idx, edge_slot]
-            new_weight = old_weight * (1 - α * reward)
+            
+            # 🔍 DEBUG: Check what edge_weights contains
+            if not hasattr(self, '_edge_weight_debug_count'):
+                self._edge_weight_debug_count = 0
+            self._edge_weight_debug_count += 1
+            if self._edge_weight_debug_count <= 3:
+                print(f"[EDGE DEBUG #{self._edge_weight_debug_count}] Accessing edge_weights[{source_idx}, {edge_slot}]")
+                print(f"  old_weight type: {type(old_weight)}, value: {old_weight}")
+                print(f"  edge_weights type: {type(self.edge_weights)}")
+                print(f"  edge_weights shape: {self.edge_weights.shape if hasattr(self.edge_weights, 'shape') else 'no shape'}")
+                print(f"  learning_rate: {learning_rate}, reward: {reward}")
+                print(f"  hyperbolic_scale: {hyperbolic_scale:.4f}, radius: {radius:.4f}")
+                # 🔍 NEW: Show which tier this is!
+                tier_name = "UNKNOWN"
+                if hasattr(self, 'capacity'):
+                    if self.capacity == 10:
+                        tier_name = "WORKING"
+                    elif self.capacity == 100:
+                        tier_name = "BUFFER"
+                    elif self.capacity >= 1000:
+                        tier_name = "LONGTERM"
+                print(f"  TIER: {tier_name} (capacity={self.capacity if hasattr(self, 'capacity') else 'N/A'})")
+            
+            # 🔥 HYPERBOLIC WEIGHT UPDATE with normalization
+            # Weight reduction: higher reward → bigger reduction (shorter path)
+            # Apply same hyperbolic scaling to prevent collapse
+            # BUT clamp the effective change to maintain DEQ stability (Lipschitz bound)
+            weight_change = scaled_lr * reward  # How much to strengthen
+            weight_change = min(weight_change, 0.5)  # 🔥 MAX 50% change per update (DEQ stability)
+            
+            new_weight = old_weight * (1.0 - weight_change)
+            
+            # 🔥 CRITICAL: Normalize to prevent graph from exploding/collapsing
+            # Ensure weights stay in reasonable range [min_edge_weight, original_distance]
+            # This preserves DEQ Lipschitz constant
+            min_edge_weight = 0.01  # Minimum distance (don't collapse to zero)
+            new_weight = torch.clamp(new_weight, min=min_edge_weight, max=old_weight)
+            
             self.edge_weights[source_idx, edge_slot] = new_weight
             
             # 🛣️ LOG HIGHWAY FORMATION
@@ -912,11 +997,29 @@ class GraphMemoryTier(nn.Module):
                     'success_rate': self.edge_success_rate[source_idx, edge_slot].item()
                 })
                 
+                # DEBUG: Log first few highway formations
+                if not hasattr(self, '_highway_debug_count'):
+                    self._highway_debug_count = 0
+                self._highway_debug_count += 1
+                if self._highway_debug_count <= 10:
+                    print(f"🛣️ [HIGHWAY #{self._highway_debug_count}] {source_idx}→{target_idx}: "
+                          f"weight {old_weight.item():.4f}→{new_weight.item():.4f} "
+                          f"(Δ={strengthening:.4f}, r={radius:.2f}, h_scale={hyperbolic_scale:.2f}x, reward={reward:.4f})")
+                
                 # Keep only top-K by strengthening amount
                 if len(self.highway_log) > self.highway_log_max * 2:
                     # Sort by strengthening and keep top half
                     self.highway_log.sort(key=lambda x: x['strengthening'], reverse=True)
                     self.highway_log = self.highway_log[:self.highway_log_max]
+            else:
+                # DEBUG: Why no strengthening?
+                if not hasattr(self, '_no_strengthen_debug_count'):
+                    self._no_strengthen_debug_count = 0
+                self._no_strengthen_debug_count += 1
+                if self._no_strengthen_debug_count <= 5:
+                    print(f"[NO STRENGTHEN #{self._no_strengthen_debug_count}] {source_idx}→{target_idx}: "
+                          f"reward={reward:.6f}, old_weight={old_weight.item():.6f}, "
+                          f"strengthening={strengthening:.6f}")
     
     def get_highway_stats(self, top_k: int = 10):
         """
@@ -1437,12 +1540,13 @@ class HyperbolicGraphConv(nn.Module):
     """
     
     def __init__(self, in_dim: int, out_dim: int, use_gradient_checkpointing: bool = True,
-                 temperature: float = 1.0):
+                 temperature: float = 1.0, use_full_hyperbolic: bool = False):
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.use_gradient_checkpointing = use_gradient_checkpointing  # Save ~30-40% VRAM
         self.temperature = nn.Parameter(torch.tensor(temperature))  # Learnable distance decay
+        self.use_full_hyperbolic = use_full_hyperbolic  # Full Möbius ops vs hybrid
         
         # SINGLE transformation (DEQ provides depth through iteration!)
         self.W = nn.Linear(in_dim, out_dim)
@@ -1544,20 +1648,67 @@ class HyperbolicGraphConv(nn.Module):
         combined_weights = distance_weights * learned_weights  # Element-wise product
         combined_weights = combined_weights / (combined_weights.sum(dim=-1, keepdim=True) + 1e-8)  # Renormalize
         
-        # MESSAGE AGGREGATION (Euclidean for speed, hyperbolic ops are expensive!)
-        # The graph structure + distance weighting already encodes hyperbolic geometry
-        messages = (neighbor_transformed * combined_weights.unsqueeze(-1)).sum(dim=1)  # [N, out_dim]
+        # ════════════════════════════════════════════════════════════════════
+        # MESSAGE AGGREGATION: Full hyperbolic vs Hybrid (faster)
+        # ════════════════════════════════════════════════════════════════════
+        if self.use_full_hyperbolic:
+            # 🌀 FULL HYPERBOLIC MESSAGE PASSING (Möbius aggregation)
+            # This respects the DEQ's nested/hierarchical iteration structure
+            # ~2-3x slower but better for tree-like reasoning
+            
+            # 1. Map current node to hyperbolic space
+            x_hyp = poincare.exponential_map(
+                torch.zeros_like(x_transformed),
+                x_transformed
+            )  # [N, out_dim]
+            
+            # 2. Map neighbors to hyperbolic space
+            neighbor_hyp = poincare.exponential_map(
+                torch.zeros(neighbor_transformed.size(0), neighbor_transformed.size(1), self.out_dim, 
+                           device=neighbor_transformed.device),
+                neighbor_transformed
+            )  # [N, k, out_dim]
+            
+            # 3. Möbius weighted average (proper hyperbolic aggregation)
+            # This is the Fréchet mean in hyperbolic space
+            # Formula: m = ⊕_{i=1}^k w_i ⊗ p_i
+            # where ⊕ is Möbius addition, ⊗ is scalar multiplication
+            
+            # Start with origin (neutral element for Möbius addition)
+            aggregated_hyp = torch.zeros_like(x_hyp)  # [N, out_dim]
+            
+            # Iteratively add weighted neighbors using Möbius addition
+            for i in range(min(neighbor_hyp.size(1), 8)):  # Limit to 8 neighbors for speed
+                # Get i-th neighbor for all nodes
+                neighbor_i = neighbor_hyp[:, i, :]  # [N, out_dim]
+                weight_i = combined_weights[:, i:i+1]  # [N, 1]
+                
+                # Möbius scalar multiplication: w ⊗ p
+                # Formula: (tanh(w * arctanh(||p||)) / ||p||) * p
+                neighbor_norm = torch.clamp(neighbor_i.norm(dim=-1, keepdim=True), min=1e-8, max=0.99)
+                neighbor_dir = neighbor_i / neighbor_norm
+                
+                # Scalar multiplication in hyperbolic space
+                scaled_norm = torch.tanh(weight_i * torch.atanh(neighbor_norm))
+                scaled_neighbor = scaled_norm * neighbor_dir  # [N, out_dim]
+                
+                # Möbius addition: aggregated ⊕ scaled_neighbor
+                aggregated_hyp = poincare.mobius_add(aggregated_hyp, scaled_neighbor)
+            
+            # 4. Map back to Euclidean space
+            messages = poincare.logarithmic_map(
+                torch.zeros_like(aggregated_hyp),
+                aggregated_hyp
+            )  # [N, out_dim]
+        else:
+            # HYBRID: Euclidean aggregation with hyperbolic weights (faster)
+            # The graph structure + distance weighting already encodes hyperbolic geometry
+            messages = (neighbor_transformed * combined_weights.unsqueeze(-1)).sum(dim=1)  # [N, out_dim]
         
         # Residual connection + normalization (stable DEQ dynamics!)
         output = self.ln(x_transformed + messages)
         
         return output
-        # Use inverse of exponential map (approximate)
-        updated_euclidean = updated_hyp / (1 - updated_hyp.norm(dim=-1, keepdim=True).clamp(max=0.9))
-        
-        # Residual + normalization
-        out = self.ln(x_self + updated_euclidean)
-        return F.gelu(out)
 
 
 class GraphMemoryQueryNetwork(nn.Module):
@@ -1570,7 +1721,7 @@ class GraphMemoryQueryNetwork(nn.Module):
     """
     
     def __init__(self, query_dim: int, memory_dim: int, hidden_dim: int, k_neighbors: int, 
-                 enable_gnn: bool = False, num_edge_types: int = 8):  # DISABLED until memory optimization
+                 enable_gnn: bool = False, num_edge_types: int = 8, use_full_hyperbolic: bool = False):
         super().__init__()
         self.query_dim = query_dim
         self.memory_dim = memory_dim
@@ -1585,8 +1736,13 @@ class GraphMemoryQueryNetwork(nn.Module):
         # Hyperbolic graph convolution (single layer for efficiency)
         # Multi-hop reasoning happens via attention over the graph structure
         if enable_gnn:
-            self.graph_conv = HyperbolicGraphConv(memory_dim, memory_dim, use_gradient_checkpointing=True)
-            print(f"  [GNN] Gradient checkpointing ENABLED (~30-40% VRAM savings, ~20% slower)")
+            self.graph_conv = HyperbolicGraphConv(
+                memory_dim, memory_dim, 
+                use_gradient_checkpointing=True,
+                use_full_hyperbolic=use_full_hyperbolic
+            )
+            mode_str = "FULL HYPERBOLIC (Möbius)" if use_full_hyperbolic else "HYBRID (Euclidean+hyp weights)"
+            print(f"  [GNN] {mode_str}, Gradient checkpointing ENABLED (~30-40% VRAM savings)")
         
         # Hyperbolic projection
         self.poincare = PoincareManifold(dim=memory_dim)
@@ -1887,13 +2043,16 @@ class GraphMemorySystem(nn.Module):
                  k_neighbors: int = 20,
                  gnn_hidden_dim: int = 512,
                  n_head: int = 4,
-                 enable_gnn: bool = False):  # DISABLED by default until we optimize hyperbolic ops for VRAM
+                 enable_gnn: bool = False,  # DISABLED by default until we optimize hyperbolic ops for VRAM
+                 highway_learning_rate: float = 0.3,  # 🔥 NEW: How fast highways strengthen
+                 use_full_hyperbolic_gnn: bool = False):  # 🌀 NEW: Full Möbius vs hybrid
         super().__init__()
         
         self.memory_dim = memory_dim
         self.query_dim = query_dim
         self.context_dim = context_dim
         self.k_neighbors = k_neighbors
+        self.highway_learning_rate = highway_learning_rate  # Store for Hebbian updates
         
         # Hyperbolic geometry
         self.poincare = PoincareManifold(dim=memory_dim)
@@ -1907,7 +2066,9 @@ class GraphMemorySystem(nn.Module):
         
         # GNN query network (can disable for VRAM savings)
         self.query_network = GraphMemoryQueryNetwork(
-            query_dim, memory_dim, gnn_hidden_dim, k_neighbors, enable_gnn=enable_gnn
+            query_dim, memory_dim, gnn_hidden_dim, k_neighbors, 
+            enable_gnn=enable_gnn,
+            use_full_hyperbolic=use_full_hyperbolic_gnn
         ).cuda()
         
         print(f"  GNN refinement: {'ENABLED' if enable_gnn else 'DISABLED (VRAM saver)'}")
@@ -1974,10 +2135,89 @@ class GraphMemorySystem(nn.Module):
         
         return new_idx
     
+    def strengthen_last_retrieval(self, per_token_loss: torch.Tensor):
+        """
+        Strengthen highways based on ACTUAL per-token prediction accuracy.
+        
+        Call this AFTER computing the loss to reinforce paths that helped!
+        This is token-level learning: good retrieval for token i → strengthen that path only.
+        
+        Args:
+            per_token_loss: [B, T] tensor of per-token losses (NOT averaged!)
+        """
+        if not hasattr(self, '_last_retrieval_paths') or self._last_retrieval_paths is None:
+            return  # No retrieval happened this step
+        
+        paths = self._last_retrieval_paths
+        B, T = paths['shape']
+        
+        # Move loss to same device as query
+        device = paths['query'].device
+        if per_token_loss.device != device:
+            per_token_loss = per_token_loss.to(device)
+        
+        # Strengthen highways for EACH token individually
+        with torch.no_grad():
+            for b in range(B):
+                for t in range(T):
+                    # Get loss for this specific token
+                    token_loss = per_token_loss[b, t].item()
+                    
+                    # 🔥 IMPROVED REWARD FORMULA: More aggressive scaling
+                    # Use exponential decay: reward = exp(-loss/temperature)
+                    # This gives stronger rewards for good predictions!
+                    # loss=0 → 1.0, loss=2 → 0.37, loss=5 → 0.08, loss=10 → 0.007
+                    temperature = 2.0  # Lower = more aggressive
+                    reward = math.exp(-token_loss / temperature)
+                    reward = min(2.0, reward)  # Cap at 2.0, but don't raise floor (let threshold filter)
+                    
+                    # Only strengthen if reward is above threshold (don't strengthen random paths!)
+                    if reward < 0.15:  # Skip if prediction was bad (loss > ~5.7)
+                        continue
+                    
+                    query_token = paths['query'][b, t]
+                    
+                    # Strengthen working memory highways (fast adaptation)
+                    working_indices = paths['working'][b, t]
+                    if working_indices.numel() > 1 and working_indices[0] >= 0:
+                        self.record_retrieval_success(
+                            query_token,
+                            working_indices,
+                            reward=reward,
+                            tier='working',
+                            learning_rate=self.highway_learning_rate  # Fast learning for working memory
+                        )
+                    
+                    # Strengthen buffer memory highways (medium-term)
+                    buffer_indices = paths['buffer'][b, t]
+                    if buffer_indices.numel() > 1 and buffer_indices[0] >= 0:
+                        self.record_retrieval_success(
+                            query_token,
+                            buffer_indices,
+                            reward=reward * 0.7,  # Slightly scaled down
+                            tier='buffer',
+                            learning_rate=self.highway_learning_rate * 0.7  # Medium learning
+                        )
+                    
+                    # Strengthen long-term memory highways (slow, stable learning)
+                    longterm_indices = paths['longterm'][b, t]
+                    if longterm_indices.numel() > 1 and longterm_indices[0] >= 0:
+                        self.record_retrieval_success(
+                            query_token,
+                            longterm_indices,
+                            reward=reward * 0.3,  # More conservative reward
+                            tier='longterm',
+                            learning_rate=self.highway_learning_rate * 0.2  # Slow, stable learning
+                        )
+        
+        # Clear stored paths
+        self._last_retrieval_paths = None
+    
     def record_retrieval_success(self, query_embedding: torch.Tensor, 
                                  retrieved_indices: torch.Tensor, 
                                  reward: float,
-                                 tier: str = 'working'):
+                                 tier: str = 'working',
+                                 learning_rate: float = 0.3):
         """
         Record which memories were retrieved together successfully.
         
@@ -1993,7 +2233,10 @@ class GraphMemorySystem(nn.Module):
             retrieved_indices: Which memories were retrieved (in order)
             reward: How helpful this retrieval was (higher = strengthen more)
             tier: Which tier to strengthen ('working', 'buffer', or 'longterm')
+            learning_rate: How fast to update edge weights (0.1=slow, 0.5=fast)
         """
+        # Skip debug logging - system is working correctly!
+        
         if len(retrieved_indices) < 2:
             return
         
@@ -2020,8 +2263,8 @@ class GraphMemorySystem(nn.Module):
             # Check: >= 0 (not placeholder) and < size (within bounds)
             if (idx_a >= 0 and idx_a < memory_tier.size.item() and 
                 idx_b >= 0 and idx_b < memory_tier.size.item()):
-                memory_tier.strengthen_edge(idx_a, idx_b, reward=reward)
-                memory_tier.strengthen_edge(idx_b, idx_a, reward=reward)  # Bidirectional
+                memory_tier.strengthen_edge(idx_a, idx_b, reward=reward, learning_rate=learning_rate)
+                memory_tier.strengthen_edge(idx_b, idx_a, reward=reward, learning_rate=learning_rate)  # Bidirectional
     
     def evolve_graph(self, enable_sleep_replay: bool = False):
         """
@@ -2304,39 +2547,25 @@ class GraphMemorySystem(nn.Module):
                     
                     # Entropy (lower = more confident)
                     entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1)  # [B*T]
-                    reward = 1.0 - entropy.mean().item() / torch.log(torch.tensor(k, dtype=torch.float))
-                    reward = max(0.0, reward)
+                    max_entropy = torch.log(torch.tensor(k, dtype=torch.float, device=entropy.device))
                     
-                    # 🔥 HEBBIAN LEARNING: Strengthen edges in ALL tiers based on retrieval success
-                    # Record pattern for first batch/token (representative)
+                    # 🔥 FIX: Entropy-based reward was too harsh (always 0 for uniform attention)
+                    # Old: reward = 1.0 - entropy / max_entropy (0 when uniform)
+                    # New: Use confidence (max prob) as reward - simpler & more direct!
+                    max_prob = probs.max(dim=-1)[0].mean().item()  # Average max attention weight
                     
-                    # WORKING MEMORY (tiny, fast updates)
-                    if working_bundle['indices'][0, 0].numel() > 1:
-                        self.record_retrieval_success(
-                            query[0, 0],
-                            working_bundle['indices'][0, 0],
-                            reward=reward,
-                            tier='working'
-                        )
-                    
-                    # BUFFER MEMORY (intermediate term)
-                    if buffer_bundle['indices'][0, 0].numel() > 1:
-                        self.record_retrieval_success(
-                            query[0, 0],
-                            buffer_bundle['indices'][0, 0],
-                            reward=reward * 0.5,  # Slower updates for stability
-                            tier='buffer'
-                        )
-                    
-                    # 🌟 LONG-TERM MEMORY (THE BIG ONE - 200K nodes!)
-                    # This is where the DEQ learns to sculpt the knowledge graph!
-                    if longterm_bundle['indices'][0, 0].numel() > 1:
-                        self.record_retrieval_success(
-                            query[0, 0],
-                            longterm_bundle['indices'][0, 0],
-                            reward=reward * 0.1,  # Very slow updates (preserve stability)
-                            tier='longterm'
-                        )
+                    # 🔥 DEFERRED HEBBIAN LEARNING: Store retrieval paths for ALL tokens (per-token strengthening!)
+                    # We'll strengthen AFTER we know the PER-TOKEN prediction loss (true reward signal)
+                    # Store full [B, T] structure so we can strengthen individually
+                    B, T, _ = query.shape
+                    self._last_retrieval_paths = {
+                        'working': working_bundle['indices'],  # [B, T, k]
+                        'buffer': buffer_bundle['indices'],    # [B, T, k]
+                        'longterm': longterm_bundle['indices'], # [B, T, k]
+                        'query': query,  # [B, T, D]
+                        'shape': (B, T),
+                        'attention_confidence': max_prob  # Optional: can use as bonus signal
+                    }
         
         # Combine all retrieved memories (flatten k dimension)
         bundles_to_combine = [working_bundle, buffer_bundle, longterm_bundle]
@@ -2561,21 +2790,54 @@ class GraphMemorySystem(nn.Module):
                 new_reward = alpha * reward + (1 - alpha) * old_reward
                 self.working.rewards[recent_idx] = new_reward
                 
-                # Also strengthen edges that were traversed during successful retrieval
-                # (This happens in record_retrieval_success, but we can boost recent memory's edges)
-                if recent_idx > 0:
-                    # Find neighbors of recent memory
-                    neighbors = self.working.adjacency[recent_idx]
-                    valid_neighbors = neighbors[neighbors >= 0]
+                # 🛣️ HIGHWAY FORMATION: Strengthen edges along successful retrieval paths!
+                # This is the key to forming "highways" - Hebbian learning on query paths
+                if hasattr(self, '_last_retrieval_paths') and self._last_retrieval_paths is not None:
+                    paths = self._last_retrieval_paths
                     
-                    # Boost CO_RETRIEVAL edge type (type 4) for successful prediction
-                    for neighbor_idx in valid_neighbors[:5]:  # Top 5 neighbors
-                        # Find which edge slot points to this neighbor
-                        for slot in range(self.working.adjacency.shape[1]):
-                            if self.working.adjacency[recent_idx, slot] == neighbor_idx:
-                                # Mark as co-retrieved with success strength
-                                self.working.edge_types[recent_idx, slot, 4] = reward
-                            break
+                    # DEBUG: Log highway formation attempt
+                    if not hasattr(self, '_highway_attempt_count'):
+                        self._highway_attempt_count = 0
+                    self._highway_attempt_count += 1
+                    if self._highway_attempt_count <= 3:
+                        print(f"[Highway Attempt #{self._highway_attempt_count}] reward={reward:.3f}, paths available: "
+                              f"working={paths.get('working') is not None}, "
+                              f"buffer={paths.get('buffer') is not None}, "
+                              f"longterm={paths.get('longterm') is not None}")
+                    
+                    # Strengthen highways in ALL tiers based on retrieval success
+                    # reward is high when loss is low → strengthen paths that led to good predictions
+                    for tier_name in ['working', 'buffer', 'longterm']:
+                        indices = paths.get(tier_name)  # [B, T, k]
+                        if indices is None or indices.numel() == 0:
+                            continue
+                        
+                        tier = getattr(self, tier_name)
+                        if tier.size < 2:
+                            continue
+                        
+                        # Flatten to get all retrieved memory pairs [B*T*k]
+                        B, T, k = indices.shape
+                        indices_flat = indices.view(-1)  # [B*T*k]
+                        
+                        # Strengthen consecutive retrievals (build highways along query path)
+                        for i in range(len(indices_flat) - 1):
+                            src_idx = indices_flat[i].item()
+                            tgt_idx = indices_flat[i + 1].item()
+                            
+                            if src_idx >= 0 and tgt_idx >= 0 and src_idx != tgt_idx:
+                                # Strengthen edge directly with hyperbolic Hebbian learning
+                                tier.strengthen_edge(src_idx, tgt_idx, reward=reward)
+                    
+                    # Clear after use to avoid strengthening same paths multiple times
+                    self._last_retrieval_paths = None
+                else:
+                    # DEBUG: Why no paths?
+                    if not hasattr(self, '_no_paths_count'):
+                        self._no_paths_count = 0
+                    self._no_paths_count += 1
+                    if self._no_paths_count <= 3:
+                        print(f"[No Paths #{self._no_paths_count}] apply_dopamine called but no retrieval paths stored")
     
     def update_balancer_feedback(self, sigma_memory: float):
         """

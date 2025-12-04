@@ -106,8 +106,8 @@ class DiskBackedTensor:
             else:
                 # Initialize empty disk storage
                 self.disk_data = {
-                    'embeddings': torch.zeros(0, *self.row_shape, dtype=dtype),
-                    'valid_mask': torch.zeros(0, dtype=torch.bool)
+                    'data': torch.zeros(0, *self.row_shape, dtype=dtype),
+                    'valid': torch.zeros(0, dtype=torch.bool)
                 }
         else:
             self.disk_file = None
@@ -183,8 +183,8 @@ class DiskBackedTensor:
             return cached.to(self.device)
         
         # Load from disk (slow path - blocks on I/O)
-        if self.disk_data is not None and idx < len(self.disk_data['embeddings']):
-            emb = self.disk_data['embeddings'][idx].clone()
+        if self.disk_data is not None and idx < len(self.disk_data['data']):
+            emb = self.disk_data['data'][idx].clone()
             
             # Add to cache
             with self._write_lock:
@@ -272,7 +272,9 @@ class DiskBackedTensor:
                 self.cache[idx] = value
                 if idx not in self._cache_order:
                     self._cache_order.append(idx)
-                if len(self.cache) > self.hot_capacity:
+                # 🔥 FIX: Only evict if cache is MUCH larger than capacity AND we have few dirty entries
+                # During bulk writes (like preload), cache can temporarily exceed capacity
+                if len(self.cache) > self.hot_capacity * 2 and len(self._dirty) < self.hot_capacity:
                     # LRU eviction - skip dirty entries
                     for evict_idx in list(self._cache_order):
                         if evict_idx not in self._dirty:
@@ -286,8 +288,10 @@ class DiskBackedTensor:
         # Queue for background flush (non-blocking!)
         if self._flush_thread is not None:
             self._flush_queue.put(('write', idx))
-        elif len(self._dirty) > 100:
-            # No background thread - flush synchronously when buffer fills
+        elif len(self._dirty) > self.hot_capacity:
+            # No background thread - flush synchronously when dirty buffer exceeds cache size
+            # This prevents unbounded RAM growth during bulk writes
+            self.flush()
             self.flush()
     
     def _set_slice(self, s: slice, value: torch.Tensor):
@@ -326,58 +330,66 @@ class DiskBackedTensor:
             try:
                 self.disk_data = torch.load(self.disk_file, map_location='cpu', weights_only=True)
                 
-                # Validate loaded data has correct structure
-                if 'embeddings' not in self.disk_data or 'valid_mask' not in self.disk_data:
-                    raise ValueError("Corrupted disk data - missing keys")
+                # 🔥 FIX: Use generic keys 'data'/'valid', not 'embeddings'/'valid_mask'
+                # This allows edge_weights, adjacency, etc. to work correctly
+                if 'data' not in self.disk_data or 'valid' not in self.disk_data:
+                    # Legacy format - migrate
+                    if 'embeddings' in self.disk_data and 'valid_mask' in self.disk_data:
+                        self.disk_data = {
+                            'data': self.disk_data['embeddings'],
+                            'valid': self.disk_data['valid_mask']
+                        }
+                    else:
+                        raise ValueError("Corrupted disk data - missing keys")
                     
-                # Ensure embeddings and mask sizes match (fix corruption)
-                emb_size = self.disk_data['embeddings'].size(0)
-                mask_size = self.disk_data['valid_mask'].size(0)
-                if emb_size != mask_size:
-                    print(f"⚠️  Size mismatch in disk data: emb={emb_size}, mask={mask_size}. Fixing...")
-                    # Resize mask to match embeddings
-                    new_mask = torch.zeros(emb_size, dtype=torch.bool)
-                    copy_size = min(emb_size, mask_size)
-                    new_mask[:copy_size] = self.disk_data['valid_mask'][:copy_size]
-                    self.disk_data['valid_mask'] = new_mask
+                # Ensure data and mask sizes match (fix corruption)
+                data_size = self.disk_data['data'].size(0)
+                mask_size = self.disk_data['valid'].size(0)
+                if data_size != mask_size:
+                    print(f"⚠️  Size mismatch in disk data: data={data_size}, mask={mask_size}. Fixing...")
+                    # Resize mask to match data
+                    new_mask = torch.zeros(data_size, dtype=torch.bool)
+                    copy_size = min(data_size, mask_size)
+                    new_mask[:copy_size] = self.disk_data['valid'][:copy_size]
+                    self.disk_data['valid'] = new_mask
                     
             except Exception as e:
                 print(f"⚠️  Failed to load disk data: {e}. Reinitializing...")
                 # Corrupted file - reinitialize
                 self.disk_data = {
-                    'embeddings': torch.zeros(0, *self.row_shape, dtype=self.dtype),
-                    'valid_mask': torch.zeros(0, dtype=torch.bool)
+                    'data': torch.zeros(0, *self.row_shape, dtype=self.dtype),
+                    'valid': torch.zeros(0, dtype=torch.bool)
                 }
         
         # Determine the actual size we need (max of current_size and any dirty indices)
         max_dirty_idx = max(dirty_snapshot) if dirty_snapshot else 0
-        required_size = max(current_size, max_dirty_idx + 1, self.disk_data['embeddings'].size(0))
+        required_size = max(current_size, max_dirty_idx + 1, self.disk_data['data'].size(0))
         
         # Expand disk storage if needed
-        if self.disk_data['embeddings'].size(0) < required_size:
-            new_embeddings = torch.zeros(required_size, *self.row_shape, dtype=self.dtype)
+        if self.disk_data['data'].size(0) < required_size:
+            new_data = torch.zeros(required_size, *self.row_shape, dtype=self.dtype)
             new_mask = torch.zeros(required_size, dtype=torch.bool)
             
-            old_size = self.disk_data['embeddings'].size(0)
-            old_mask_size = self.disk_data['valid_mask'].size(0)
+            old_size = self.disk_data['data'].size(0)
+            old_mask_size = self.disk_data['valid'].size(0)
             
             if old_size > 0:
-                # Copy existing embeddings (use actual old_size, not required_size)
+                # Copy existing data (use actual old_size, not required_size)
                 copy_size = min(old_size, required_size)
-                new_embeddings[:copy_size] = self.disk_data['embeddings'][:copy_size]
+                new_data[:copy_size] = self.disk_data['data'][:copy_size]
                 
-                # Copy existing mask (handle size mismatch between embeddings and mask)
+                # Copy existing mask (handle size mismatch between data and mask)
                 mask_copy_size = min(old_mask_size, copy_size, required_size)
-                new_mask[:mask_copy_size] = self.disk_data['valid_mask'][:mask_copy_size]
+                new_mask[:mask_copy_size] = self.disk_data['valid'][:mask_copy_size]
             
-            self.disk_data['embeddings'] = new_embeddings
-            self.disk_data['valid_mask'] = new_mask
+            self.disk_data['data'] = new_data
+            self.disk_data['valid'] = new_mask
         
         # Write dirty entries from cache to disk (bounds-checked)
         with self._write_lock:
             for idx in dirty_snapshot:
                 # Skip if index is somehow out of bounds
-                if idx >= self.disk_data['embeddings'].size(0):
+                if idx >= self.disk_data['data'].size(0):
                     continue
                     
                 if isinstance(self.cache, HyperbolicCache):
@@ -386,8 +398,8 @@ class DiskBackedTensor:
                     cached = self.cache.get(idx)
                 
                 if cached is not None:
-                    self.disk_data['embeddings'][idx] = cached.cpu()
-                    self.disk_data['valid_mask'][idx] = True
+                    self.disk_data['data'][idx] = cached.cpu()
+                    self.disk_data['valid'][idx] = True
         
         # Save to disk (this is the only blocking I/O)
         try:
@@ -445,29 +457,36 @@ class DiskBackedTensor:
             # No disk file yet - start fresh
             self._actual_size = 0
             self.disk_data = {
-                'embeddings': torch.zeros(0, *self.row_shape, dtype=self.dtype),
-                'valid_mask': torch.zeros(0, dtype=torch.bool)
+                'data': torch.zeros(0, *self.row_shape, dtype=self.dtype),
+                'valid': torch.zeros(0, dtype=torch.bool)
             }
             return
         
         try:
             self.disk_data = torch.load(self.disk_file, map_location='cpu', weights_only=True)
             
-            # Validate structure
-            if 'embeddings' not in self.disk_data or 'valid_mask' not in self.disk_data:
-                raise ValueError("Missing keys in disk data")
+            # Validate structure (support legacy format)
+            if 'data' not in self.disk_data or 'valid' not in self.disk_data:
+                if 'embeddings' in self.disk_data and 'valid_mask' in self.disk_data:
+                    # Legacy format - migrate
+                    self.disk_data = {
+                        'data': self.disk_data['embeddings'],
+                        'valid': self.disk_data['valid_mask']
+                    }
+                else:
+                    raise ValueError("Missing keys in disk data")
             
             # Validate sizes match
-            emb_size = self.disk_data['embeddings'].size(0)
-            mask_size = self.disk_data['valid_mask'].size(0)
+            emb_size = self.disk_data['data'].size(0)
+            mask_size = self.disk_data['valid'].size(0)
             if emb_size != mask_size:
-                print(f"⚠️  Disk data size mismatch (emb={emb_size}, mask={mask_size}). Fixing...")
+                print(f"⚠️  Disk data size mismatch (data={emb_size}, mask={mask_size}). Fixing...")
                 new_mask = torch.zeros(emb_size, dtype=torch.bool)
                 copy_size = min(emb_size, mask_size)
-                new_mask[:copy_size] = self.disk_data['valid_mask'][:copy_size]
-                self.disk_data['valid_mask'] = new_mask
+                new_mask[:copy_size] = self.disk_data['valid'][:copy_size]
+                self.disk_data['valid'] = new_mask
             
-            self._actual_size = self.disk_data['valid_mask'].sum().item()
+            self._actual_size = self.disk_data['valid'].sum().item()
             
         except Exception as e:
             print(f"⚠️  Failed to load disk file {self.disk_file}: {e}")
@@ -482,8 +501,8 @@ class DiskBackedTensor:
             # Start fresh
             self._actual_size = 0
             self.disk_data = {
-                'embeddings': torch.zeros(0, *self.row_shape, dtype=self.dtype),
-                'valid_mask': torch.zeros(0, dtype=torch.bool)
+                'data': torch.zeros(0, *self.row_shape, dtype=self.dtype),
+                'valid': torch.zeros(0, dtype=torch.bool)
             }
     
     def to(self, device):

@@ -35,6 +35,10 @@ matplotlib.use('Agg')  # Non-interactive backend
 import matplotlib.pyplot as plt
 plt.ioff()  # Turn off interactive mode
 
+# NOTE: Even with Agg backend, matplotlib is NOT thread-safe when multiple threads
+# create figures concurrently. This causes C++ aborts like "terminate called without
+# an active exception". All plt.* calls must be protected by BackgroundWorker._matplotlib_lock
+
 # Import from model_graybox instead of model
 from model_hdeq import GPTConfig, GPT, compute_pauli_exclusion_loss, HamiltonianOperator, DEQOperator, HomeostaticBalancer
 
@@ -64,12 +68,22 @@ except ImportError:
     VISUALIZATION_AVAILABLE = False
     print("⚠️  matplotlib/sklearn not available - phase space visualization disabled")
 
+# Check for --visualizations-off flag (parsed later, but we can peek early)
+import sys
+if '--visualizations-off' in sys.argv:
+    VISUALIZATION_AVAILABLE = False
+    print("🚫 Visualizations disabled via --visualizations-off flag")
+
 # -----------------------------------------------------------------------------
 # Background Task Worker
 # -----------------------------------------------------------------------------
 
 class BackgroundWorker:
     """Non-blocking background worker for visualization/diagnostics"""
+    
+    # Matplotlib is NOT thread-safe, even with Agg backend
+    # Use global lock to prevent simultaneous figure creation
+    _matplotlib_lock = threading.Lock()
     
     def __init__(self, max_queue_size=3):
         self.queue = Queue(maxsize=max_queue_size)
@@ -321,7 +335,9 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # --memory-path=<path>: Use specific memory file (for resuming/sharing)
 # --copy-clean-from=<path>: Copy from clean/reference memory (e.g., preloaded cache)
 # --create-clean-to=<path>: After preload, save a clean copy to this path (for reuse)
+# --visualizations-off: Disable all matplotlib visualizations (prevents thread-safety crashes)
 clean_memory = '--clean-memory' in sys.argv
+visualizations_disabled = '--visualizations-off' in sys.argv
 memory_path_override = None
 copy_clean_from = None
 create_clean_to = None
@@ -532,6 +548,7 @@ if use_memory_manifold:
         model_args['longterm_memory_decay'] = longterm_memory_decay
         model_args['memory_promotion_threshold'] = memory_promotion_threshold
         model_args['memory_promotion_interval'] = memory_promotion_interval
+        model_args['highway_learning_rate'] = highway_learning_rate if 'highway_learning_rate' in locals() else 0.3  # 🔥 NEW
     else:
         # Legacy static manifold loading
         print(f"🧠 Loading memory manifold from: {memory_manifold_path}")
@@ -1034,97 +1051,99 @@ def generate_samples_with_visualization(iter_num):
             reflex_activations = reflex_activations[:max_frames]
             generated_tokens = generated_tokens[:max_frames]
             
-            # Create figure with 2 subplots
-            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), facecolor='white',
-                                          gridspec_kw={'height_ratios': [2, 1]})
-            
-            # Prepare data for trajectory plot
-            from sklearn.decomposition import PCA
-            activations_array = np.array(reflex_activations)
-            pca = PCA(n_components=2)
-            trajectory_2d = pca.fit_transform(activations_array)
-            
-            def update_frame(frame_idx):
-                ax1.clear()
-                ax2.clear()
+            # CRITICAL: Matplotlib is NOT thread-safe, must use lock
+            with BackgroundWorker._matplotlib_lock:
+                # Create figure with 2 subplots
+                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8), facecolor='white',
+                                              gridspec_kw={'height_ratios': [2, 1]})
                 
-                # TOP: 2D trajectory through activation space
-                ax1.set_facecolor('#f0f0f0')
+                # Prepare data for trajectory plot
+                from sklearn.decomposition import PCA
+                activations_array = np.array(reflex_activations)
+                pca = PCA(n_components=2)
+                trajectory_2d = pca.fit_transform(activations_array)
                 
-                # Plot full trajectory (faded)
-                ax1.plot(trajectory_2d[:, 0], trajectory_2d[:, 1], 
-                        'gray', alpha=0.3, linewidth=1.5, linestyle='--')
+                def update_frame(frame_idx):
+                    ax1.clear()
+                    ax2.clear()
+                    
+                    # TOP: 2D trajectory through activation space
+                    ax1.set_facecolor('#f0f0f0')
+                    
+                    # Plot full trajectory (faded)
+                    ax1.plot(trajectory_2d[:, 0], trajectory_2d[:, 1], 
+                            'gray', alpha=0.3, linewidth=1.5, linestyle='--')
+                    
+                    # Plot trajectory up to current frame (bright)
+                    if frame_idx > 0:
+                        ax1.plot(trajectory_2d[:frame_idx+1, 0], trajectory_2d[:frame_idx+1, 1],
+                                color='#e74c3c', linewidth=3, alpha=0.9, label='Path so far')
+                    
+                    # Current position (big marker)
+                    ax1.scatter(trajectory_2d[frame_idx, 0], trajectory_2d[frame_idx, 1],
+                               c='red', s=300, marker='*', zorder=5, edgecolors='black', linewidths=2)
+                    
+                    # Start position
+                    ax1.scatter(trajectory_2d[0, 0], trajectory_2d[0, 1],
+                               c='green', s=150, marker='o', zorder=4, edgecolors='black', 
+                               linewidths=1.5, label='Start', alpha=0.7)
+                    
+                    # Labels for a few key points
+                    if frame_idx > 0:
+                        for i in range(0, min(frame_idx, 10), 3):
+                            token_str = decode([generated_tokens[i]])
+                            ax1.annotate(token_str, (trajectory_2d[i, 0], trajectory_2d[i, 1]),
+                                       fontsize=8, alpha=0.6, ha='center')
+                    
+                    # Current token label (big)
+                    current_token = decode([generated_tokens[frame_idx]])
+                    ax1.text(trajectory_2d[frame_idx, 0], trajectory_2d[frame_idx, 1] + 0.5,
+                            f'"{current_token}"', fontsize=14, fontweight='bold',
+                            ha='center', va='bottom', 
+                            bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.8))
+                    
+                    ax1.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%})', 
+                                  fontsize=12, fontweight='bold')
+                    ax1.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%})', 
+                                  fontsize=12, fontweight='bold')
+                    ax1.set_title(f'Reflex Network Trajectory (Token {frame_idx+1}/{len(reflex_activations)})',
+                                 fontsize=14, fontweight='bold')
+                    ax1.legend(loc='upper right', fontsize=10)
+                    ax1.grid(True, alpha=0.3)
+                    
+                    # BOTTOM: Raw activation heatmap
+                    ax2.set_facecolor('white')
+                    activation = activations_array[frame_idx]
+                    
+                    # Show top 50 dimensions for visibility
+                    top_dims = min(100, len(activation))
+                    im = ax2.imshow(activation[:top_dims].reshape(1, -1), 
+                                   cmap='RdBu_r', aspect='auto', 
+                                   vmin=-2, vmax=2, interpolation='nearest')
+                    
+                    ax2.set_title(f'Activation Pattern: "{current_token}"',
+                                 fontsize=12, fontweight='bold')
+                    ax2.set_ylabel('Neuron', fontsize=10)
+                    ax2.set_xlabel(f'Dimension (showing first {top_dims})', fontsize=10)
+                    ax2.set_yticks([])
+                    
+                    # Generated text so far
+                    text_so_far = decode(generated_tokens[:frame_idx+1])
+                    fig.text(0.5, 0.02, f'Generated: "{text_so_far}"',
+                            ha='center', fontsize=11, 
+                            bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.7))
+                    
+                    return ax1, ax2
                 
-                # Plot trajectory up to current frame (bright)
-                if frame_idx > 0:
-                    ax1.plot(trajectory_2d[:frame_idx+1, 0], trajectory_2d[:frame_idx+1, 1],
-                            color='#e74c3c', linewidth=3, alpha=0.9, label='Path so far')
+                # Create animation
+                anim = FuncAnimation(fig, update_frame, frames=len(reflex_activations),
+                                   interval=300, blit=False, repeat=True)
                 
-                # Current position (big marker)
-                ax1.scatter(trajectory_2d[frame_idx, 0], trajectory_2d[frame_idx, 1],
-                           c='red', s=300, marker='*', zorder=5, edgecolors='black', linewidths=2)
-                
-                # Start position
-                ax1.scatter(trajectory_2d[0, 0], trajectory_2d[0, 1],
-                           c='green', s=150, marker='o', zorder=4, edgecolors='black', 
-                           linewidths=1.5, label='Start', alpha=0.7)
-                
-                # Labels for a few key points
-                if frame_idx > 0:
-                    for i in range(0, min(frame_idx, 10), 3):
-                        token_str = decode([generated_tokens[i]])
-                        ax1.annotate(token_str, (trajectory_2d[i, 0], trajectory_2d[i, 1]),
-                                   fontsize=8, alpha=0.6, ha='center')
-                
-                # Current token label (big)
-                current_token = decode([generated_tokens[frame_idx]])
-                ax1.text(trajectory_2d[frame_idx, 0], trajectory_2d[frame_idx, 1] + 0.5,
-                        f'"{current_token}"', fontsize=14, fontweight='bold',
-                        ha='center', va='bottom', 
-                        bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.8))
-                
-                ax1.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%})', 
-                              fontsize=12, fontweight='bold')
-                ax1.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%})', 
-                              fontsize=12, fontweight='bold')
-                ax1.set_title(f'Reflex Network Trajectory (Token {frame_idx+1}/{len(reflex_activations)})',
-                             fontsize=14, fontweight='bold')
-                ax1.legend(loc='upper right', fontsize=10)
-                ax1.grid(True, alpha=0.3)
-                
-                # BOTTOM: Raw activation heatmap
-                ax2.set_facecolor('white')
-                activation = activations_array[frame_idx]
-                
-                # Show top 50 dimensions for visibility
-                top_dims = min(100, len(activation))
-                im = ax2.imshow(activation[:top_dims].reshape(1, -1), 
-                               cmap='RdBu_r', aspect='auto', 
-                               vmin=-2, vmax=2, interpolation='nearest')
-                
-                ax2.set_title(f'Activation Pattern: "{current_token}"',
-                             fontsize=12, fontweight='bold')
-                ax2.set_ylabel('Neuron', fontsize=10)
-                ax2.set_xlabel(f'Dimension (showing first {top_dims})', fontsize=10)
-                ax2.set_yticks([])
-                
-                # Generated text so far
-                text_so_far = decode(generated_tokens[:frame_idx+1])
-                fig.text(0.5, 0.02, f'Generated: "{text_so_far}"',
-                        ha='center', fontsize=11, 
-                        bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.7))
-                
-                return ax1, ax2
-            
-            # Create animation
-            anim = FuncAnimation(fig, update_frame, frames=len(reflex_activations),
-                               interval=300, blit=False, repeat=True)
-            
-            # Save as GIF
-            gif_path = os.path.join(monitor.reports_dir, f'reflex_generation_iter_{iter_num:06d}.gif')
-            writer = PillowWriter(fps=3)
-            anim.save(gif_path, writer=writer)
-            plt.close()
+                # Save as GIF
+                gif_path = os.path.join(monitor.reports_dir, f'reflex_generation_iter_{iter_num:06d}.gif')
+                writer = PillowWriter(fps=3)
+                anim.save(gif_path, writer=writer)
+                plt.close()
             
             print(f"  ✅ Reflex animation saved: {gif_path}")
         except Exception as e:
@@ -1133,25 +1152,31 @@ def generate_samples_with_visualization(iter_num):
     # CREATE HYPERBOLIC MEMORY NAVIGATION VISUALIZATION
     if hasattr(raw_model, 'reflex') and hasattr(raw_model.reflex, 'memory_retrieval'):
         memory_system = raw_model.reflex.memory_retrieval
-        memory_stats = memory_system.get_memory_stats()
         
-        if memory_stats.get('num_longterm', 0) > 10:  # Only if we have enough memories
-            print(f"  🗺️  Creating hyperbolic memory map...")
-            try:
-                from visualize_hyperbolic_navigation import visualize_memory_state_static
-                
-                map_path = os.path.join(monitor.reports_dir, f'hyperbolic_map_iter_{iter_num:06d}.png')
-                visualize_memory_state_static(memory_system, map_path)
-                
-                # TODO: For animated trajectory showing what model "looks at" per token:
-                # 1. Capture query embeddings during generation (in model.generate())
-                # 2. Capture retrieved memory indices per query
-                # 3. If deq_requery enabled, capture DEQ iteration trajectory
-                # 4. Use visualize_hyperbolic_navigation.create_navigation_gif()
-                # This would show the actual navigation path through hyperbolic space!
-                
-            except Exception as e:
-                print(f"  ⚠️  Could not create hyperbolic map: {e}")
+        # Safety check: memory_system might be None if memory disabled
+        if memory_system is not None:
+            memory_stats = memory_system.get_memory_stats()
+            
+            if memory_stats.get('num_longterm', 0) > 10:  # Only if we have enough memories
+                print(f"  🗺️  Creating hyperbolic memory map...")
+                try:
+                    from visualize_hyperbolic_navigation import visualize_memory_state_static
+                    
+                    map_path = os.path.join(monitor.reports_dir, f'hyperbolic_map_iter_{iter_num:06d}.png')
+                    
+                    # CRITICAL: visualize_memory_state_static uses matplotlib, must lock
+                    with BackgroundWorker._matplotlib_lock:
+                        visualize_memory_state_static(memory_system, map_path)
+                    
+                    # TODO: For animated trajectory showing what model "looks at" per token:
+                    # 1. Capture query embeddings during generation (in model.generate())
+                    # 2. Capture retrieved memory indices per query
+                    # 3. If deq_requery enabled, capture DEQ iteration trajectory
+                    # 4. Use visualize_hyperbolic_navigation.create_navigation_gif()
+                    # This would show the actual navigation path through hyperbolic space!
+                    
+                except Exception as e:
+                    print(f"  ⚠️  Could not create hyperbolic map: {e}")
     
     print("="*70 + "\n")
     model.train()
@@ -1271,49 +1296,52 @@ def visualize_phase_space(iter_num):
     traj_2d = pca.transform(traj)
     start_2d = pca.transform(traj_start)
     
-    # Plot
-    plt.figure(figsize=(10, 8))
-    plt.style.use('dark_background')
-    
-    plt.plot(traj_2d[:, 0], traj_2d[:, 1], 'r-', linewidth=2, label='Last Token Trajectory')
-    plt.scatter(traj_2d[0, 0], traj_2d[0, 1], c='white', marker='o', s=100, label='Start', zorder=5)
-    plt.scatter(traj_2d[-1, 0], traj_2d[-1, 1], c='red', marker='*', s=300, label='Equilibrium', zorder=5)
-    
-    plt.plot(start_2d[:, 0], start_2d[:, 1], 'b--', alpha=0.5, linewidth=1.5, label='First Token (Control)')
-    plt.scatter(start_2d[-1, 0], start_2d[-1, 1], c='blue', marker='x', s=150, zorder=5)
-    
-    # Arrows for first few iterations
-    for i in range(min(len(traj_2d)-1, 10)):
-        dx = traj_2d[i+1,0] - traj_2d[i,0]
-        dy = traj_2d[i+1,1] - traj_2d[i,1]
-        plt.arrow(traj_2d[i,0], traj_2d[i,1], dx*0.7, dy*0.7,
-                 head_width=0.05, head_length=0.05, fc='red', ec='red', alpha=0.6, zorder=3)
-    
-    # Diagnostics
-    center = traj_2d.mean(axis=0)
-    radii = np.linalg.norm(traj_2d - center, axis=1)
-    radius_trend = np.polyfit(range(len(radii)), radii, 1)[0]
-    
-    if abs(radius_trend) < 0.01:
-        dynamics_type = "ORBITAL (Hamiltonian)"
-    elif radius_trend < -0.01:
-        dynamics_type = "SPIRAL (Dissipative)"
-    else:
-        dynamics_type = "DIVERGING"
-    
-    plt.title(f'Phase Space @ Iter {iter_num}\nDynamics: {dynamics_type} | DEQ Iters: {len(traj)}', fontsize=14)
-    plt.xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%})', fontsize=11)
-    plt.ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%})', fontsize=11)
-    plt.legend(loc='best', fontsize=9)
-    plt.grid(True, alpha=0.2)
-    plt.tight_layout()
-    
-    # Save to reports
-    phase_dir = os.path.join(out_dir, 'reports', 'phase_space')
-    os.makedirs(phase_dir, exist_ok=True)
-    output_path = os.path.join(phase_dir, f'phase_iter_{iter_num:06d}.png')
-    plt.savefig(output_path, dpi=200, bbox_inches='tight')
-    plt.close()
+    # CRITICAL: Matplotlib is NOT thread-safe, even with Agg backend
+    # Must use global lock to prevent C++ aborts from concurrent figure creation
+    with BackgroundWorker._matplotlib_lock:
+        # Plot
+        plt.figure(figsize=(10, 8))
+        plt.style.use('dark_background')
+        
+        plt.plot(traj_2d[:, 0], traj_2d[:, 1], 'r-', linewidth=2, label='Last Token Trajectory')
+        plt.scatter(traj_2d[0, 0], traj_2d[0, 1], c='white', marker='o', s=100, label='Start', zorder=5)
+        plt.scatter(traj_2d[-1, 0], traj_2d[-1, 1], c='red', marker='*', s=300, label='Equilibrium', zorder=5)
+        
+        plt.plot(start_2d[:, 0], start_2d[:, 1], 'b--', alpha=0.5, linewidth=1.5, label='First Token (Control)')
+        plt.scatter(start_2d[-1, 0], start_2d[-1, 1], c='blue', marker='x', s=150, zorder=5)
+        
+        # Arrows for first few iterations
+        for i in range(min(len(traj_2d)-1, 10)):
+            dx = traj_2d[i+1,0] - traj_2d[i,0]
+            dy = traj_2d[i+1,1] - traj_2d[i,1]
+            plt.arrow(traj_2d[i,0], traj_2d[i,1], dx*0.7, dy*0.7,
+                     head_width=0.05, head_length=0.05, fc='red', ec='red', alpha=0.6, zorder=3)
+        
+        # Diagnostics
+        center = traj_2d.mean(axis=0)
+        radii = np.linalg.norm(traj_2d - center, axis=1)
+        radius_trend = np.polyfit(range(len(radii)), radii, 1)[0]
+        
+        if abs(radius_trend) < 0.01:
+            dynamics_type = "ORBITAL (Hamiltonian)"
+        elif radius_trend < -0.01:
+            dynamics_type = "SPIRAL (Dissipative)"
+        else:
+            dynamics_type = "DIVERGING"
+        
+        plt.title(f'Phase Space @ Iter {iter_num}\nDynamics: {dynamics_type} | DEQ Iters: {len(traj)}', fontsize=14)
+        plt.xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%})', fontsize=11)
+        plt.ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%})', fontsize=11)
+        plt.legend(loc='best', fontsize=9)
+        plt.grid(True, alpha=0.2)
+        plt.tight_layout()
+        
+        # Save to reports
+        phase_dir = os.path.join(out_dir, 'reports', 'phase_space')
+        os.makedirs(phase_dir, exist_ok=True)
+        output_path = os.path.join(phase_dir, f'phase_iter_{iter_num:06d}.png')
+        plt.savefig(output_path, dpi=200, bbox_inches='tight')
+        plt.close()
     
     # Silent mode - phase space saved to graph
     model.train()
@@ -1393,24 +1421,30 @@ def get_chaos_aware_lr(it, metrics, base_lr):
     
     # Stress Signal 2: High Residual (Energy not conserved/minimized)
     # Use LOGARITHMIC scale to distinguish orders of magnitude
-    # RECALIBRATED for quantum solver (which explores before converging)
-    # - Residual 100.0: Initialization chaos, explosive
-    # - Residual 10.0: Early exploration, very high
-    # - Residual 1.0: Mid exploration, acceptable
-    # - Residual 0.1: Converging well
+    # 🔥 EUSTRESS CALIBRATION: Early exploration needs HIGH residuals to learn!
+    # The model MUST be allowed to explore chaotic regions during initialization.
+    # Only truly explosive residuals (>10.0) should trigger throttling.
+    #
+    # RECALIBRATED SCALE (shifted tolerance window):
+    # - Residual 100.0: True explosion, dangerous
+    # - Residual 10.0: High exploration, ACCEPTABLE early on
+    # - Residual 1.0: Healthy orbit search, GOOD (this is where successful runs stabilize)
+    # - Residual 0.1: Converging to fixed point
+    # - Residual 0.04: Orbital stability (sin(1) ≈ 0.84 throttle observed in good runs)
     # - Residual 1e-2 (0.01): Locked in
     # - Residual 1e-3 (0.001): Perfect equilibrium
     raw_res = metrics.get('final_residual', 0.0)
     if raw_res > 0:
-        # Map log10(residual) from [-3, +2] to [0, 1]
-        # log10(1e-3) = -3 -> 0.0 (Zen - perfect)
-        # log10(0.01) = -2 -> 0.2 (Excellent)
-        # log10(0.1) = -1 -> 0.4 (Good)
-        # log10(1.0) = 0 -> 0.6 (Exploring)
-        # log10(10.0) = +1 -> 0.8 (High exploration)
-        # log10(100.0) = +2 -> 1.0 (Panic - explosive)
+        # NEW: Shift tolerance window - residual of 1.0 is now "safe" (score 0.2, not 0.6)
+        # Map log10(residual) from [-3, +2] but with shifted zero point
+        # log10(1e-3) = -3 -> -0.33 -> 0.0 (Zen - perfect)
+        # log10(0.04) = -1.4 -> -0.07 -> 0.0 (Orbital - successful runs!)
+        # log10(0.1) = -1 -> 0.0 -> 0.17 (Good)
+        # log10(1.0) = 0 -> +1.0 -> 0.33 (Exploring - ACCEPTABLE)
+        # log10(10.0) = +1 -> +2.0 -> 0.67 (High exploration - start watching)
+        # log10(100.0) = +2 -> +3.0 -> 0.83 (Panic - explosive)
         log_res = math.log10(max(raw_res, 1e-4))  # Clamp to avoid log(0)
-        stress_residual = (log_res + 3.0) / 5.0  # Map [-3, +2] to [0, 1]
+        stress_residual = (log_res + 1.0) / 6.0  # Map [-1, +2] to [0, 0.5], shifted tolerance
         stress_residual = max(0.0, min(1.0, stress_residual))  # Clamp to [0, 1]
     else:
         stress_residual = 0.0
@@ -1419,10 +1453,12 @@ def get_chaos_aware_lr(it, metrics, base_lr):
     chaos_score = max(stress_iters, stress_residual)
     
     # The Valve: If chaos is high, throttle the LR
-    # If chaos > 0.8, LR drops to 10%. If chaos < 0.2, LR is 100%.
-    # This prevents "driving into corners at full speed"
+    # 🔥 CRITICAL: Raise the floor to 0.5 (never drop below 50% LR)
+    # This ensures the model retains enough plasticity to escape initialization basin
+    # and find the stable 0.84 orbital regime observed in successful runs.
+    # If chaos > 0.8, LR drops to 50%. If chaos < 0.2, LR is 100%.
     throttle = 1.0 - max(0, (chaos_score - 0.2) / 0.8)
-    throttle = max(0.1, throttle)  # Never stop completely, but slow down 10x
+    throttle = max(0.5, throttle)  # 🚀 NEVER drop below 50% LR (was 0.1)
     
     # REMOVED: Early training override (no longer needed with recalibrated chaos sensor)
     # The new residual scale (log10 mapped from [-3, +1]) handles explosive init correctly:
@@ -1479,11 +1515,44 @@ prev_metrics = {'num_iters': 0, 'final_residual': 0.0}
 while True:
 
     # determine and set the learning rate for this iteration
-    # Use Lyapunov-guided (chaos-aware) LR if we have metrics from previous step
-    if decay_lr and iter_num > 0:
-        lr = get_chaos_aware_lr(iter_num, prev_metrics, learning_rate)
+    # 🚀 FERRARI MODE: Keep LR high, use Thermostat Loss instead of throttling
+    # Robot Arm insight: Don't brake the optimizer - teach the weights to stabilize!
+    # The stability_loss term (added to balanced_loss) trains the network to self-regulate.
+    use_chaos_aware = getattr(config, 'use_chaos_aware_lr', True)  # Can disable for baseline
+    
+    # CHANGED: Don't throttle LR based on chaos - just use normal schedule
+    # The thermostat loss will handle stability training via gradients
+    if decay_lr:
+        lr = get_lr(iter_num)  # Normal cosine schedule (warmup + decay)
     else:
-        lr = get_lr(iter_num) if decay_lr else learning_rate
+        lr = learning_rate  # Constant LR (debug mode)
+    
+    # Optional: Still compute chaos metrics for monitoring (but don't throttle!)
+    if use_chaos_aware and iter_num > 0 and prev_metrics:
+        # Compute chaos score for diagnostics and stability_loss (BEFORE forward pass)
+        # 🔥 RECALIBRATED CHAOS FORMULA - matches eustress calibration
+        stress_iters = min(1.0, prev_metrics['num_iters'] / deq_max_iter)
+        raw_res = prev_metrics['final_residual']
+        if raw_res > 0:
+            # NEW SCALE: Residual 1.0 is now "safe" (was "chaos")
+            # log10(1e-3) = -3 -> -2.0 -> -0.33 -> 0.0 (Perfect)
+            # log10(0.04) = -1.4 -> -0.4 -> -0.07 -> 0.0 (Orbital - sin(1) regime!)
+            # log10(0.1) = -1 -> 0.0 -> 0.0 -> 0.0 (Good)
+            # log10(1.0) = 0 -> +1.0 -> +0.17 -> 0.17 (Exploring)
+            # log10(10.0) = +1 -> +2.0 -> +0.50 -> 0.50 (High exploration)
+            # log10(100.0) = +2 -> +3.0 -> +0.83 -> 0.83 (Panic)
+            log_res = math.log10(max(raw_res, 1e-4))
+            stress_residual = (log_res + 1.0) / 6.0  # NEW: Shifted tolerance window
+            stress_residual = max(0.0, min(1.0, stress_residual))
+        else:
+            stress_residual = 0.0
+        chaos_score_current = max(stress_iters, stress_residual)
+        
+        # Store in a temp variable for stability_loss to use
+        # Will be overwritten by actual metrics after forward pass
+        current_chaos_estimate = chaos_score_current
+    else:
+        current_chaos_estimate = 0.0
     
     # Apply LR to param groups, but protect balancer's independent LR
     # The balancer (last param group) should learn faster to regulate the network
@@ -1926,7 +1995,55 @@ while True:
             
             # Apply Homeostatic Balancer
             # This automatically weights each loss by 1/σ² where σ is learned
-            balanced_loss, balance_stats = balancer(loss_components)
+            # 🔥 TEMPORARILY DISABLED: Use only prediction loss to debug base learning
+            USE_BALANCER = False  # Set to True to re-enable homeostatic balancing
+            
+            if USE_BALANCER:
+                balanced_loss, balance_stats = balancer(loss_components)
+            else:
+                # Pure prediction loss only - no auxiliary losses!
+                balanced_loss = loss_components['prediction']
+                balance_stats = {
+                    'sigma_prediction': 1.0,
+                    'sigma_jacobian': 1.0,
+                    'sigma_novelty': 1.0,
+                    'sigma_memory': 1.0,
+                    'sigma_navigation': 1.0,
+                    'weight_prediction': 1.0,
+                    'weight_jacobian': 0.0,
+                    'weight_novelty': 0.0,
+                    'weight_memory': 0.0,
+                    'weight_navigation': 0.0
+                }
+            
+            # 🌡️ THERMOSTAT (not Panic Button): Stability as a Loss Term
+            # Robot Arm insight: Don't kill the LR when unstable - teach the weights to stabilize!
+            # Add a DIFFERENTIABLE penalty that pushes the system toward target entropy/residual
+            # This allows the optimizer to LEARN stability, rather than just braking.
+            #
+            # Target: chaos_score ≈ sin(1) ≈ 0.841 (Natural attractor for limit cycles!)
+            # This is the "Golden Ratio" of dynamical systems - stable periodic orbit
+            # Penalty scales with distance from target - model learns to self-regulate
+            stability_loss_tensor = torch.tensor(0.0, device=device)
+            stability_loss_value = 0.0
+            if use_chaos_aware and 'current_chaos_estimate' in locals():
+                chaos = current_chaos_estimate  # Use PRE-computed chaos from prev step
+                chaos_target = math.sin(1.0)  # ≈ 0.841 - Natural limit cycle attractor
+                chaos_deviation = abs(chaos - chaos_target)
+                
+                # Scale penalty: strong when far from target, weak when close
+                # γ_thermo (thermostat gain) - how hard to push toward equilibrium
+                gamma_thermo = 0.05  # Start gentle (5% of task loss weight)
+                stability_loss_tensor = torch.tensor(gamma_thermo * (chaos_deviation ** 2), device=device)
+                stability_loss_value = stability_loss_tensor.item()
+                
+                # Add to total loss - this trains the WEIGHTS to be stable
+                balanced_loss = balanced_loss + stability_loss_tensor
+                
+                # Store for diagnostics
+                metrics['stability_loss'] = stability_loss_value
+                metrics['chaos_target'] = chaos_target
+                metrics['chaos_current'] = chaos
             
             # HOMEOSTATIC FEEDBACK: Update memory system with balancer's uncertainty
             # This creates adaptive consolidation - reduce memory formation when σ_memory is low
@@ -1938,6 +2055,12 @@ while True:
                 # Lower loss → higher reward → strengthen recent memory
                 prediction_loss = loss_components['prediction'].item()
                 raw_model.reflex.memory_retrieval.apply_dopamine(prediction_loss)
+                
+                # 🛣️ HIGHWAY STRENGTHENING: Reinforce retrieval paths based on ACTUAL PER-TOKEN loss
+                # This creates "highways" through the memory graph - fast paths to useful knowledge!
+                # Only strengthen paths that lead to GOOD predictions (token-level precision!)
+                if 'loss_per_token' in metrics and metrics['loss_per_token'] is not None:
+                    raw_model.reflex.memory_retrieval.strengthen_last_retrieval(metrics['loss_per_token'])
             
             # Scale for gradient accumulation
             loss = balanced_loss / gradient_accumulation_steps
@@ -2014,11 +2137,15 @@ while True:
     # Reveals the local geometry of the loss landscape
     # This shows if we're converging (sink), oscillating (vortex), or bypassing (orthogonal flows)
     # RUN IN BACKGROUND - don't block training!
-    if iter_num % 20 == 0 and iter_num > 0 and master_process and bg_worker:
+    if iter_num % 20 == 0 and iter_num > 0 and master_process and bg_worker and VISUALIZATION_AVAILABLE:
+        # CRITICAL: visualize_gradient_flow uses matplotlib, must wrap with lock
+        def safe_gradient_flow_viz():
+            with BackgroundWorker._matplotlib_lock:
+                visualize_gradient_flow(raw_model, optimizer, iter_num, out_dir, max_layers=40)
+        
         bg_worker.submit(
             "Gradient Flow Viz",
-            visualize_gradient_flow,
-            raw_model, optimizer, iter_num, out_dir, max_layers=40
+            safe_gradient_flow_viz
         )
     
     # Optimizer step
@@ -2074,19 +2201,19 @@ while True:
         'pauli_component': metrics.get('pauli_component', 0.0)  # Pauli contribution
     }
     
-    # Calculate chaos score components for logging (MUST MATCH get_chaos_aware_lr formula!)
+    # Calculate chaos score components for logging (matches NEW recalibrated formula!)
     stress_iters = min(1.0, prev_metrics['num_iters'] / deq_max_iter)
-    # Use logarithmic scale for residual - UPDATED to match quantum solver range
+    # Use NEW logarithmic scale for residual (shifted tolerance window)
     raw_res = prev_metrics['final_residual']
     if raw_res > 0:
         log_res = math.log10(max(raw_res, 1e-4))
-        stress_residual = (log_res + 3.0) / 5.0  # Map [-3, +2] to [0, 1] (quantum scale)
+        stress_residual = (log_res + 1.0) / 6.0  # NEW: Shifted tolerance (was +3.0 / 5.0)
         stress_residual = max(0.0, min(1.0, stress_residual))
     else:
         stress_residual = 0.0
     chaos_score = max(stress_iters, stress_residual)
     throttle = 1.0 - max(0, (chaos_score - 0.2) / 0.8)
-    throttle = max(0.1, throttle)
+    throttle = max(0.5, throttle)  # Floor at 50% (but not used anymore - LR stays high)
     
     # HOMEOSTATIC ADAPTIVE FRICTION: Update Hamiltonian friction based on Chaos Score
     # This makes the damping self-regulate: High chaos → High γ → Aggressive damping
@@ -2274,16 +2401,25 @@ while True:
             base = prev_metrics['loss_base']
             loss_breakdown_str = f", base={base:.2f}{balancer_str}"
         
+        # Add gradient norm if available
+        grad_norm_str = ""
+        if 'grad_norm' in metrics:
+            grad_norm_str = f", ∇={metrics['grad_norm']:.2e}"
+        
         # Log line with NOVELTY/EXPLORATION DRIVE (ℂ), chaos breakdown, Bayesian balancer, reflex gate, and memory state
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {time_ms:.2f}ms, mfu {running_mfu*100:.2f}%, deq_iters={deq_iters}, lr={lr:.2e}, chaos={chaos_score:.3f}{chaos_breakdown}, res={raw_residual:.2e}, ℂ={novelty_drive:.3e}, {gate_phase}{memory_stats_str}{loss_breakdown_str}")
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {time_ms:.2f}ms, mfu {running_mfu*100:.2f}%, deq_iters={deq_iters}, lr={lr:.2e}, chaos={chaos_score:.3f}{chaos_breakdown}, res={raw_residual:.2e}, ℂ={novelty_drive:.3e}, {gate_phase}{memory_stats_str}{loss_breakdown_str}{grad_norm_str}")
         
         # 🛣️ HIGHWAY REPORT: Every 100 iters, show detailed Hebbian learning stats
         if iter_num % 100 == 0 and iter_num > 0 and master_process and use_memory_manifold:
             if hasattr(raw_model.reflex, 'get_memory_stats'):
                 mem_stats = raw_model.reflex.get_memory_stats()
-                if mem_stats.get('highways_formed', 0) > 0:
-                    print(f"\n🛣️  HEBBIAN HIGHWAYS (iter {iter_num})")
-                    print(f"   Total strengthened: {mem_stats['highways_formed']} edges")
+                highways_count = mem_stats.get('highways_formed', 0)
+                
+                # ALWAYS print highway status (even if 0, so we know it's checking)
+                print(f"\n🛣️  HEBBIAN HIGHWAYS (iter {iter_num})")
+                print(f"   Total strengthened: {highways_count} edges")
+                
+                if highways_count > 0:
                     print(f"   Max strengthening: {mem_stats.get('max_highway_strength', 0):.4f}")
                     print(f"   Avg strengthening: {mem_stats.get('avg_highway_strength', 0):.4f}")
                     
@@ -2293,12 +2429,19 @@ while True:
                         if highway_details.get('top_highways'):
                             print(f"   Top 5 highways:")
                             for i, hw in enumerate(highway_details['top_highways'][:5], 1):
-                                print(f"      {i}. Edge {hw['source']}→{hw['target']}: "
+                                print(f"      {i}. Edge {hw['source_idx']}→{hw['target_idx']}: "
                                       f"weight {hw['old_weight']:.3f}→{hw['new_weight']:.3f} "
                                       f"(Δ={hw['strengthening']:.4f}, "
                                       f"traversals={hw.get('traversal_count', 0)}, "
                                       f"success={hw.get('success_rate', 0):.2f})")
-                    print()
+                else:
+                    print(f"   ℹ️  No highways formed yet (highway_log empty)")
+                    print(f"   Longterm size: {mem_stats.get('num_longterm', 0)} memories")
+                    # Debug: Check if strengthen_edge is even being called
+                    if hasattr(raw_model.reflex.memory_retrieval, 'longterm'):
+                        lt = raw_model.reflex.memory_retrieval.longterm
+                        print(f"   Highway log size: {len(lt.highway_log) if hasattr(lt, 'highway_log') else 'N/A'}")
+                print()
         
         # Save profiling stats to CSV (silent mode - no console spam)
         if enable_profiling and iter_num % profile_interval == 0 and iter_num > 0 and master_process:
@@ -2306,17 +2449,23 @@ while True:
             profiler.save_to_csv(profiling_csv, recent_n=profile_interval)
         
         # [COMPREHENSIVE DIAGNOSTIC REPORT] Every 10 iters - RUN IN BACKGROUND
-        if iter_num % 10 == 0 and iter_num > 0 and diagnostic and master_process and bg_worker:
+        if iter_num % 10 == 0 and iter_num > 0 and diagnostic and master_process and bg_worker and VISUALIZATION_AVAILABLE:
             meta_path_diag = os.path.join(data_dir, 'meta.pkl')
             if os.path.exists(meta_path_diag):
                 with open(meta_path_diag, 'rb') as f:
                     meta_diag = pickle.load(f)
                 
                 # Submit to background - non-blocking, silent mode (data saved to files)
+                # CRITICAL: diagnostic.generate_full_report uses matplotlib, must wrap with lock
+                def safe_diagnostic_report():
+                    with BackgroundWorker._matplotlib_lock:
+                        diagnostic.generate_full_report(
+                            raw_model, get_batch, meta_diag, iter_num, device=device, silent=True
+                        )
+                
                 bg_worker.submit(
                     "Diagnostic Report",
-                    diagnostic.generate_full_report,
-                    raw_model, get_batch, meta_diag, iter_num, device=device, silent=True
+                    safe_diagnostic_report
                 )
                 # Note: model.train() will be called at end of diagnostic in background
         
@@ -2343,24 +2492,30 @@ while True:
         fast_mode = getattr(config, 'fast_mode', False)
         plot_interval = getattr(config, 'plot_interval', 20)
         
-        if iter_num % plot_interval == 0 and iter_num > 0 and monitor and bg_worker:
+        if iter_num % plot_interval == 0 and iter_num > 0 and monitor and bg_worker and VISUALIZATION_AVAILABLE:
+            # CRITICAL: monitor.plot_homeostasis uses matplotlib, must wrap with lock
+            def safe_homeostasis_plot():
+                with BackgroundWorker._matplotlib_lock:
+                    monitor.plot_homeostasis(iter_num)
+            
             bg_worker.submit(
                 "Homeostasis Dashboard",
-                monitor.plot_homeostasis,
-                iter_num
+                safe_homeostasis_plot
             )
             
             # 🧠 BAYESIAN BRAIN DIAGNOSTICS (every 100 iters) - RUN IN BACKGROUND
             # This creates the comprehensive precision-weighted visualization
             if iter_num % 100 == 0:
                 def _plot_bayesian():
-                    try:
-                        import importlib
-                        import plot_bayesian_brain
-                        importlib.reload(plot_bayesian_brain)  # Force reload to pick up fixes
-                        plot_bayesian_brain.plot_bayesian_brain(monitor.reports_dir, silent=True)
-                    except Exception as e:
-                        pass  # Errors handled by background worker
+                    # CRITICAL: plot_bayesian_brain uses matplotlib, must use lock
+                    with BackgroundWorker._matplotlib_lock:
+                        try:
+                            import importlib
+                            import plot_bayesian_brain
+                            importlib.reload(plot_bayesian_brain)  # Force reload to pick up fixes
+                            plot_bayesian_brain.plot_bayesian_brain(monitor.reports_dir, silent=True)
+                        except Exception as e:
+                            pass  # Errors handled by background worker
                 
                 bg_worker.submit("Bayesian Brain Plot", _plot_bayesian)
         

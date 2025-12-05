@@ -168,7 +168,8 @@ def preload_memories_from_dataset(
     device='cuda',
     dtype=torch.float16,
     verbose=True,
-    use_simple_mode=True  # Use simple one-at-a-time mode like the test
+    use_simple_mode=True,  # Use simple one-at-a-time mode like the test
+    build_trajectories=True  # 🚀 NEW: Build sequential trajectories during preload!
 ):
     """
     Scan dataset and populate memory system with semantic chunks.
@@ -384,7 +385,9 @@ def preload_memories_from_dataset(
     streaming_batch_size = 256  # Encode 256 chunks at a time
     batch_embeddings = []
     chunk_tokens_list = []  # 🔥 Store tokens for PMI-based edge initialization
+    chunk_positions = []  # 🚀 Track dataset positions for trajectory building
     memories_added = 0
+    prev_batch_end_idx = 0  # 🚀 Track where previous batch ended for sequential edges
     
     from hyperbolic_memory import PoincareManifold
     if hasattr(memory_system, 'longterm'):
@@ -406,6 +409,7 @@ def preload_memories_from_dataset(
             
             # 🔥 Store chunk tokens for PMI-based edge building
             chunk_tokens_list.append(chunk.tolist())
+            chunk_positions.append(pos)  # 🚀 NEW: Track position for sequential trajectory edges
             
             # Convert to tensor
             x = torch.from_numpy(chunk.astype(np.int64)).to(device)
@@ -440,8 +444,49 @@ def preload_memories_from_dataset(
                 )
                 memories_added += added
                 
+                # 🚀 BUILD SEQUENTIAL TRAJECTORIES (single-pass, as we load!)
+                if build_trajectories and added > 1:
+                    batch_start_idx = prev_batch_end_idx
+                    batch_end_idx = batch_start_idx + added
+                    
+                    # Build edges for sequential chunks in dataset
+                    trajectory_edges = 0
+                    trajectory_errors = 0
+                    
+                    for i in range(batch_start_idx, batch_end_idx - 1):
+                        # Check if consecutive in dataset (positions close)
+                        local_idx = i - batch_start_idx
+                        if local_idx < len(chunk_positions) - 1:
+                            pos_a = chunk_positions[local_idx]
+                            pos_b = chunk_positions[local_idx + 1]
+                            
+                            # If positions overlap (stride < chunk_size), this is a trajectory!
+                            if abs(pos_b - pos_a) <= chunk_size:
+                                # Strengthen edge between consecutive MEMORY indices
+                                # i and i+1 are absolute memory indices
+                                try:
+                                    # Validate indices before strengthening
+                                    if i >= 0 and i + 1 < lt_mem.size.item():
+                                        lt_mem.strengthen_edge(i, i + 1, reward=0.5)
+                                        trajectory_edges += 1
+                                    else:
+                                        trajectory_errors += 1
+                                except (IndexError, RuntimeError, AttributeError) as e:
+                                    trajectory_errors += 1
+                                    if trajectory_errors <= 3:  # Only print first few errors
+                                        if verbose:
+                                            print(f"   ⚠️  Edge strengthen failed: {e}")
+                    
+                    if verbose and trajectory_edges > 0:
+                        print(f"   🛣️  Built {trajectory_edges} trajectory edges")
+                        if trajectory_errors > 0:
+                            print(f"   ⚠️  {trajectory_errors} edges failed (expected if k-NN not connected)")
+                    
+                    prev_batch_end_idx = batch_end_idx
+                
                 # Clear batch to free RAM
                 batch_embeddings = []
+                chunk_positions = []  # Clear positions too
                 
                 # Force garbage collection every 10 batches
                 if memories_added % 2560 == 0:
@@ -524,6 +569,54 @@ def preload_memories_from_dataset(
     
     if verbose:
         print("=" * 70 + "\n")
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # 🚀 ENCODE DATASET TRAJECTORIES - Seed memory with sequential patterns!
+    # ═══════════════════════════════════════════════════════════════════════
+    if memories_added > 1 and hasattr(memory_system, 'longterm') and os.path.exists(train_data_path):
+        try:
+            from preload_trajectories import preload_trajectories_from_dataset
+            
+            if verbose:
+                print(f"\n🛤️  ENCODING DATASET TRAJECTORIES")
+                print("=" * 70)
+            
+            # Prepare memory chunks for matching
+            # Convert stored embeddings back to token sequences for pattern matching
+            memory_chunks = []
+            if chunk_tokens_list and len(chunk_tokens_list) > 0:
+                # Use the token sequences we already extracted
+                memory_chunks = [tuple(tokens) for tokens in chunk_tokens_list]
+            
+            if len(memory_chunks) > 0:
+                trajectory_stats = preload_trajectories_from_dataset(
+                    memory_system=memory_system,
+                    dataset_path=train_data_path,
+                    memory_chunks=memory_chunks,
+                    chunk_size=chunk_size,
+                    stride=chunk_size // 2,  # 50% overlap for pattern mining
+                    min_frequency=3,  # Pattern must appear 3+ times
+                    max_patterns=10000,  # Keep top 10K patterns
+                    n_gram_sizes=[2, 3, 4],  # Bigrams, trigrams, 4-grams
+                    tier_name='longterm',
+                    strength_scale=0.1,  # Conservative strengthening
+                    verbose=verbose
+                )
+                
+                if verbose:
+                    print(f"✅ Trajectory encoding complete!")
+                    print(f"   Patterns mined: {trajectory_stats['total_patterns']:,}")
+                    print("=" * 70 + "\n")
+            elif verbose:
+                print(f"⚠️  No chunks available for trajectory encoding")
+                print("=" * 70 + "\n")
+                
+        except Exception as e:
+            if verbose:
+                print(f"⚠️  Could not encode trajectories: {e}")
+                import traceback
+                traceback.print_exc()
+                print("=" * 70 + "\n")
     
     model.train()
     
@@ -800,7 +893,9 @@ def _build_preload_edges_cpu(memory_system, n_memories, verbose=True, chunk_toke
             for local_i, i in enumerate(range(batch_start, batch_end)):
                 # Find high-similarity nodes (>threshold, excluding self)
                 node_similarities = similarity[local_i]
-                high_sim_mask = (node_similarities > similarity_threshold) & (torch.arange(n_memories) != i)
+                # Move arange to same device as node_similarities
+                self_mask = torch.arange(n_memories, device=node_similarities.device) != i
+                high_sim_mask = (node_similarities > similarity_threshold) & self_mask
                 high_sim_indices = high_sim_mask.nonzero(as_tuple=True)[0]
                 
                 if len(high_sim_indices) > 0:
@@ -856,6 +951,7 @@ def should_preload_memories(model, min_memories=50):
     memory_system = model.reflex.memory_retrieval
     
     if hasattr(memory_system, 'longterm'):
+        # Use .size property (works for both bundled and non-bundled)
         current_size = memory_system.longterm.size.item()
         return current_size < min_memories
     

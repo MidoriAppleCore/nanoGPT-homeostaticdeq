@@ -17,6 +17,7 @@ from collections import defaultdict
 import threading
 from queue import Queue
 import warnings
+import psutil  # For memory monitoring
 
 # Silence C++ stack trace warnings from gradient checkpointing
 os.environ['TORCH_DISABLE_ADDR2LINE'] = '1'
@@ -336,8 +337,10 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # --copy-clean-from=<path>: Copy from clean/reference memory (e.g., preloaded cache)
 # --create-clean-to=<path>: After preload, save a clean copy to this path (for reuse)
 # --visualizations-off: Disable all matplotlib visualizations (prevents thread-safety crashes)
+# --profile: Enable detailed performance profiling (find bottlenecks!)
 clean_memory = '--clean-memory' in sys.argv
 visualizations_disabled = '--visualizations-off' in sys.argv
+enable_profiling = '--profile' in sys.argv
 memory_path_override = None
 copy_clean_from = None
 create_clean_to = None
@@ -349,8 +352,30 @@ for arg in sys.argv:
     elif arg.startswith('--create-clean-to='):
         create_clean_to = arg.split('=', 1)[1]
 
-# Initialize profiler (after config loaded)
-profiler = TrainingProfiler(enabled=globals().get('enable_profiling', True))
+# Initialize profiler (after flags parsed)
+if enable_profiling:
+    from profiler import Profiler
+    profiler = Profiler(enabled=True, cuda_sync=True)
+    print("🔬 PROFILING ENABLED - Performance analysis active!")
+else:
+    # Use existing lightweight profiler
+    profiler = TrainingProfiler(enabled=True)
+
+# Memory safety check
+MAX_RAM_GB = 20.0  # Allow large caches for hyperbolic prefetching
+def check_memory_safety():
+    """Kill process if RAM usage exceeds limit (prevents runaway leaks)"""
+    process = psutil.Process()
+    ram_gb = process.memory_info().rss / (1024**3)
+    if ram_gb > MAX_RAM_GB:
+        print(f"\n{'='*80}")
+        print(f"💀 MEMORY SAFETY KILL - RAM usage: {ram_gb:.2f}GB > {MAX_RAM_GB}GB")
+        print(f"This protects against memory leaks, not intentional cache usage.")
+        print(f"If you need more cache, increase MAX_RAM_GB in train_hdeq.py")
+        print(f"{'='*80}")
+        import sys
+        sys.exit(1)
+    return ram_gb
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -1513,6 +1538,12 @@ if master_process and not os.path.exists(metrics_csv):
 prev_metrics = {'num_iters': 0, 'final_residual': 0.0}
 
 while True:
+    # 💀 MEMORY SAFETY: Check RAM usage every iteration
+    if master_process:
+        ram_gb = check_memory_safety()
+        # Print warning at 15GB (intentional large caches are OK, leaks are not)
+        if ram_gb > 15.0 and iter_num % 10 == 0:
+            print(f"⚠️  RAM usage: {ram_gb:.2f}GB (limit: {MAX_RAM_GB}GB) - large caches active")
 
     # determine and set the learning rate for this iteration
     # 🚀 FERRARI MODE: Keep LR high, use Thermostat Loss instead of throttling
@@ -2080,9 +2111,38 @@ while True:
         X, Y = get_batch('train')
         profiler.stop('data_prefetch')
         
+        # 🔮 MEMORY PREFETCH: Hint which bundles will be needed for next iteration
+        # This loads bundles into cache during backward pass (parallel I/O!)
+        if iter_num > 0 and use_memory_manifold and hasattr(raw_model.reflex, 'memory_retrieval'):
+            try:
+                # Quick approximate query using next batch token embeddings (no DEQ needed!)
+                with torch.no_grad():
+                    approx_query = raw_model.encoder.wte(X).mean(dim=[0, 1])  # [D] - cheap!
+                
+                # Get likely memory indices for next forward pass
+                likely_indices = raw_model.reflex.memory_retrieval.approx_knn_indices(
+                    approx_query, k=20, tier_name='longterm'
+                )
+                
+                # Hint to prefetch (non-blocking - just queues for background loading)
+                if likely_indices:
+                    raw_model.reflex.memory_retrieval.longterm.hint_prefetch(likely_indices)
+            except Exception as e:
+                # Prefetch is best-effort - don't break training if it fails
+                pass
+        
         # Backward pass
         profiler.start('backward')
         scaler.scale(loss).backward()
+        
+        # 🔮 PROCESS PREFETCH HINTS: Load bundles while gradients are fresh
+        # This happens during backward - bundles load in parallel with gradient computation
+        if iter_num > 0 and use_memory_manifold and hasattr(raw_model.reflex, 'memory_retrieval'):
+            try:
+                raw_model.reflex.memory_retrieval.process_prefetch_hints()
+            except Exception as e:
+                pass
+        
         profiler.stop('backward')
     
     # Gradient clipping
@@ -2406,10 +2466,22 @@ while True:
         if 'grad_norm' in metrics:
             grad_norm_str = f", ∇={metrics['grad_norm']:.2e}"
         
-        # Log line with NOVELTY/EXPLORATION DRIVE (ℂ), chaos breakdown, Bayesian balancer, reflex gate, and memory state
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {time_ms:.2f}ms, mfu {running_mfu*100:.2f}%, deq_iters={deq_iters}, lr={lr:.2e}, chaos={chaos_score:.3f}{chaos_breakdown}, res={raw_residual:.2e}, ℂ={novelty_drive:.3e}, {gate_phase}{memory_stats_str}{loss_breakdown_str}{grad_norm_str}")
+        # 🚀 Get edge subsampling stats for clean reporting
+        from graph_memory_system import get_edge_subsample_stats
+        edge_stats = get_edge_subsample_stats()
+        edge_stats_str = ""
+        if edge_stats['calls_count'] > 0:
+            edge_stats_str = f", edge_sub={edge_stats['calls_count']}calls({edge_stats['reduction_pct']:.0f}%↓)"
         
-        # 🛣️ HIGHWAY REPORT: Every 100 iters, show detailed Hebbian learning stats
+        # Log line with NOVELTY/EXPLORATION DRIVE (ℂ), chaos breakdown, Bayesian balancer, reflex gate, and memory state
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {time_ms:.2f}ms, mfu {running_mfu*100:.2f}%, deq_iters={deq_iters}, lr={lr:.2e}, chaos={chaos_score:.3f}{chaos_breakdown}, res={raw_residual:.2e}, ℂ={novelty_drive:.3e}, {gate_phase}{memory_stats_str}{loss_breakdown_str}{grad_norm_str}{edge_stats_str}")
+        
+        # � MICRO-PROFILING: Print memory operation stats every iteration
+        from graph_memory_system import print_profile_stats, reset_profile_stats
+        print_profile_stats()
+        reset_profile_stats()
+        
+        # �🛣️ HIGHWAY REPORT: Every 100 iters, show detailed Hebbian learning stats
         if iter_num % 100 == 0 and iter_num > 0 and master_process and use_memory_manifold:
             if hasattr(raw_model.reflex, 'get_memory_stats'):
                 mem_stats = raw_model.reflex.get_memory_stats()
@@ -2533,6 +2605,19 @@ while True:
     # termination conditions
     if iter_num > max_iters:
         break
+    
+    # 🔬 PROFILING: Print stats every 100 iterations to reduce spam
+    if enable_profiling and iter_num > 0 and iter_num % 100 == 0 and master_process:
+        print(f"\n📊 PROFILING (iter {iter_num}):")
+        profiler.print_stats(top_n=5, min_percent=1.0)  # Top 5, >1% only
+
+# 🔬 PROFILING: Final stats at end of training
+if enable_profiling and master_process:
+    print("\n" + "="*80)
+    print("🏁 FINAL PROFILING RESULTS")
+    print("="*80)
+    profiler.print_stats(top_n=30, min_percent=0.1)
+    profiler.save_to_csv(os.path.join(out_dir, 'profiling_stats.csv'))
 
 if ddp:
     destroy_process_group()

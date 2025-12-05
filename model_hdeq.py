@@ -752,7 +752,11 @@ class ReflexModule(nn.Module):
                 highway_learning_rate = getattr(config, 'highway_learning_rate', 0.3)
                 
                 # 🌀 NEW: Full hyperbolic GNN vs hybrid
+                # 🌀 NEW: Full hyperbolic GNN vs hybrid
                 use_full_hyperbolic_gnn = getattr(config, 'use_full_hyperbolic_gnn', False)
+                
+                # 🚀 NEW: Routing lookahead depth (scales with model intelligence)
+                routing_max_hops = getattr(config, 'routing_max_hops', 2)  # 2=TinyStories, 4=GPT-3, 6=GPT-4
                 
                 self.memory_retrieval = GraphMemorySystem(
                     memory_dim=memory_dim,
@@ -768,7 +772,8 @@ class ReflexModule(nn.Module):
                     n_head=n_head,
                     enable_gnn=enable_gnn,
                     highway_learning_rate=highway_learning_rate,
-                    use_full_hyperbolic_gnn=use_full_hyperbolic_gnn
+                    use_full_hyperbolic_gnn=use_full_hyperbolic_gnn,
+                    routing_max_hops=routing_max_hops  # 🚀 NEW!
                 )
                 
                 print(f"[Reflex] Graph-structured memory enabled")
@@ -1580,6 +1585,10 @@ class DEQOperator(nn.Module):
         print(f"  - Self-Attention + Cross-Attention (Decoder architecture!)")
         print(f"  - SwiGLU activation (GPT-4 architecture)")
         print(f"  - RoPE position encoding (better extrapolation)")
+        print(f"  - 🚀 SPECULATIVE SKIP: Highway detection for fast inference!")
+        
+        # Speculative skip state (populated during forward, read by inference)
+        self.last_skip_candidates = None
         
         # Spectral normalization for stability (CRITICAL for DEQ convergence)
         # Must enforce Lipschitz constant K < 1 for Banach Fixed Point Theorem
@@ -1744,6 +1753,98 @@ class DEQOperator(nn.Module):
             # Memory importance: combine edge types with proximity
             # [B, T, M, k, 8] × [8] → [B, T, M, k]
             edge_importance = (edge_types * type_weights.view(1, 1, 1, 1, -1)).sum(dim=-1)
+            
+            # 🛣️ ROUTING INTELLIGENCE: Incorporate multi-hop statistics + token previews
+            if 'hop_0_stats' in memory_bundle:
+                try:
+                    hop_0 = memory_bundle['hop_0_stats']  # [B, T, k_longterm, 3] (traversal, success, token)
+                    hop_1 = memory_bundle['hop_1_stats']  # [B, T, k_longterm, max_edges, 3]
+                    hop_2 = memory_bundle['hop_2_stats']  # [B, T, k_longterm, max_edges, max_edges, 3]
+                    
+                    # Note: routing stats are for longterm tier only (k_longterm memories)
+                    # Combined bundle has M = k_working + k_buffer + k_longterm memories
+                    # So routing applies to last k_longterm memories
+                    k_longterm = hop_0.shape[2]
+                    
+                    if k_longterm <= M:
+                        # Extract routing features for longterm memories:
+                        # - hop_0: current edge stats (traversal, success, token_id)
+                        # - hop_1_avg: average 1-hop lookahead
+                        # - hop_2_avg: average 2-hop lookahead
+                        hop_1_avg = hop_1.mean(dim=3)  # [B, T, k_longterm, 3]
+                        hop_2_avg = hop_2.view(B, T, k_longterm, -1, 3).mean(dim=3)  # [B, T, k_longterm, 3]
+                        
+                        # Routing confidence based on success rates and traversal counts
+                        # High success + high traversal = highway (bonus)
+                        # Low success = avoid
+                        # Rare path with high success = exploration opportunity
+                        success_scores = hop_0[:, :, :, 1] + hop_1_avg[:, :, :, 1] + hop_2_avg[:, :, :, 1]  # [B, T, k_longterm]
+                        traversal_scores = torch.log1p(hop_0[:, :, :, 0] + hop_1_avg[:, :, :, 0] + hop_2_avg[:, :, :, 0])  # [B, T, k_longterm]
+                        
+                        # Combine: success_rate * log(traversal_count + 1)
+                        # This gives bonus to highways but doesn't ignore rare paths
+                        routing_confidence = success_scores * (0.1 + 0.2 * traversal_scores)  # [B, T, k_longterm]
+                        
+                        # 🚀 SPECULATIVE SKIP DETECTION: Highway with high confidence → skip ahead!
+                        # Find best memory for each token position
+                        best_mem_idx = routing_confidence.argmax(dim=-1)  # [B, T]
+                        
+                        # Extract routing stats for best memory at each position
+                        # We'll store skip candidates for inference engine
+                        skip_candidates = []
+                        for b in range(B):
+                            for t in range(T):
+                                mem_idx = best_mem_idx[b, t].item()
+                                
+                                # Get 2-hop path statistics for this best memory
+                                h0_success = hop_0[b, t, mem_idx, 1].item()  # Current edge success
+                                h1_success = hop_1_avg[b, t, mem_idx, 1].item()  # 1-hop avg success
+                                h2_success = hop_2_avg[b, t, mem_idx, 1].item()  # 2-hop avg success
+                                
+                                h0_traversal = hop_0[b, t, mem_idx, 0].item()
+                                h1_traversal = hop_1_avg[b, t, mem_idx, 0].item()
+                                h2_traversal = hop_2_avg[b, t, mem_idx, 0].item()
+                                
+                                # Get token IDs for lookahead path
+                                h0_token = hop_0[b, t, mem_idx, 2].item()  # Current destination
+                                h1_token = hop_1_avg[b, t, mem_idx, 2].item()  # 1-hop destination
+                                h2_token = hop_2_avg[b, t, mem_idx, 2].item()  # 2-hop destination
+                                
+                                # SKIP CRITERIA: Highway with high confidence
+                                # - Both hops have high success rate (>85%)
+                                # - Both hops are well-traveled (>50 traversals)
+                                # - Tokens are valid (not padding -1)
+                                is_highway = (h1_success > 0.85 and h2_success > 0.85 and
+                                             h1_traversal > 50 and h2_traversal > 50 and
+                                             h1_token >= 0 and h2_token >= 0)
+                                
+                                if is_highway:
+                                    # Store skip candidate: (batch, time, skip_tokens, confidence)
+                                    confidence = (h1_success + h2_success) / 2.0
+                                    skip_candidates.append({
+                                        'batch': b,
+                                        'time': t,
+                                        'current_token': int(h0_token),
+                                        'skip_sequence': [int(h1_token), int(h2_token)],
+                                        'confidence': float(confidence),
+                                        'traversal_count': int(h1_traversal + h2_traversal)
+                                    })
+                        
+                        # Store skip candidates in module state for inference engine
+                        # (will be None during training, used during generation)
+                        if not self.training and len(skip_candidates) > 0:
+                            self.last_skip_candidates = skip_candidates
+                        else:
+                            self.last_skip_candidates = None
+                        
+                        # Apply routing confidence to longterm memory scores
+                        # Assume longterm memories are at the end of the M dimension
+                        memory_scores_longterm = memory_scores[:, :, -k_longterm:]  # [B, T, k_longterm]
+                        memory_scores_longterm = memory_scores_longterm + 0.5 * routing_confidence  # Boost highways
+                        memory_scores[:, :, -k_longterm:] = memory_scores_longterm
+                except Exception as e:
+                    # Gracefully degrade if routing processing fails
+                    pass
             
             # Distance similarity (closer = better)
             # Normalize edge weights per memory to prevent magnitude explosions from Hebbian highways
@@ -2215,12 +2316,21 @@ class DEQBrain(nn.Module):
         # DEQ RE-QUERYING: Iterative memory refinement during equilibrium search
         enable_requery = getattr(self.config, 'deq_requery_memory', False)
         requery_interval = getattr(self.config, 'deq_requery_interval', 4)  # Re-query every 4 iters
-        use_hierarchical = getattr(self.config, 'use_hierarchical_retrieval', True)  # Use hierarchical vs flat
+        use_hierarchical = getattr(self.config, 'use_hierarchical_retrieval', False)  # 🚀 DISABLED: B×T loop bottleneck
+        
+        # 🎯 ADAPTIVE RE-QUERYING: Only re-query when state changes significantly
+        # This saves I/O when DEQ is refining same concept vs exploring new regions
+        adaptive_requery = getattr(self.config, 'adaptive_requery', True)
+        requery_threshold = getattr(self.config, 'requery_threshold', 0.1)  # Norm delta to trigger re-query
+        
+        z_at_last_requery = None  # Track state at last re-query
+        requery_count = 0  # Count actual re-queries for diagnostics
         
         if verbose:
             print(f"[DEQ] Starting solve: max_iter={max_iter}, tol={tol:.1e}, adaptive_depth={adaptive_depth_enabled}")
             if enable_requery:
-                print(f"[DEQ] Re-querying enabled: interval={requery_interval}, hierarchical={use_hierarchical}")
+                mode = "adaptive" if adaptive_requery else f"fixed (every {requery_interval})"
+                print(f"[DEQ] Re-querying enabled: mode={mode}, hierarchical={use_hierarchical}")
         
         for i in range(max_iter):
             z_prev_iter = z
@@ -2244,33 +2354,109 @@ class DEQBrain(nn.Module):
             # ════════════════════════════════════════════════════════════════════
             
             if enable_requery and reflex_module is not None and i > 0 and i % requery_interval == 0:
-                # Use current equilibrium state z as refined query
-                with torch.no_grad():  # Don't backprop through re-querying (expensive)
-                    if use_hierarchical:
-                        # Use hierarchical retrieval (cluster → node)
-                        memory_result = reflex_module.memory_retrieval.retrieve_hierarchical(
-                            z, k=20, k_clusters=5
-                        )
+                # 🎯 ADAPTIVE RE-QUERYING: Check if state changed enough to warrant new retrieval
+                should_requery = True
+                
+                if adaptive_requery and z_at_last_requery is not None:
+                    # Measure semantic drift: how much has z changed since last re-query?
+                    state_delta = (z - z_at_last_requery).norm(dim=-1).mean().item()  # Average norm across batch/time
+                    
+                    if state_delta < requery_threshold:
+                        # State hasn't changed much → still exploring same semantic region
+                        # Skip re-query, reuse existing bundle (save I/O!)
+                        should_requery = False
+                        
+                        if verbose and i % (requery_interval * 3) == 0:  # Print occasionally
+                            print(f"[DEQ] iter {i}: Skipped re-query (Δ={state_delta:.3f} < {requery_threshold:.3f})")
                     else:
-                        # Use flat retrieval
-                        memory_result = reflex_module.memory_retrieval.retrieve(z, k=20)
-                    
-                    # Update memory bundle and forcing function
-                    memory_bundle = memory_result['bundle']
-                    new_memory_context = memory_result['enhanced_context']
-                    
-                    # Blend new memory with original reflex forcing
-                    # Use learned blending weight α ∈ [0, 1]
-                    # α=0: trust original reflex, α=1: trust new memory
-                    blend_alpha = 0.3  # Conservative: 30% new memory, 70% original
-                    u = (1 - blend_alpha) * u + blend_alpha * new_memory_context
-                    
-                    if verbose:
-                        print(f"[DEQ] iter {i}: Re-queried memory (α={blend_alpha:.2f})")
+                        # State evolved significantly → new semantic region, re-query!
+                        if verbose:
+                            print(f"[DEQ] iter {i}: Triggering re-query (Δ={state_delta:.3f} > {requery_threshold:.3f})")
+                
+                # Perform re-query if needed
+                if should_requery:
+                    # Use current equilibrium state z as refined query
+                    with torch.no_grad():  # Don't backprop through re-querying (expensive)
+                        if use_hierarchical:
+                            # Use hierarchical retrieval (cluster → node)
+                            memory_result = reflex_module.memory_retrieval.retrieve_hierarchical(
+                                z, k=20, k_clusters=5
+                            )
+                        else:
+                            # Use flat retrieval
+                            memory_result = reflex_module.memory_retrieval.retrieve(z, k=20)
+                        
+                        # Update memory bundle and forcing function
+                        memory_bundle = memory_result['bundle']
+                        new_memory_context = memory_result['enhanced_context']
+                        
+                        # Blend new memory with original reflex forcing
+                        # Use learned blending weight α ∈ [0, 1]
+                        # α=0: trust original reflex, α=1: trust new memory
+                        blend_alpha = 0.3  # Conservative: 30% new memory, 70% original
+                        u = (1 - blend_alpha) * u + blend_alpha * new_memory_context
+                        
+                        # Track state for next adaptive check
+                        z_at_last_requery = z.detach().clone()
+                        requery_count += 1
+                        
+                        if verbose:
+                            print(f"[DEQ] iter {i}: Re-queried memory #{requery_count} (α={blend_alpha:.2f})")
             
             # Compute semantic integration (now iteration-aware AND memory-navigating!)
             # The operator has built-in temporal encoding + memory graph structure
             delta_z = self.operator(z, u, mask, iteration=i, memory_bundle=memory_bundle)
+            
+            # 🔄 TRM-STYLE OUTPUT INJECTION: Decode answer and feed back as context
+            # ════════════════════════════════════════════════════════════════════
+            # Periodically project current state z to vocabulary (the "Answer"),
+            # embed it, and inject back as context for next iteration.
+            #
+            # This implements TRM's recursive self-refinement:
+            #   Standard DEQ: z_{k+1} = f(z_k, u)           (internal refinement)
+            #   TRM Logic:    z_{k+1} = f(z_k, u+y_k, mem)  (answer + memory refinement)
+            #                 where y_k = decode(z_k)
+            #
+            # The answer embedding is ADDED to the forcing function u (memory context),
+            # creating a combined context of: retrieved memories + current best guess.
+            #
+            # Benefits:
+            #   1. Explicit answer visible in token space (like chain-of-thought)
+            #   2. Model can "see" its current best guess and refine it
+            #   3. Bridges gap between implicit DEQ and explicit TRM reasoning
+            #   4. Answer + memory work together (not competing)
+            # ════════════════════════════════════════════════════════════════════
+            answer_injection_active = False
+            if self.config.output_injection and i > 0 and i % self.config.output_injection_interval == 0:
+                with torch.no_grad():  # Don't backprop through injection (expensive)
+                    # Project to output space
+                    z_for_decode = self.ln_f(z)
+                    if self.use_split_dims:
+                        z_for_decode = self.projector.project_down(z_for_decode)
+                    
+                    # Decode to vocabulary (get top-1 token per position)
+                    logits = self.lm_head(z_for_decode)  # [B, T, vocab_size]
+                    pred_tokens = logits.argmax(dim=-1)   # [B, T]
+                    
+                    # Re-embed predicted answer
+                    answer_emb = self.transformer.wte(pred_tokens)  # [B, T, n_embd]
+                    answer_emb = self.transformer.wpe(answer_emb)   # Add position encoding
+                    
+                    # Project back to DEQ space if using split dims
+                    if self.use_split_dims:
+                        answer_emb = self.projector.project_up(answer_emb)
+                    
+                    # 🔥 BLEND answer with forcing function (memory + answer context)
+                    # This makes u = memory_context + answer_context
+                    # The operator then computes f(z, memory+answer)
+                    alpha = self.config.output_injection_strength
+                    u = (1.0 - alpha) * u + alpha * answer_emb
+                    answer_injection_active = True
+                    
+                    if verbose:
+                        # Show first few tokens of predicted answer
+                        sample_tokens = pred_tokens[0, :min(5, pred_tokens.size(1))].tolist()
+                        print(f"[TRM] iter {i}: Injected answer {sample_tokens[:3]}... into forcing (α={alpha:.2f})")
             
             # SMART STABILIZER: per-dimension damping α ∈ [0.1, 0.9]
             # Now trajectory-aware if enabled
@@ -3136,6 +3322,28 @@ class GrayBoxConfig:
     learned_anderson: bool = True  # Learned Anderson mixing weights
     # These add ~10-15% overhead but can reduce iterations by 20-40%
     
+    # 🔄 TRM-STYLE OUTPUT REFINEMENT (Recursive Self-Refinement)
+    # TRM explicitly decodes answer and re-encodes it as context for next iteration
+    # This differs from pure DEQ (internal state refinement) by refining ANSWERS
+    output_injection: bool = False  # Enable TRM-style answer refinement
+    output_injection_interval: int = 4  # Decode→re-encode every N DEQ iterations
+    output_injection_strength: float = 0.3  # Blend ratio: 0=ignore answer, 1=replace state
+    # When enabled: z_{k+2} = f(z_{k+1}, u, decode(z_{k+1}))
+    # This creates explicit "chain of thought" visible in token space
+    
+    # 🎯 ADAPTIVE RE-QUERYING (Smart memory navigation!)
+    # Instead of fixed intervals, re-query only when DEQ state changes significantly
+    # Saves I/O when refining same concept, explores when entering new regions
+    deq_requery_memory: bool = False  # Enable iterative memory re-querying during DEQ solve
+    deq_requery_interval: int = 4  # Check for re-query every N iterations
+    adaptive_requery: bool = True  # Only re-query if state delta > threshold (smart!)
+    requery_threshold: float = 0.1  # Semantic drift threshold to trigger re-query
+    # How it works:
+    #   - Every 4 iters: measure ||z_current - z_last_requery||
+    #   - If > 0.1: State evolved → re-query with refined understanding
+    #   - If < 0.1: Still refining same concept → reuse bundle (fast!)
+    use_hierarchical_retrieval: bool = False  # Use cluster→node retrieval (slower but deeper)
+    
     # Multiscale solving (Renormalization Group Flow)
     multiscale: bool = False  # Enable hierarchical coarse-to-fine solving
     coarse_dim: int = 128  # Coarsest scale dimension
@@ -3440,15 +3648,18 @@ class GrayBoxDEQ(nn.Module):
             return logits, loss
     
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, effort=1.0):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, effort=1.0, visualize_navigation=False):
         """
         Generate tokens autoregressively.
         
         effort < 1.0: fast/shallow thinking
         effort = 1.0: normal
         effort > 1.0: slow/deep thinking
+        visualize_navigation: If True, return trajectory visualization data
         """
-        for _ in range(max_new_tokens):
+        trajectories = [] if visualize_navigation else None
+        
+        for step in range(max_new_tokens):
             # Crop context to block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             
@@ -3456,18 +3667,53 @@ class GrayBoxDEQ(nn.Module):
             logits, _ = self(idx_cond, effort=effort)
             logits = logits[:, -1, :] / temperature
             
-            # Top-k
+            # 🗺️ CAPTURE NAVIGATION TRAJECTORY
+            if visualize_navigation and hasattr(self, 'reflex') and hasattr(self.reflex, 'memory_retrieval'):
+                memory_sys = self.reflex.memory_retrieval
+                
+                # Get last retrieval paths (set during forward pass)
+                if hasattr(memory_sys, '_last_retrieval_paths') and memory_sys._last_retrieval_paths is not None:
+                    paths = memory_sys._last_retrieval_paths
+                    
+                    # Extract trajectory for this step
+                    step_trajectory = {
+                        'step': step,
+                        'context_tokens': idx_cond[0, -min(16, idx_cond.size(1)):].tolist(),  # Last 16 tokens
+                        'retrieved_indices': {
+                            'longterm': paths.get('longterm', [None])[0, -1, :5].tolist() if paths.get('longterm') is not None else [],  # Top-5 memories
+                            'buffer': paths.get('buffer', [None])[0, -1, :5].tolist() if paths.get('buffer') is not None else [],
+                            'working': paths.get('working', [None])[0, -1, :5].tolist() if paths.get('working') is not None else [],
+                        }
+                    }
+                    
+                    # Get probability distribution over next tokens
+                    # Top-k
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
             
             # Sample
             probs = F.softmax(logits, dim=-1)
+            
+            # 🎯 CAPTURE TOKEN PROBABILITIES
+            if visualize_navigation:
+                top_probs, top_indices = torch.topk(probs[0], min(10, probs.size(-1)))
+                step_trajectory['next_token_probs'] = {
+                    'indices': top_indices.tolist(),
+                    'probs': top_probs.tolist()
+                }
+            
             idx_next = torch.multinomial(probs, num_samples=1)
+            
+            if visualize_navigation:
+                step_trajectory['sampled_token'] = idx_next[0, 0].item()
+                trajectories.append(step_trajectory)
             
             # Append
             idx = torch.cat((idx, idx_next), dim=1)
         
+        if visualize_navigation:
+            return idx, trajectories
         return idx
     
     @torch.no_grad()

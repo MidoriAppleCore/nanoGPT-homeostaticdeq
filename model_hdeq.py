@@ -730,61 +730,58 @@ class ReflexModule(nn.Module):
         
         if self.use_memory:
             if self.memory_mode == 'hybrid':
-                # NEW: Graph-structured memory with GNN-based retrieval
+                # Graph-structured memory with GNN-based retrieval
                 from graph_memory_system import GraphMemorySystem
                 
                 memory_dim = config.memory_dim if config.memory_dim is not None else config.n_embd
                 k_neighbors = getattr(config, 'memory_k', 20)
                 
-                # Three-tier params
-                working_capacity = getattr(config, 'working_memory_capacity', 20)
-                buffer_capacity = getattr(config, 'consolidation_buffer_size', 100)
-                longterm_capacity = getattr(config, 'longterm_memory_capacity', 20000)
-                longterm_disk_path = getattr(config, 'longterm_disk_path', None)  # NEW: disk backing
-                longterm_max_disk_size = getattr(config, 'longterm_max_disk_size', 100000)  # Max disk memories
+                # 🌍 SINGLE-TIER UNIFIED MEMORY
+                # Total capacity (can grow to disk)
+                memory_capacity = getattr(config, 'longterm_memory_capacity', 200000)
+                disk_path = getattr(config, 'longterm_disk_path', None)
+                max_disk_size = getattr(config, 'longterm_max_disk_size', 200000)
                 
                 # GNN params
                 gnn_hidden_dim = getattr(config, 'gnn_hidden_dim', 512)
                 n_head = getattr(config, 'n_head', 8)
-                enable_gnn = getattr(config, 'enable_gnn', True)  # Can disable for VRAM constraints
+                enable_gnn = getattr(config, 'enable_gnn', True)
                 
-                # 🔥 NEW: Configurable highway learning rate
+                # Highway learning rate
                 highway_learning_rate = getattr(config, 'highway_learning_rate', 0.3)
                 
-                # 🌀 NEW: Full hyperbolic GNN vs hybrid
-                # 🌀 NEW: Full hyperbolic GNN vs hybrid
+                # Full hyperbolic GNN vs hybrid
                 use_full_hyperbolic_gnn = getattr(config, 'use_full_hyperbolic_gnn', False)
                 
-                # 🚀 NEW: Routing lookahead depth (scales with model intelligence)
+                # Routing lookahead depth (scales with model intelligence)
                 routing_max_hops = getattr(config, 'routing_max_hops', 2)  # 2=TinyStories, 4=GPT-3, 6=GPT-4
                 
                 self.memory_retrieval = GraphMemorySystem(
                     memory_dim=memory_dim,
                     query_dim=config.n_embd,
                     context_dim=config.n_embd,
-                    working_capacity=working_capacity,
-                    buffer_capacity=buffer_capacity,
-                    longterm_capacity=longterm_capacity,
-                    longterm_disk_path=longterm_disk_path,  # Pass disk path!
-                    longterm_max_disk_size=longterm_max_disk_size,  # Max disk size!
+                    memory_capacity=memory_capacity,
+                    disk_path=disk_path,
+                    max_disk_size=max_disk_size,
                     k_neighbors=k_neighbors,
                     gnn_hidden_dim=gnn_hidden_dim,
                     n_head=n_head,
                     enable_gnn=enable_gnn,
                     highway_learning_rate=highway_learning_rate,
                     use_full_hyperbolic_gnn=use_full_hyperbolic_gnn,
-                    routing_max_hops=routing_max_hops  # 🚀 NEW!
+                    routing_max_hops=routing_max_hops
                 )
                 
-                print(f"[Reflex] Graph-structured memory enabled")
-                print(f"  Working:   {working_capacity} on GPU")
-                print(f"  Buffer:    {buffer_capacity} on GPU")
-                if longterm_disk_path:
-                    print(f"  Long-term: {longterm_capacity} hot in CPU + disk backing at {longterm_disk_path}")
+                print(f"[Reflex] Graph-structured memory enabled (SINGLE-TIER)")
+                print(f"  Total capacity: {memory_capacity:,} nodes")
+                print(f"  RAM cache: Auto-calculated (~5GB budget)")
+                if disk_path:
+                    print(f"  Disk backing: {disk_path} (max {max_disk_size:,})")
                 else:
-                    print(f"  Long-term: {longterm_capacity} on CPU")
+                    print(f"  Disk backing: Disabled (RAM only)")
                 print(f"  k_neighbors: {k_neighbors}, GNN hidden: {gnn_hidden_dim}")
-                print(f"  🛣️ Highway learning rate: {highway_learning_rate}")  # Show new param!
+                print(f"  🛣️ Highway learning rate: {highway_learning_rate}")
+                print(f"  🚀 Routing lookahead: {routing_max_hops}-hop")
                 
             elif self.memory_mode == 'hyperbolic':
                 from hyperbolic_memory import HyperbolicMemoryRetrieval
@@ -989,12 +986,8 @@ class ReflexModule(nn.Module):
         if not self.use_memory or self.memory_retrieval is None:
             return
         
-        # Hybrid two-tier system: Apply dopamine to both tiers
-        if self.memory_mode == 'hybrid' and hasattr(self.memory_retrieval, 'apply_dopamine'):
-            self.memory_retrieval.apply_dopamine(loss)
-        # Legacy hyperbolic memory
-        elif self.memory_mode == 'hyperbolic' and hasattr(self.memory_retrieval, 'apply_dopamine_modulation'):
-            pass  # Dopamine applied via gradient modulation
+        # REMOVED: apply_dopamine() - reward tracking no longer needed with single-tier architecture
+        # Quality tracked via edge_success_rate and edge_traversal_count from actual graph usage
     
     def memory_step(self):
         """
@@ -1004,8 +997,8 @@ class ReflexModule(nn.Module):
         if not self.use_memory or self.memory_retrieval is None:
             return
         
-        if self.memory_mode == 'hybrid' and hasattr(self.memory_retrieval, 'step'):
-            self.memory_retrieval.step()
+        # REMOVED: step() - no aging/access tracking needed with disk-backed cache
+
     
     def get_memory_stats(self):
         """Get memory system statistics for logging"""

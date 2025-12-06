@@ -18,11 +18,17 @@ import sys
 from ast import literal_eval
 
 for arg in sys.argv[1:]:
-    # Skip special flags that are handled elsewhere (--clean-memory, --memory-path=..., --copy-clean-from=..., --create-clean-to=..., --visualizations-off)
+    # Skip special flags that are handled elsewhere (--clean-memory, --memory-path=..., --copy-clean-from=..., --create-clean-to=..., --visualizations-off, --profile, --show-brain, --brain-always)
     if arg == '--clean-memory':
         continue  # Handled in train_hdeq.py
     if arg == '--visualizations-off':
         continue  # Handled in train_hdeq.py
+    if arg == '--profile':
+        continue  # Handled in train_hdeq.py
+    if arg == '--show-brain':
+        continue  # Handled in graph_memory_system.py - shows DEQ debug view (sparse)
+    if arg == '--brain-always':
+        continue  # Handled in graph_memory_system.py - shows every DEQ iteration (verbose)
     if arg.startswith('--memory-path='):
         continue  # Handled in train_hdeq.py
     if arg.startswith('--copy-clean-from='):

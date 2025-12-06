@@ -828,7 +828,7 @@ if init_from == 'resume' and use_memory_manifold and hasattr(model.reflex, 'load
 if use_memory_manifold and init_from == 'scratch':
     # Check if we should preload (memory empty or nearly empty)
     needs_preload = should_preload_memories(model, min_memories=50)
-    current_mem_size = model.reflex.memory_retrieval.longterm.size.item() if hasattr(model.reflex, 'memory_retrieval') else 0
+    current_mem_size = model.reflex.memory_retrieval.memory.size.item() if hasattr(model.reflex, 'memory_retrieval') else 0
     print(f"\n🔍 Preload check: current_size={current_mem_size}, needs_preload={needs_preload}")
     
     # Note: cluster_ids, depths, type_embeddings are now DiskBackedTensor
@@ -838,12 +838,12 @@ if use_memory_manifold and init_from == 'scratch':
     # When loading from golden checkpoint, DiskBackedTensors auto-restore their size,
     # but regular buffers (rewards/age/access) stay at size 0 since they don't persist
     if current_mem_size > 0 and hasattr(model.reflex, 'memory_retrieval'):
-        longterm = model.reflex.memory_retrieval.longterm
-        if hasattr(longterm, 'rewards') and longterm.rewards.size(0) == 0:
+        memory_tier = model.reflex.memory_retrieval.memory
+        if hasattr(memory_tier, 'rewards') and memory_tier.rewards.size(0) == 0:
             # Initialize to zeros matching the loaded memory size
-            longterm.rewards = torch.zeros(current_mem_size, device=longterm.device)
-            longterm.age = torch.zeros(current_mem_size, device=longterm.device)
-            longterm.access = torch.zeros(current_mem_size, device=longterm.device)
+            memory_tier.rewards = torch.zeros(current_mem_size, device=memory_tier.device)
+            memory_tier.age = torch.zeros(current_mem_size, device=memory_tier.device)
+            memory_tier.access = torch.zeros(current_mem_size, device=memory_tier.device)
             if master_process:
                 print(f"✅ Resized RAM buffers (rewards/age/access) to {current_mem_size} to match loaded memories")
     
@@ -879,8 +879,8 @@ if use_memory_manifold and init_from == 'scratch':
                 
                 # CRITICAL: Flush all disk-backed tensors to ensure ALL data is on disk
                 print("💾 Flushing all memory tensors to disk before snapshot...")
-                if hasattr(model.reflex, 'memory_retrieval') and hasattr(model.reflex.memory_retrieval, 'longterm'):
-                    longterm = model.reflex.memory_retrieval.longterm
+                if hasattr(model.reflex, 'memory_retrieval') and hasattr(model.reflex.memory_retrieval, 'memory'):
+                    memory_tier = model.reflex.memory_retrieval.memory
                     # Flush ALL disk-backed tensors (graph structure + metadata)
                     tensor_names = [
                         'embeddings', 'adjacency', 'edge_weights', 'edge_types',
@@ -888,8 +888,8 @@ if use_memory_manifold and init_from == 'scratch':
                         'cluster_ids', 'depths', 'type_embeddings'  # Metadata now disk-backed too!
                     ]
                     for tensor_name in tensor_names:
-                        if hasattr(longterm, tensor_name):
-                            tensor = getattr(longterm, tensor_name)
+                        if hasattr(memory_tier, tensor_name):
+                            tensor = getattr(memory_tier, tensor_name)
                             if isinstance(tensor, DiskBackedTensor):
                                 tensor.flush()
                                 print(f"   ✓ Flushed {tensor_name}")
@@ -1891,9 +1891,9 @@ while True:
                         
                         # Check if we have enough memories to do supervised navigation
                         has_enough_memories = False
-                        if hasattr(raw_model.reflex.memory_retrieval, 'longterm'):
-                            lt_mem = raw_model.reflex.memory_retrieval.longterm
-                            has_enough_memories = lt_mem.size.item() >= 50  # Need at least 50 memories
+                        if hasattr(raw_model.reflex.memory_retrieval, 'memory'):
+                            mem_tier = raw_model.reflex.memory_retrieval.memory
+                            has_enough_memories = mem_tier.size.item() >= 50  # Need at least 50 memories
                         
                         # Decay teacher forcing over time (1.0 → 0.0)
                         teacher_weight = max(0.0, 1.0 - iter_num / supervised_iters)
@@ -1916,11 +1916,11 @@ while True:
                                             target_emb = raw_model.transformer.wte(target_tokens).mean(dim=0)  # [n_embd]
                                             
                                             # Find "oracle" memories nearest to ground truth
-                                            if hasattr(raw_model.reflex.memory_retrieval, 'longterm'):
-                                                lt_mem = raw_model.reflex.memory_retrieval.longterm
-                                                if lt_mem.size.item() > 5:
+                                            if hasattr(raw_model.reflex.memory_retrieval, 'memory'):
+                                                mem_tier = raw_model.reflex.memory_retrieval.memory
+                                                if mem_tier.size.item() > 5:
                                                     # Compute distances to all long-term memories
-                                                    mem_embs = lt_mem.embeddings[:lt_mem.size.item()]  # [N, n_embd]
+                                                    mem_embs = mem_tier.embeddings[:mem_tier.size.item()]  # [N, n_embd]
                                                     distances = torch.cdist(
                                                         target_emb.unsqueeze(0), 
                                                         mem_embs
@@ -2026,8 +2026,8 @@ while True:
             
             # Apply Homeostatic Balancer
             # This automatically weights each loss by 1/σ² where σ is learned
-            # 🔥 TEMPORARILY DISABLED: Use only prediction loss to debug base learning
-            USE_BALANCER = False  # Set to True to re-enable homeostatic balancing
+            # 🔥 ALWAYS ENABLED: Core part of differentiable cybernetics architecture
+            USE_BALANCER = True  # Learnable loss weights are critical for auto PDE control
             
             if USE_BALANCER:
                 balanced_loss, balance_stats = balancer(loss_components)
@@ -2082,16 +2082,71 @@ while True:
                 sigma_memory = balance_stats.get('sigma_memory', 1.0)
                 raw_model.reflex.memory_retrieval.update_balancer_feedback(sigma_memory)
                 
-                # DOPAMINE SIGNAL: Apply reward based on prediction loss
-                # Lower loss → higher reward → strengthen recent memory
-                prediction_loss = loss_components['prediction'].item()
-                raw_model.reflex.memory_retrieval.apply_dopamine(prediction_loss)
+                # REMOVED: apply_dopamine() - reward tracking no longer needed
+                # Quality is now tracked via edge_success_rate and edge_traversal_count
                 
                 # 🛣️ HIGHWAY STRENGTHENING: Reinforce retrieval paths based on ACTUAL PER-TOKEN loss
                 # This creates "highways" through the memory graph - fast paths to useful knowledge!
                 # Only strengthen paths that lead to GOOD predictions (token-level precision!)
                 if 'loss_per_token' in metrics and metrics['loss_per_token'] is not None:
                     raw_model.reflex.memory_retrieval.strengthen_last_retrieval(metrics['loss_per_token'])
+                
+                # 🧠 ONLINE MEMORY FORMATION: Store surprising or successful patterns
+                # This enables continual learning across datasets!
+                # Surprise (high loss) → "I don't know this, remember it!"
+                # Success (low loss) → "This works well, consolidate it!"
+                if iter_num % 10 == 0 and 'loss_per_token' in metrics and metrics['loss_per_token'] is not None:
+                    # Get the reflex state from the model's last forward pass
+                    # The reflex output is the final layer norm output before logits
+                    if hasattr(raw_model.reflex, 'ln_f'):
+                        # During training, we need to do a quick forward to get reflex states
+                        # Or we can use the logits and back-project (expensive)
+                        # For now, let's just store based on loss without explicit reflex embedding
+                        # TODO: Add reflex_state to metrics for efficient access
+                        
+                        per_token_loss = metrics['loss_per_token']  # [B, T]
+                        
+                        # Thresholds (configurable)
+                        surprise_threshold = 3.0  # Store if loss > 3.0 (very surprised)
+                        success_threshold = 0.3   # Store if loss < 0.3 (very successful)
+                        
+                        B, T = per_token_loss.shape
+                        stored_count = 0
+                        
+                        # Sample a few positions to avoid overhead
+                        # Store at most 5 memories per iteration
+                        max_stores_per_iter = 5
+                        
+                        for b in range(B):
+                            if stored_count >= max_stores_per_iter:
+                                break
+                            for t in range(T):
+                                if stored_count >= max_stores_per_iter:
+                                    break
+                                    
+                                loss_val = per_token_loss[b, t].item()
+                                
+                                # Store if surprising OR successful
+                                if loss_val > surprise_threshold or loss_val < success_threshold:
+                                    # Use the token embedding as a proxy for reflex state
+                                    # This is not perfect but allows memory formation without extra forward pass
+                                    token_id = X[b, t].item()
+                                    token_emb = raw_model.encoder.wte.weight[token_id].detach()
+                                    
+                                    # Convert loss to reward: lower loss → higher reward
+                                    reward = 1.0 / (1.0 + loss_val * 0.5)
+                                    reward = max(0.1, min(2.0, reward))  # Clamp to [0.1, 2.0]
+                                    
+                                    raw_model.reflex.memory_retrieval.store_memory_dynamic(
+                                        token_emb,
+                                        reward=reward
+                                    )
+                                    stored_count += 1
+                        
+                        # Log occasionally
+                        if stored_count > 0 and iter_num % 100 == 0:
+                            mem_size = raw_model.reflex.memory_retrieval.memory.size.item()
+                            print(f"[Memory Formation] Stored {stored_count} new memories (total: {mem_size})")
             
             # Scale for gradient accumulation
             loss = balanced_loss / gradient_accumulation_steps
@@ -2121,12 +2176,12 @@ while True:
                 
                 # Get likely memory indices for next forward pass
                 likely_indices = raw_model.reflex.memory_retrieval.approx_knn_indices(
-                    approx_query, k=20, tier_name='longterm'
+                    approx_query, k=20
                 )
                 
                 # Hint to prefetch (non-blocking - just queues for background loading)
                 if likely_indices:
-                    raw_model.reflex.memory_retrieval.longterm.hint_prefetch(likely_indices)
+                    raw_model.reflex.memory_retrieval.memory.hint_prefetch(likely_indices)
             except Exception as e:
                 # Prefetch is best-effort - don't break training if it fails
                 pass
@@ -2233,15 +2288,10 @@ while True:
             balancer.log_vars.data.clamp_(-3.0, 3.0)
     
     # ══════════════════════════════════════════════════════════════
-    # MEMORY SYSTEM UPDATE (dopamine + aging/decay)
+    # MEMORY SYSTEM UPDATE (removed - no longer needed)
     # ══════════════════════════════════════════════════════════════
-    profiler.start('memory_update')
-    if use_memory_manifold and hasattr(raw_model.reflex, 'apply_dopamine_signal'):
-        raw_model.reflex.apply_dopamine_signal(loss)
-    
-    if use_memory_manifold and hasattr(raw_model.reflex, 'memory_step'):
-        raw_model.reflex.memory_step()
-    profiler.stop('memory_update')
+    # REMOVED: apply_dopamine_signal(), memory_step()
+    # Quality tracking now happens via edge_success_rate and edge_traversal_count
 
     # timing and logging
     profiler.stop_iter()
@@ -2444,13 +2494,13 @@ while True:
         # Reflex integration status (always full now)
         gate_phase = "β=1.0 [REFLEX+MEMORY ACTIVE]"
         
-        # MEMORY STATS: Show three-tier memory state
+        # MEMORY STATS: Show single-tier memory state
         memory_stats_str = ""
         if use_memory_manifold and hasattr(raw_model.reflex, 'get_memory_stats'):
             mem_stats = raw_model.reflex.get_memory_stats()
             if mem_stats:
-                # Basic tier stats
-                memory_stats_str = f", mem=[W:{mem_stats.get('num_working', 0)}/B:{mem_stats.get('num_buffer', 0)}/LT:{mem_stats.get('num_longterm', 0)}]"
+                # Single-tier architecture: just show total size
+                memory_stats_str = f", mem={mem_stats.get('num_memory', 0)}"
                 # Add highway stats if available (compact format)
                 if mem_stats.get('highways_formed', 0) > 0:
                     memory_stats_str += f", 🛣️{mem_stats['highways_formed']}"
@@ -2496,8 +2546,8 @@ while True:
                     print(f"   Avg strengthening: {mem_stats.get('avg_highway_strength', 0):.4f}")
                     
                     # Get top-5 highways if available
-                    if hasattr(raw_model.reflex.memory_retrieval, 'longterm'):
-                        highway_details = raw_model.reflex.memory_retrieval.longterm.get_highway_stats(top_k=5)
+                    if hasattr(raw_model.reflex.memory_retrieval, 'memory'):
+                        highway_details = raw_model.reflex.memory_retrieval.memory.get_highway_stats(top_k=5)
                         if highway_details.get('top_highways'):
                             print(f"   Top 5 highways:")
                             for i, hw in enumerate(highway_details['top_highways'][:5], 1):
@@ -2508,11 +2558,11 @@ while True:
                                       f"success={hw.get('success_rate', 0):.2f})")
                 else:
                     print(f"   ℹ️  No highways formed yet (highway_log empty)")
-                    print(f"   Longterm size: {mem_stats.get('num_longterm', 0)} memories")
+                    print(f"   Memory size: {mem_stats.get('num_memory', 0)} memories")
                     # Debug: Check if strengthen_edge is even being called
-                    if hasattr(raw_model.reflex.memory_retrieval, 'longterm'):
-                        lt = raw_model.reflex.memory_retrieval.longterm
-                        print(f"   Highway log size: {len(lt.highway_log) if hasattr(lt, 'highway_log') else 'N/A'}")
+                    if hasattr(raw_model.reflex.memory_retrieval, 'memory'):
+                        mem_tier = raw_model.reflex.memory_retrieval.memory
+                        print(f"   Highway log size: {len(mem_tier.highway_log) if hasattr(mem_tier, 'highway_log') else 'N/A'}")
                 print()
         
         # Save profiling stats to CSV (silent mode - no console spam)

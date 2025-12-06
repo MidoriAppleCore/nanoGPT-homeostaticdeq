@@ -41,7 +41,9 @@ plt.ioff()  # Turn off interactive mode
 # an active exception". All plt.* calls must be protected by BackgroundWorker._matplotlib_lock
 
 # Import from model_graybox instead of model
-from model_hdeq import GPTConfig, GPT, compute_pauli_exclusion_loss, HamiltonianOperator, DEQOperator, HomeostaticBalancer
+from model_hdeq import GPTConfig, GPT, compute_pauli_exclusion_loss, HamiltonianOperator, DEQOperator, HomeostaticBalancer, set_memory_debug as set_model_memory_debug
+from graph_memory_system import set_memory_debug as set_graph_memory_debug
+
 
 # Memory navigation rewards (dopamine for graph exploration)
 from memory_navigation_rewards import MemoryNavigationRewards, MemoryPathReinforcement
@@ -74,6 +76,14 @@ import sys
 if '--visualizations-off' in sys.argv:
     VISUALIZATION_AVAILABLE = False
     print("🚫 Visualizations disabled via --visualizations-off flag")
+
+# Check for --memory-debug flag (enables verbose workspace/gradient logging)
+MEMORY_DEBUG = '--memory-debug' in sys.argv
+if MEMORY_DEBUG:
+    print("🔍 Memory debug mode enabled - verbose workspace/gradient diagnostics will be shown")
+    # Enable debug logging in both model and graph memory modules
+    set_model_memory_debug(True)
+    set_graph_memory_debug(True)
 
 # -----------------------------------------------------------------------------
 # Background Task Worker
@@ -522,7 +532,10 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
                   tunnel_threshold=tunnel_threshold,
                   num_tunnel_rays=num_tunnel_rays,
                   temperature_schedule=temperature_schedule,
-                  T_init=T_init, T_final=T_final)
+                  T_init=T_init, T_final=T_final,
+                  use_moe=use_moe if 'use_moe' in locals() else False,
+                  num_experts=num_experts if 'num_experts' in locals() else 8,
+                  experts_per_token=experts_per_token if 'experts_per_token' in locals() else 2)
 
 # Memory Manifold Integration (Semantic Knowledge Substrate)
 if use_memory_manifold:
@@ -1019,10 +1032,9 @@ def generate_samples_with_visualization(iter_num):
     print("SAMPLE GENERATIONS")
     print("="*70)
     
-    # Sample 1: Question prompt
+    # Sample 1: TinyStories-style prompt
     if os.path.exists(meta_path):
-        # "Why did Napoleon invade Spain?"
-        prompt = "Why did Napoleon invade Spain?"
+        prompt = "Once upon a time, there was a"
         start_ids = encode(prompt)
     else:
         start_ids = [0]
@@ -1051,15 +1063,15 @@ def generate_samples_with_visualization(iter_num):
         
         raw_model.reflex.forward = capturing_reflex_forward
     
-    # Generate with activation capture
-    y = model.generate(x, max_new_tokens=50, temperature=0.8, top_k=200, effort=1.0)
+    # Generate with activation capture (higher temp for char-level!)
+    y = model.generate(x, max_new_tokens=50, temperature=1.2, top_k=40, effort=1.0)
     generated_tokens = y[0].tolist()
     
     # Restore original reflex forward
     if hasattr(raw_model, 'reflex'):
         raw_model.reflex.forward = original_reflex_forward
     
-    print("\n[Question prompt]")
+    print("\n[TinyStories prompt: 'Once upon a time, there was a']")
     output = decode(generated_tokens)
     print(output[:200] if len(output) > 200 else output)
     
@@ -1233,17 +1245,16 @@ def generate_samples():
     
     # Generate sample
     if os.path.exists(meta_path):
-        # "Why did Napoleon invade Spain?"
-        prompt = "Why did Napoleon invade Spain?"
+        prompt = "Once upon a time, there was a"
         start_ids = encode(prompt)
     else:
         start_ids = [0]
     
     x = torch.tensor([start_ids], dtype=torch.long, device=device)
     
-    # Generate with model (minimal tokens for speed - just verify it works)
+    # Generate with model (higher temp for char-level!)
     with torch.no_grad():
-        y = model.generate(x, max_new_tokens=10, temperature=0.8, top_k=200, effort=1.0)
+        y = model.generate(x, max_new_tokens=10, temperature=1.2, top_k=40, effort=1.0)
     
     output = decode(y[0].tolist())
     
@@ -1620,15 +1631,27 @@ while True:
     
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
-        # DISABLED: Validation runs are expensive (100 forward passes every 100 iters)
-        # Use diagnostic reports + sample generation instead for faster iteration
-        # losses = estimate_loss()
-        # print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        # Validation runs to check for overfitting
+        losses = estimate_loss()
         
-        # Log to monitor (using current training loss instead)
+        # Calculate train/val gap for overfitting detection
+        gap = losses['val'] - losses['train']
+        gap_pct = (gap / losses['train']) * 100 if losses['train'] > 0 else 0
+        
+        # Overfitting indicator
+        overfit_indicator = ""
+        if gap_pct > 20:
+            overfit_indicator = " ⚠️ OVERFITTING!"
+        elif gap_pct > 10:
+            overfit_indicator = " ⚠️"
+        elif gap_pct < 5:
+            overfit_indicator = " ✅"
+        
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f} (gap: {gap:+.4f}, {gap_pct:+.1f}%){overfit_indicator}")
+        
+        # Log to monitor
         if monitor:
-            # monitor.log_loss(iter_num, losses['train'], losses['val'])
-            pass  # Skip validation loss logging
+            monitor.log_loss(iter_num, losses['train'], losses['val'])
         
         # Generate samples to see model progress (skip at iter 0 to speed startup)
         if iter_num > 0:
@@ -1740,8 +1763,36 @@ while True:
             # HOMEOSTATIC REFLEX GATING: Compute β(t) gate coefficient
             reflex_gate = get_reflex_gate(iter_num)
             
-            # Pass gate to model forward (forces cortical development before spinal automation)
-            logits, loss_raw, metrics = model(X, Y, return_metrics=True, training_iter=iter_num, reflex_gate=reflex_gate)
+            # ═══════════════════════════════════════════════════════════════
+            # MoE ROUTING: Extract balancer weights for expert selection
+            # ═══════════════════════════════════════════════════════════════
+            # Compute current weights from log_vars (precision = exp(-log_var))
+            balancer_weights = None
+            if balancer is not None:
+                # Extract current weights (precision = 1/σ²) from balancer state
+                with torch.no_grad():
+                    precisions = torch.exp(-balancer.log_vars)
+                    
+                    # Apply floors/ceilings like in balancer.forward()
+                    # Index mapping: [prediction=0, jacobian=1, novelty=2, memory=3, navigation=4]
+                    w_pred = max(precisions[0].item(), 1.2)  # Floor
+                    w_jaco = min(precisions[1].item(), 0.7)  # Ceiling
+                    w_nove = precisions[2].item()
+                    w_memo = precisions[3].item()
+                    w_nav = precisions[4].item()
+                    
+                    balancer_weights = {
+                        'w_pred': w_pred,
+                        'w_jaco': w_jaco,
+                        'w_nove': w_nove,
+                        'w_memo': w_memo,
+                        'w_nav': w_nav
+                    }
+            
+            # Pass gate + balancer weights to model forward
+            # (forces cortical development before spinal automation + enables MoE routing)
+            logits, loss_raw, metrics = model(X, Y, return_metrics=True, training_iter=iter_num, 
+                                             reflex_gate=reflex_gate, balancer_weights=balancer_weights)
             
             # Track gate value for monitoring
             metrics['reflex_gate'] = reflex_gate
@@ -2218,6 +2269,19 @@ while True:
         metrics['grad_norm'] = grad_norm
     profiler.stop('grad_clip')
     
+    # 🧠 WORKSPACE UPDATE: Apply gradients to workspace context AFTER all gradient accumulation
+    # This must happen AFTER backward() and gradient clipping, but BEFORE optimizer.step()
+    # Gradients have accumulated across all micro-steps, now we apply them once
+    workspace_stats = None
+    if use_memory_manifold and hasattr(raw_model.reflex, 'memory_retrieval'):
+        if hasattr(raw_model, 'last_z_star') and raw_model.last_z_star is not None:
+            # Get current learning rate for workspace updates
+            current_lr = optimizer.param_groups[0]['lr'] if optimizer else 0.001
+            workspace_stats = raw_model.reflex.memory_retrieval.update_workspace_context(
+                raw_model.last_z_star,
+                optimizer_lr=current_lr
+            )
+    
     # 🔬 BALANCER PARAMETER TRACKING (Every 10 iters - lightweight check)
     # Show actual log_vars values to see if they're moving from 0.0
     if iter_num % 10 == 0 and iter_num > 0 and master_process:
@@ -2523,8 +2587,16 @@ while True:
         if edge_stats['calls_count'] > 0:
             edge_stats_str = f", edge_sub={edge_stats['calls_count']}calls({edge_stats['reduction_pct']:.0f}%↓)"
         
-        # Log line with NOVELTY/EXPLORATION DRIVE (ℂ), chaos breakdown, Bayesian balancer, reflex gate, and memory state
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {time_ms:.2f}ms, mfu {running_mfu*100:.2f}%, deq_iters={deq_iters}, lr={lr:.2e}, chaos={chaos_score:.3f}{chaos_breakdown}, res={raw_residual:.2e}, ℂ={novelty_drive:.3e}, {gate_phase}{memory_stats_str}{loss_breakdown_str}{grad_norm_str}{edge_stats_str}")
+        # 📝 WORKSPACE LEARNING STATS (no loops - direct from stats dict)
+        workspace_stats_str = ""
+        if workspace_stats and workspace_stats['updates_applied'] > 0:
+            ws_updates = workspace_stats['updates_applied']
+            ws_grad = workspace_stats['avg_grad_magnitude']
+            ws_step = workspace_stats['avg_step_magnitude']  # How much we changed the leafs
+            workspace_stats_str = f", ws={ws_updates}upd(∇={ws_grad:.1e},Δ={ws_step:.1e})"
+        
+        # Log line with NOVELTY/EXPLORATION DRIVE (ℂ), chaos breakdown, Bayesian balancer, reflex gate, memory state, and workspace learning
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {time_ms:.2f}ms, mfu {running_mfu*100:.2f}%, deq_iters={deq_iters}, lr={lr:.2e}, chaos={chaos_score:.3f}{chaos_breakdown}, res={raw_residual:.2e}, ℂ={novelty_drive:.3e}, {gate_phase}{memory_stats_str}{loss_breakdown_str}{grad_norm_str}{workspace_stats_str}{edge_stats_str}")
         
         # � MICRO-PROFILING: Print memory operation stats every iteration
         from graph_memory_system import print_profile_stats, reset_profile_stats

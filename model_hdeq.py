@@ -241,6 +241,15 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+# 🔍 MEMORY DEBUG FLAG - Controls verbose workspace/memory logging
+# Set to True via: --memory-debug CLI flag or config.memory_debug = True
+MEMORY_DEBUG = False  # Default: silent operation
+
+def set_memory_debug(enabled: bool):
+    """Enable/disable memory debug logging globally"""
+    global MEMORY_DEBUG
+    MEMORY_DEBUG = enabled
+
 
 # -----------------------------------------------------------------------------
 # Homeostatic Uncertainty Balancer (Bayesian Multi-Objective Learning)
@@ -486,10 +495,15 @@ class AndersonAcceleration:
         Anderson acceleration is a CONTROL/FEEDBACK mechanism (cybernetics),
         not part of the differentiable dynamics. History tracking happens
         outside the gradient flow.
+        
+        🔥 CRITICAL FIX: Compute residual WITH GRADIENTS first, then detach for history.
+        This preserves gradient flow through the fixed-point iteration.
         """
+        # 1. Calculate residual WITH GRADIENTS (keeps graph alive!)
+        residual = f_new - x_new
+        
+        # 2. Store DETACHED copies for Anderson history (the math uses history)
         with torch.no_grad():
-            residual = f_new - x_new
-            
             self.X.append(x_new.detach())
             self.F.append(residual.detach())
             
@@ -500,6 +514,7 @@ class AndersonAcceleration:
         
         if len(self.X) == 1:
             # First iteration: damped fixed-point
+            # CRITICAL: Return x_new + beta * residual (where residual is ATTACHED to graph)
             return x_new + self.beta * residual
         
         # Stack history
@@ -866,10 +881,12 @@ class ReflexModule(nn.Module):
         
         print(f"  ✓ Loaded {len(embeddings)} memory vectors")
     
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, token_ids=None):
         """
         x: [B, T, C] context embeddings
-        Returns: [B, T, C] reflex + memory forcing
+        mask: [T, T] causal mask
+        token_ids: [B, T] token indices (for memory "road signs")
+        Returns: [B, T, C] reflex + memory forcing, memory_bundle dict
         """
         # 1. Standard Reflex Processing (Spinal Cord - Fast Local Syntax)
         # With progressive layer dropping during training
@@ -903,6 +920,12 @@ class ReflexModule(nn.Module):
                 # Extract enhanced context and structure bundle
                 reflex_out = memory_result['enhanced_context']  # [B, T, C]
                 memory_bundle = memory_result['bundle']  # {edge_types, depths, etc.}
+                
+                # 🚀 ADD TOKEN IDS AS "ROAD SIGNS" FOR MEMORY
+                # This allows workspace to learn token-specific patterns
+                # DEQ can cross-reference: "When I see token X, memory Y helps"
+                if token_ids is not None:
+                    memory_bundle['token_ids'] = token_ids  # [B, T] - the actual tokens
                 
                 # ═══════════════════════════════════════════════════════════════
                 # CRITICAL FIX: SELF-SUPERVISED CONTRASTIVE LOSS (InfoNCE)
@@ -1524,6 +1547,15 @@ class DEQOperator(nn.Module):
         print(f"[Input Injection] z₀ = injector(u) - DEQ starts FROM the prompt!")
         print(f"[Jagged Stabilizer] Anisotropic initialization - instant manifold formation")
         
+        # 🧠 WORKSPACE PROJECTION: Map 1024-dim scratchpad to hidden dim
+        # Workspace = 8 expert slots × 128 dim each = 1024 total
+        # This allows gradients to flow back to workspace during backprop!
+        self.workspace_proj = nn.Linear(1024, config.n_embd, bias=False)
+        # 🔥 FIX: Increase gain from 0.1 to 1.0 for stronger gradient signal
+        # The workspace needs sufficient influence for learning
+        nn.init.orthogonal_(self.workspace_proj.weight, gain=1.0)
+        print(f"[Workspace] Gradient-enabled scratchpad projection: 1024 → {config.n_embd}")
+        
         # GQA instead of standard MHA (3× faster, 90% quality)
         # 8 query heads, 2 KV heads = 4 groups
         num_kv_heads = max(1, config.n_head // 4)
@@ -1649,12 +1681,13 @@ class DEQOperator(nn.Module):
         
         module.register_forward_pre_hook(spectral_norm_hook)
     
-    def forward(self, z, u, mask=None, iteration=0, memory_bundle=None):
+    def forward(self, z, u, mask=None, iteration=0, memory_bundle=None, workspace_read=None):
         """
         z: [B, T, C] current equilibrium state
         u: [B, T, C] context (from encoder + reflex)
         iteration: int, current DEQ iteration (for temporal encoding)
         memory_bundle: dict with {edge_types, depths, embeddings, etc.} or None
+        workspace_read: [B, T, 128] scratchpad info from TrajectoryWorkspace or None
         
         Returns: Δz [B, T, C] semantic integration
         """
@@ -1670,6 +1703,55 @@ class DEQOperator(nn.Module):
         
         # Modulate state with temporal information
         z_temporal = z + 0.1 * iter_emb  # Small modulation to preserve stability
+        
+        # ═══════════════════════════════════════════════════════════════
+        # WORKSPACE: Inject scratchpad info if available
+        # ═══════════════════════════════════════════════════════════════
+        if workspace_read is not None:
+            # 🔍 DEBUG: Confirm workspace reaches operator (only if MEMORY_DEBUG)
+            if MEMORY_DEBUG:
+                if not hasattr(self, '_workspace_operator_count'):
+                    self._workspace_operator_count = 0
+                self._workspace_operator_count += 1
+                if self._workspace_operator_count <= 5:
+                    print(f"🎯 [DEQOperator] Workspace injection #{self._workspace_operator_count}: shape={workspace_read.shape}, magnitude={workspace_read.abs().mean().item():.6f}, requires_grad={workspace_read.requires_grad}")
+            
+            # workspace_read is [B, T, 1024] (8 slots × 128 dim flattened)
+            # Project to hidden dim and inject into computation graph
+            workspace_contrib = self.workspace_proj(workspace_read)  # [B, T, C]
+            
+            # 🔍 DEBUG: Check if workspace contribution is non-zero (only if MEMORY_DEBUG)
+            if MEMORY_DEBUG:
+                if not hasattr(self, '_workspace_contrib_check'):
+                    self._workspace_contrib_check = 0
+                    # Also check projection weight magnitude (diagnostic for gradient flow)
+                    proj_weight_mag = self.workspace_proj.weight.abs().mean().item()
+                    print(f"🔧 [workspace_proj] Weight magnitude: {proj_weight_mag:.6f} (should be ~0.3-1.0 for good gradient flow)")
+                
+                self._workspace_contrib_check += 1
+                if self._workspace_contrib_check <= 3:
+                    print(f"🔬 [workspace_contrib] magnitude={workspace_contrib.abs().mean().item():.8f}, requires_grad={workspace_contrib.requires_grad}, has_grad_fn={workspace_contrib.grad_fn is not None}")
+                    
+                    # 🔍 Add hook to workspace_contrib to trace gradient
+                    def contrib_grad_hook(grad):
+                        if grad is not None:
+                            print(f"📉 [CONTRIB GRAD] magnitude={grad.abs().mean().item():.9f}")
+                        else:
+                            print(f"📉 [CONTRIB GRAD] is None!")
+                        return grad
+                    workspace_contrib.register_hook(contrib_grad_hook)
+            
+            # With One-Step Rewind, workspace gradients flow through ONE layer (not 6)
+            # So we can use reasonable scale (1.0) instead of extreme compensation (10.0)
+            z_temporal = z_temporal + 1.0 * workspace_contrib  # Balanced injection
+        else:
+            # 🔍 DEBUG: Track if workspace is None (only if MEMORY_DEBUG)
+            if MEMORY_DEBUG:
+                if not hasattr(self, '_workspace_none_count'):
+                    self._workspace_none_count = 0
+                self._workspace_none_count += 1
+                if self._workspace_none_count <= 3:
+                    print(f"⚠️ [DEQOperator] Workspace is None (call #{self._workspace_none_count})")
         
         # Inject context into query
         z_ctx = z_temporal + u
@@ -1705,23 +1787,29 @@ class DEQOperator(nn.Module):
                 # S_t = Exp_{S_{t-1}}(α * Log_{S_{t-1}}(p_t))
                 # This is an exponentially-weighted moving average in hyperbolic space
                 
-                # CRITICAL: Use no_grad() to prevent path tracking from accumulating
-                # computation graphs across iterations. Path is for BIAS only.
-                with torch.no_grad():
-                    # Find tangent vector from path_summary toward current_node  
-                    tangent = self.manifold.logarithmic_map(
-                        self.path_summary, 
-                        current_node
-                    )  # [B, T, C]
-                    
-                    # Blend: move α% toward current node
-                    scaled_tangent = self.path_blend * tangent
-                    
-                    # Update path summary via exponential map
-                    self.path_summary = self.manifold.exponential_map(
-                        self.path_summary,
-                        scaled_tangent
-                    )
+                # CRITICAL: Check shape compatibility (generation may have different T)
+                if self.path_summary.shape[1] != current_node.shape[1]:
+                    # Shape mismatch (e.g., training T=128, generation T=30)
+                    # Reinitialize path_summary to match current sequence length
+                    self.path_summary = current_node.clone()
+                else:
+                    # CRITICAL: Use no_grad() to prevent path tracking from accumulating
+                    # computation graphs across iterations. Path is for BIAS only.
+                    with torch.no_grad():
+                        # Find tangent vector from path_summary toward current_node  
+                        tangent = self.manifold.logarithmic_map(
+                            self.path_summary, 
+                            current_node
+                        )  # [B, T, C]
+                        
+                        # Blend: move α% toward current node
+                        scaled_tangent = self.path_blend * tangent
+                        
+                        # Update path summary via exponential map
+                        self.path_summary = self.manifold.exponential_map(
+                            self.path_summary,
+                            scaled_tangent
+                        )
             
             # Use path history to bias current query
             # "Where we've been" influences "where we should look"
@@ -2079,6 +2167,468 @@ class PhysicalLaws:
         return adaptive_tol, adaptive_iters
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# MIXTURE OF EXPERTS (MoE) FOR DEQ
+# ══════════════════════════════════════════════════════════════════════════════
+# 
+# WHY MoE + DEQ IS POWERFUL:
+# 
+# 1. SPARSE ACTIVATION: 8 experts, activate only 2 per token
+#    → 8x model capacity, 2x compute cost
+# 
+# 2. EXPERT SPECIALIZATION:
+#    - Expert 0-1: Highway followers (high w_nav)
+#    - Expert 2-3: Novelty seekers (high w_nove)
+#    - Expert 4-5: Prediction specialists (high w_pred)
+#    - Expert 6-7: Memory consolidators (high w_memo)
+# 
+# 3. ITERATION-DEPENDENT ROUTING:
+#    - Early DEQ iters (0-2): Explorers (wide search)
+#    - Middle iters (3-4): Semantic navigators (refinement)
+#    - Late iters (5-6): Highway specialists (convergence)
+# 
+# 4. BALANCER INTEGRATION:
+#    - Router learns from balancer weights
+#    - Load balancing prevents expert collapse
+#    - Auxiliary losses encourage diversity
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TrajectoryWorkspace(nn.Module):
+    """
+    Learnable scratchpad memory that persists across entire trajectory.
+    
+    One workspace per batch, shared by all 8 experts. Experts can read/write
+    arbitrary continuous representations:
+    - Entity embeddings ("the girl", "Daddy")
+    - Scene composites ("kitchen with food")  
+    - Semantic fields ("food domain")
+    - Discourse state ("climax of story")
+    - Abstract learned features (whatever helps!)
+    
+    Model learns WHAT to store and WHEN to read via gradient descent.
+    No hand-coding - pure learned representations in continuous space.
+    
+    Memory: [batch, num_slots, workspace_dim]
+    Info density per slot: ~4000 bits (vs ~16 bits for token ID)
+    256x more information than discrete tokens!
+    """
+    def __init__(self, hidden_dim, workspace_dim=128, num_slots=8):
+        super().__init__()
+        self.workspace_dim = workspace_dim
+        self.num_slots = num_slots
+        
+        # Write components: WHAT to write, WHERE to write, WHEN to write
+        self.write_query = nn.Linear(hidden_dim, workspace_dim)
+        self.write_key = nn.Linear(workspace_dim, workspace_dim)
+        self.write_value = nn.Linear(hidden_dim, workspace_dim)
+        self.write_gate = nn.Linear(hidden_dim, workspace_dim)
+        
+        # Read components: WHAT to read from WHERE
+        self.read_query = nn.Linear(hidden_dim, workspace_dim)
+        self.read_key = nn.Linear(workspace_dim, workspace_dim)
+        
+        # Learnable initialization - model learns optimal starting state
+        self.init_memory = nn.Parameter(
+            torch.randn(1, num_slots, workspace_dim) * 0.01
+        )
+    
+    def forward(self, hidden_state, workspace_memory=None):
+        """
+        Args:
+            hidden_state: [B, T, hidden_dim]
+            workspace_memory: [B, num_slots, workspace_dim] or None
+        
+        Returns:
+            read_values: [B, T, workspace_dim]
+            updated_workspace: [B, num_slots, workspace_dim]
+        """
+        B, T, _ = hidden_state.shape
+        
+        # Initialize if first call (per-batch reset)
+        if workspace_memory is None:
+            workspace_memory = self.init_memory.expand(B, -1, -1).contiguous()
+        
+        # WRITE PHASE
+        W_query = self.write_query(hidden_state)
+        W_key = self.write_key(workspace_memory)
+        W_value = self.write_value(hidden_state)
+        W_gate = torch.sigmoid(self.write_gate(hidden_state))
+        
+        write_scores = torch.matmul(W_query, W_key.transpose(-2, -1))
+        write_weights = torch.softmax(write_scores / (self.workspace_dim ** 0.5), dim=-1)
+        
+        # Update sequentially across time
+        for t in range(T):
+            update = torch.matmul(
+                write_weights[:, t:t+1, :].transpose(-2, -1),
+                W_value[:, t:t+1, :]
+            )
+            gate = W_gate[:, t:t+1, :].mean(dim=1, keepdim=True)
+            workspace_memory = (1 - gate) * workspace_memory + gate * update
+        
+        # READ PHASE
+        R_query = self.read_query(hidden_state)
+        R_key = self.read_key(workspace_memory)
+        
+        read_scores = torch.matmul(R_query, R_key.transpose(-2, -1))
+        read_weights = torch.softmax(read_scores / (self.workspace_dim ** 0.5), dim=-1)
+        read_values = torch.matmul(read_weights, workspace_memory)
+        
+        return read_values, workspace_memory
+
+
+class ExpertRouter(nn.Module):
+    """
+    Routes tokens to experts based on:
+    1. Token embedding (semantic content)
+    2. DEQ iteration depth (early vs late thinking)
+    3. Memory bundle features (trajectory, success rates)
+    4. Balancer weights (optional, learnable blend)
+    
+    Uses Top-K gating with load balancing + entropy regularization.
+    """
+    def __init__(self, config, num_experts=8, experts_per_token=2):
+        super().__init__()
+        self.num_experts = num_experts
+        self.experts_per_token = experts_per_token
+        
+        # TWO-STREAM ROUTING: Token features + Balancer features
+        # Stream 1: Token + iteration (data-driven)
+        token_dim = config.n_embd + 1  # token + iter
+        self.token_router = nn.Sequential(
+            nn.Linear(token_dim, config.n_embd // 2),
+            nn.ReLU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.n_embd // 2, num_experts)
+        )
+        
+        # Stream 2: Balancer weights (homeostatic signal)
+        self.balancer_router = nn.Sequential(
+            nn.Linear(4, 32),  # 4 balancer weights → 32 hidden
+            nn.ReLU(),
+            nn.Linear(32, num_experts)
+        )
+        
+        # LEARNABLE BLEND: α ∈ [0, 1]
+        # α=0: ignore balancer, use token features only
+        # α=1: trust balancer completely
+        # α=0.5: balanced blend
+        self.blend_alpha = nn.Parameter(torch.tensor(0.3))  # Start at 30% balancer
+        
+        # Temperature for routing (learnable)
+        self.temperature = nn.Parameter(torch.ones(1))
+        
+        # Load balancing: track expert usage
+        self.register_buffer('expert_counts', torch.zeros(num_experts))
+        self.load_balance_loss_weight = 0.01
+        
+        # Entropy regularization weight (encourage diversity)
+        self.entropy_weight = 0.001
+        
+        print(f"[MoE Router] {num_experts} experts, top-{experts_per_token} routing")
+        print(f"  Stream 1: Token + iteration (data-driven)")
+        print(f"  Stream 2: Balancer weights (homeostatic)")
+        print(f"  Learnable blend α (starts at 0.3)")
+        print(f"  Load balancing: {self.load_balance_loss_weight}")
+        print(f"  Entropy regularization: {self.entropy_weight}")
+    
+    def forward(self, z, iteration, balancer_weights=None, training=True):
+        """
+        z: [B, T, C] token embeddings
+        iteration: int, DEQ iteration
+        balancer_weights: dict with {w_pred, w_nove, w_nav, w_memo} or None
+        
+        Returns:
+        - expert_ids: [B, T, K] indices of top-K experts
+        - expert_weights: [B, T, K] routing weights (sum to 1 per token)
+        - aux_losses: dict with load_balance_loss, entropy_loss
+        """
+        B, T, C = z.shape
+        
+        # === STREAM 1: TOKEN FEATURES (data-driven) ===
+        iter_feature = torch.full((B, T, 1), iteration / 30.0, device=z.device)
+        token_input = torch.cat([z, iter_feature], dim=-1)  # [B, T, C+1]
+        token_logits = self.token_router(token_input)  # [B, T, E]
+        
+        # === STREAM 2: BALANCER FEATURES (homeostatic) ===
+        if balancer_weights is not None:
+            balancer_features = torch.tensor([
+                balancer_weights.get('w_pred', 1.2),
+                balancer_weights.get('w_nove', 1.0),
+                balancer_weights.get('w_nav', 1.0),
+                balancer_weights.get('w_memo', 1.0)
+            ], device=z.device).view(1, 1, 4).expand(B, T, -1)
+            
+            balancer_logits = self.balancer_router(balancer_features)  # [B, T, E]
+            
+            # LEARNABLE BLEND: α ∈ [0, 1] via sigmoid
+            alpha = torch.sigmoid(self.blend_alpha)
+            logits = (1 - alpha) * token_logits + alpha * balancer_logits
+        else:
+            # No balancer → use token features only
+            logits = token_logits
+            alpha = 0.0
+        
+        # Temperature scaling
+        logits = logits / torch.clamp(self.temperature, min=0.1)
+        
+        # Top-K routing
+        top_k_logits, expert_ids = torch.topk(logits, self.experts_per_token, dim=-1)
+        # expert_ids: [B, T, K], top_k_logits: [B, T, K]
+        
+        # Softmax over top-K to get weights
+        expert_weights = F.softmax(top_k_logits, dim=-1)  # [B, T, K], sums to 1
+        
+        # === AUXILIARY LOSSES ===
+        aux_losses = {}
+        
+        if training:
+            # 1. LOAD BALANCING LOSS (encourage uniform expert usage)
+            expert_mask = F.one_hot(expert_ids, num_classes=self.num_experts).float()  # [B, T, K, E]
+            expert_usage = expert_mask.sum(dim=[0, 1, 2])  # [E]
+            
+            # Update running counts (exponential moving average)
+            with torch.no_grad():
+                self.expert_counts = 0.9 * self.expert_counts + 0.1 * expert_usage
+            
+            # Loss: encourage uniform distribution
+            target_count = (B * T * self.experts_per_token) / self.num_experts
+            load_balance_loss = ((expert_usage - target_count) ** 2).mean()
+            aux_losses['load_balance'] = self.load_balance_loss_weight * load_balance_loss
+            
+            # 2. ENTROPY REGULARIZATION (prevent collapse to single expert)
+            # Compute entropy of routing distribution (before top-k)
+            probs = F.softmax(logits, dim=-1)  # [B, T, E]
+            entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1).mean()  # Higher = more diverse
+            
+            # Encourage high entropy (diverse routing)
+            # Max entropy = log(num_experts), target at least 50% of max
+            target_entropy = 0.5 * torch.log(torch.tensor(self.num_experts, device=z.device))
+            entropy_loss = F.relu(target_entropy - entropy)  # Penalize if too low
+            aux_losses['entropy'] = self.entropy_weight * entropy_loss
+            
+            # Track metrics
+            aux_losses['router_alpha'] = alpha.item() if isinstance(alpha, torch.Tensor) else alpha
+            aux_losses['router_temp'] = self.temperature.item()
+            aux_losses['routing_entropy'] = entropy.item()
+        
+        return expert_ids, expert_weights, aux_losses
+
+
+class MoEDEQOperator(nn.Module):
+    """
+    Mixture of Experts DEQ Operator with Shared Trajectory Workspace.
+    
+    Maintains 8 expert operators + 1 shared scratchpad.
+    Router selects top-2 experts per token.
+    All experts read/write to same workspace for cross-expert communication.
+    
+    Architecture:
+    - 8 experts (8x capacity, sparse activation)
+    - 1 shared workspace (8 slots × 128 dim = continuous scratchpad)
+    - Expert specialization learned via balancer + routing
+    - Workspace learns to store entities, scenes, semantic fields, etc.
+    """
+    def __init__(self, config, num_experts=8, experts_per_token=2):
+        super().__init__()
+        self.config = config
+        self.num_experts = num_experts
+        self.experts_per_token = experts_per_token
+        
+        # Create 8 expert operators
+        self.experts = nn.ModuleList([
+            DEQOperator(config) for _ in range(num_experts)
+        ])
+        
+        # Router
+        self.router = ExpertRouter(config, num_experts, experts_per_token)
+        
+        # Expert usage statistics (for monitoring)
+        self.register_buffer('expert_usage_history', torch.zeros(num_experts))
+        
+        total_params = sum(p.numel() for expert in self.experts for p in expert.parameters())
+        active_params = total_params * (experts_per_token / num_experts)
+        
+        print(f"[MoE DEQ Operator]")
+        print(f"  Experts: {num_experts}")
+        print(f"  Active per token: {experts_per_token}")
+        print(f"  Total capacity: {total_params/1e6:.1f}M params")
+        print(f"  Active per forward: {active_params/1e6:.1f}M params")
+        print(f"  Capacity multiplier: {num_experts/experts_per_token:.1f}x")
+    
+    def forward(self, z, u, mask=None, iteration=0, memory_bundle=None, balancer_weights=None, training=True):
+        """
+        z: [B, T, C] current equilibrium state
+        u: [B, T, C] context
+        iteration: int, DEQ iteration
+        memory_bundle: dict with memory features (includes workspace_context if available)
+        balancer_weights: dict with {w_pred, w_nove, w_nav, w_memo}
+        
+        Returns: Δz [B, T, C]
+        """
+        B, T, C = z.shape
+        
+        # ═══════════════════════════════════════════════════════════════
+        # WORKSPACE: Extract and aggregate trajectory context from memories
+        # ═══════════════════════════════════════════════════════════════
+        workspace_read = None
+        if memory_bundle and 'workspace_context' in memory_bundle and memory_bundle['workspace_context'] is not None:
+            workspace_from_mem = memory_bundle['workspace_context']  # [B, T, M, 8, 128]
+            
+            # 🔍 DEBUG: Confirm workspace tensor identity and gradient tracking (only if MEMORY_DEBUG)
+            if MEMORY_DEBUG and not hasattr(self, '_workspace_read_count'):
+                self._workspace_read_count = 0
+            
+            if MEMORY_DEBUG:
+                self._workspace_read_count += 1
+                
+                # --- 🩺 GRAPH INTEGRITY CHECK #1: Input from dictionary ---
+                if self._workspace_read_count <= 3:  # First 3 calls only
+                    print(f"\n{'='*60}")
+                    print(f"🩺 GRAPH DOCTOR - MoELayer Call #{self._workspace_read_count}")
+                    print(f"{'='*60}")
+                    print(f"1️⃣  workspace_from_mem (BEFORE aggregation):")
+                    print(f"   ├─ Is Leaf? {workspace_from_mem.is_leaf}")
+                    print(f"   ├─ Requires Grad? {workspace_from_mem.requires_grad}")
+                    print(f"   ├─ Grad Fn? {workspace_from_mem.grad_fn}")
+                    print(f"   ├─ Tensor ID: {id(workspace_from_mem)}")
+                    print(f"   ├─ Shape: {workspace_from_mem.shape}")
+                    print(f"   └─ Magnitude: {workspace_from_mem.abs().mean().item():.6f}")
+                    if not workspace_from_mem.requires_grad:
+                        print(f"   🚨 PROBLEM: Input doesn't require grad!")
+                    elif workspace_from_mem.is_leaf and workspace_from_mem.grad_fn is None:
+                        print(f"   ✅ OK: Leaf tensor (like nn.Parameter)")
+                    elif workspace_from_mem.grad_fn is not None:
+                        print(f"   ✅ OK: Has grad_fn (intermediate tensor)")
+                    else:
+                        print(f"   ⚠️  SUSPICIOUS: requires_grad but no grad_fn and not leaf")
+            
+            # Aggregate across M retrieved memories (weighted by relevance)
+            # Use depths as attention: shallower memories (lower depth) have more influence
+            if 'depths' in memory_bundle:
+                depths = memory_bundle['depths']  # [B, T, M] - hyperbolic distance
+                # Convert distances to similarities (closer = higher weight)
+                similarities = torch.exp(-depths)  # Exponential decay with distance
+                sim_normalized = similarities / (similarities.sum(dim=-1, keepdim=True) + 1e-8)  # [B, T, M]
+                
+                # Weighted average of workspaces: [B, T, M, 8, 128] × [B, T, M, 1, 1] → [B, T, 8, 128]
+                workspace_read = (workspace_from_mem * sim_normalized.unsqueeze(-1).unsqueeze(-1)).sum(dim=2)
+            else:
+                # No weights available, use simple mean
+                workspace_read = workspace_from_mem.mean(dim=2)  # [B, T, 8, 128]
+            
+            # --- 🩺 GRAPH INTEGRITY CHECK #2: Output after aggregation ---
+            if MEMORY_DEBUG and self._workspace_read_count <= 3:
+                print(f"\n2️⃣  workspace_read (AFTER aggregation, BEFORE view):")
+                print(f"   ├─ Is Leaf? {workspace_read.is_leaf}")
+                print(f"   ├─ Requires Grad? {workspace_read.requires_grad}")
+                print(f"   ├─ Grad Fn? {workspace_read.grad_fn} ⬅️  CRITICAL!")
+                print(f"   ├─ Tensor ID: {id(workspace_read)}")
+                print(f"   ├─ Shape: {workspace_read.shape}")
+                print(f"   └─ Magnitude: {workspace_read.abs().mean().item():.6f}")
+                
+                if workspace_read.grad_fn is None and workspace_read.requires_grad:
+                    print(f"\n   🚨🚨🚨 GRAPH SEVERED! 🚨🚨🚨")
+                    print(f"   workspace_read requires grad but has NO grad_fn!")
+                    print(f"   The aggregation operation broke the computation graph!")
+                elif not workspace_read.requires_grad:
+                    print(f"\n   🚨🚨🚨 GRAPH DEAD! 🚨🚨🚨")
+                    print(f"   workspace_read does NOT require gradients!")
+                    print(f"   The aggregation lost the gradient flag!")
+                else:
+                    print(f"\n   ✅ GRAPH ALIVE: grad_fn present, chain intact")
+            
+            # Flatten workspace slots for expert input: [B, T, 8×128] = [B, T, 1024]
+            workspace_read = workspace_read.view(B, T, -1)  # [B, T, 1024]
+            
+            # --- 🩺 GRAPH INTEGRITY CHECK #3: Output after view ---
+            if MEMORY_DEBUG and self._workspace_read_count <= 3:
+                print(f"\n3️⃣  workspace_read (AFTER view/flatten):")
+                print(f"   ├─ Is Leaf? {workspace_read.is_leaf}")
+                print(f"   ├─ Requires Grad? {workspace_read.requires_grad}")
+                print(f"   ├─ Grad Fn? {workspace_read.grad_fn}")
+                print(f"   ├─ Tensor ID: {id(workspace_read)}")
+                print(f"   ├─ Shape: {workspace_read.shape}")
+                print(f"   └─ Magnitude: {workspace_read.abs().mean().item():.6f}")
+                
+                if workspace_read.grad_fn is None:
+                    print(f"\n   🚨 VIEW OPERATION BROKE GRAPH!")
+                else:
+                    print(f"\n   ✅ View preserved graph connection")
+                print(f"{'='*60}\n")
+        
+        # Route tokens to experts (with both token and balancer features)
+        expert_ids, expert_weights, aux_losses = self.router(
+            z, iteration, balancer_weights, training
+        )
+        # expert_ids: [B, T, K], expert_weights: [B, T, K]
+        
+        # Gather expert outputs
+        delta_z = torch.zeros_like(z)  # [B, T, C]
+        
+        # Process each expert
+        for k in range(self.experts_per_token):
+            # Get expert indices for this slot
+            expert_idx = expert_ids[:, :, k]  # [B, T]
+            weights = expert_weights[:, :, k].unsqueeze(-1)  # [B, T, 1]
+            
+            # For each unique expert, process tokens assigned to it
+            unique_experts = torch.unique(expert_idx)
+            for expert_id in unique_experts:
+                # Mask for tokens routed to this expert
+                mask_expert = (expert_idx == expert_id).unsqueeze(-1)  # [B, T, 1]
+                
+                # Get expert output (now experts see workspace!)
+                expert_output = self.experts[expert_id](
+                    z, u, mask=mask, iteration=iteration, 
+                    memory_bundle=memory_bundle,
+                    workspace_read=workspace_read  # NEW: pass scratchpad!
+                )  # [B, T, C]
+                
+                # Add weighted contribution
+                delta_z = delta_z + expert_output * weights * mask_expert.float()
+        
+        # Track expert usage (for monitoring)
+        if training:
+            with torch.no_grad():
+                expert_mask = F.one_hot(expert_ids, num_classes=self.num_experts).float()
+                usage = expert_mask.sum(dim=[0, 1, 2])  # [E]
+                self.expert_usage_history = 0.95 * self.expert_usage_history + 0.05 * usage
+        
+        # Store auxiliary losses for backprop (combine all losses)
+        self.aux_losses = aux_losses
+        # Safe summation - check if dict is non-empty and contains tensors
+        if aux_losses and len(aux_losses) > 0:
+            aux_values = list(aux_losses.values())
+            if aux_values and isinstance(aux_values[0], torch.Tensor):
+                total_aux = sum(aux_values)
+            else:
+                total_aux = 0.0
+        else:
+            total_aux = 0.0
+        self.load_balance_loss = total_aux  # For backward compatibility
+        
+        return delta_z
+    
+    def get_expert_stats(self):
+        """Return expert usage statistics for monitoring."""
+        stats = {
+            'expert_usage': self.expert_usage_history.cpu().tolist(),
+            'router_counts': self.router.expert_counts.cpu().tolist(),
+            'temperature': self.router.temperature.item(),
+            'blend_alpha': torch.sigmoid(self.router.blend_alpha).item(),  # Actual blend value
+        }
+        
+        # Add aux loss values if available
+        if hasattr(self, 'aux_losses'):
+            for key, val in self.aux_losses.items():
+                if isinstance(val, (int, float)):
+                    stats[key] = val
+        
+        return stats
+
+
 class DEQBrain(nn.Module):
     """
     Iterates the DEQ operator until equilibrium:
@@ -2127,15 +2677,34 @@ class DEQBrain(nn.Module):
             self.projector = None
             operator_config = config
         
-        # Choose operator: Hamiltonian (energy-conserving) or Standard (dissipative)
-        if config.hamiltonian:
-            self.operator = HamiltonianOperator(operator_config)
-            print("[Physics] Using HAMILTONIAN operator (symplectic, energy-conserving)")
-            print("          State = [position; momentum] in semantic phase space")
-            print("          Dynamics preserve phase volume → no vanishing gradients")
+        # 🚀 MoE SUPPORT: Choose operator type
+        self.use_moe = getattr(config, 'use_moe', False)
+        self.num_experts = getattr(config, 'num_experts', 8)
+        self.experts_per_token = getattr(config, 'experts_per_token', 2)
+        
+        if self.use_moe:
+            # Mixture of Experts DEQ Operator
+            if config.hamiltonian:
+                raise NotImplementedError("MoE + Hamiltonian not yet implemented")
+            else:
+                self.operator = MoEDEQOperator(
+                    operator_config, 
+                    num_experts=self.num_experts,
+                    experts_per_token=self.experts_per_token
+                )
+                print(f"[MoE] Using MIXTURE OF EXPERTS operator")
+                print(f"      {self.num_experts} experts, top-{self.experts_per_token} routing")
+                print(f"      {self.num_experts/self.experts_per_token:.1f}x capacity with sparse activation!")
         else:
-            self.operator = DEQOperator(operator_config)
-            print("[Physics] Using DISSIPATIVE operator (standard DEQ, fixed-point)")
+            # Standard single operator
+            if config.hamiltonian:
+                self.operator = HamiltonianOperator(operator_config)
+                print("[Physics] Using HAMILTONIAN operator (symplectic, energy-conserving)")
+                print("          State = [position; momentum] in semantic phase space")
+                print("          Dynamics preserve phase volume → no vanishing gradients")
+            else:
+                self.operator = DEQOperator(operator_config)
+                print("[Physics] Using DISSIPATIVE operator (standard DEQ, fixed-point)")
         
         self.stabilizer = Stabilizer(operator_config)  # Use DEQ dims for stabilizer
         
@@ -2154,6 +2723,23 @@ class DEQBrain(nn.Module):
             print("                 γ adapts to state complexity for optimal convergence")
         
         self.ln_f = nn.LayerNorm(operator_config.n_embd, bias=config.bias)  # DEQ dims
+        
+        # 🔥 DIRECT MEMORY BYPASS - Gradient Highway with Signal Normalization
+        # A direct path from Loss → Memory bypassing complex DEQ integration
+        # This allows memory to learn "relevance" even before DEQ learns to "integrate"
+        # 1024 = 8 slots × 128 dim (workspace dimensionality)
+        workspace_dim = 8 * 128
+        
+        # 🔥 CRITICAL: LayerNorm to prevent gradient underflow
+        # Scales input magnitude from ~0.002 → ~1.0, boosting gradients by ~500x
+        # Without this, gradients fall below float32 epsilon (1.19e-7) and vanish
+        self.bypass_norm = nn.LayerNorm(workspace_dim)
+        self.memory_bypass = nn.Linear(workspace_dim, operator_config.n_embd, bias=False)
+        nn.init.orthogonal_(self.memory_bypass.weight, gain=1.0)  # Strong initialization
+        print("[Memory Bypass] DIRECT gradient highway enabled")
+        print(f"               {workspace_dim}d workspace → {operator_config.n_embd}d output")
+        print("               🔥 LayerNorm: Prevents gradient underflow (scales ~500x)")
+        print("               Bypasses Stabilizer/MoE attenuation for clean gradient flow")
         
         # Physical laws
         self.laws = PhysicalLaws()
@@ -2218,7 +2804,7 @@ class DEQBrain(nn.Module):
             self.stabilizer_med = Stabilizer(med_config)
     
     def solve(self, u, mask=None, effort=1.0, verbose=False, memory_bundle=None, 
-              reflex_module=None, query_embeddings=None):
+              reflex_module=None, query_embeddings=None, balancer_weights=None):
         """
         Find equilibrium: z* such that z* = f(z*, u)
         
@@ -2227,9 +2813,10 @@ class DEQBrain(nn.Module):
                 ADAPTIVE DEPTH: effort is modulated by chaos score (fractal complexity)
                 High chaos → need more iters to navigate basin boundaries
         verbose: if True, print progress every 5 iterations
-        memory_bundle: initial memory structure from reflex
+        memory_bundle: initial memory structure from reflex (includes workspace_context)
         reflex_module: optional reflex module for DEQ re-querying
         query_embeddings: original token embeddings for re-querying
+        balancer_weights: dict with {w_pred, w_nove, w_nav, w_memo} for MoE routing
         
         Returns: (z*, num_iters, metrics) equilibrium state, iteration count, and diagnostic metrics
         """
@@ -2266,7 +2853,12 @@ class DEQBrain(nn.Module):
         # NEW: z = injector(u)  (learnable warm start with jagged anisotropy)
         # This prevents the DEQ from hallucinating context out of the void.
         # The operator.z_injector creates an initial manifold with diverse relaxation rates.
-        z = self.operator.z_injector(u) + self.operator.jagged_bias.view(1, 1, -1)
+        
+        # For MoE, use first expert's injector (they all have the same initialization)
+        if isinstance(self.operator, MoEDEQOperator):
+            z = self.operator.experts[0].z_injector(u) + self.operator.experts[0].jagged_bias.view(1, 1, -1)
+        else:
+            z = self.operator.z_injector(u) + self.operator.jagged_bias.view(1, 1, -1)
         z_prev = None
         
         # Anderson acceleration (with optional learned mixing)
@@ -2379,26 +2971,52 @@ class DEQBrain(nn.Module):
                             # Use flat retrieval
                             memory_result = reflex_module.memory_retrieval.retrieve(z, k=20)
                         
-                        # Update memory bundle and forcing function
+                        # Update memory bundle
                         memory_bundle = memory_result['bundle']
                         new_memory_context = memory_result['enhanced_context']
-                        
-                        # Blend new memory with original reflex forcing
-                        # Use learned blending weight α ∈ [0, 1]
-                        # α=0: trust original reflex, α=1: trust new memory
-                        blend_alpha = 0.3  # Conservative: 30% new memory, 70% original
-                        u = (1 - blend_alpha) * u + blend_alpha * new_memory_context
-                        
-                        # Track state for next adaptive check
-                        z_at_last_requery = z.detach().clone()
-                        requery_count += 1
-                        
-                        if verbose:
-                            print(f"[DEQ] iter {i}: Re-queried memory #{requery_count} (α={blend_alpha:.2f})")
+                    
+                    # 🔥 CRITICAL: Re-enable gradients for workspace OUTSIDE no_grad context!
+                    # Memory retrieval happened in no_grad(), but workspace learning needs gradients
+                    # Even if requires_grad=True, tensor created in no_grad() is not connected to graph!
+                    # Must ALWAYS detach and re-enable to create new leaf node in active graph
+                    if memory_bundle is not None and 'workspace_context' in memory_bundle:
+                        workspace = memory_bundle['workspace_context']
+                        if workspace is not None:
+                            # ALWAYS detach (cut no_grad history) and re-enable (join active graph)
+                            workspace = workspace.detach().requires_grad_(True)
+                            memory_bundle['workspace_context'] = workspace
+                            # Re-register hook on the new tensor! (only if MEMORY_DEBUG)
+                            if MEMORY_DEBUG and hasattr(reflex_module.memory_retrieval, '_workspace_grad_cache'):
+                                def requery_workspace_hook(grad):
+                                    """Capture gradients from re-queried workspace"""
+                                    if grad is not None:
+                                        print(f"🎯 [REQUERY HOOK FIRED!] Shape: {grad.shape}, magnitude: {grad.abs().mean().item():.6f}")
+                                    return grad
+                                workspace.register_hook(requery_workspace_hook)
+                    
+                    # Blend new memory with original reflex forcing
+                    # Use learned blending weight α ∈ [0, 1]
+                    # α=0: trust original reflex, α=1: trust new memory
+                    blend_alpha = 0.3  # Conservative: 30% new memory, 70% original
+                    u = (1 - blend_alpha) * u + blend_alpha * new_memory_context
+                    
+                    # Track state for next adaptive check
+                    z_at_last_requery = z.detach().clone()
+                    requery_count += 1
+                    
+                    if verbose:
+                        print(f"[DEQ] iter {i}: Re-queried memory #{requery_count} (α={blend_alpha:.2f})")
             
             # Compute semantic integration (now iteration-aware AND memory-navigating!)
             # The operator has built-in temporal encoding + memory graph structure
-            delta_z = self.operator(z, u, mask, iteration=i, memory_bundle=memory_bundle)
+            # For MoE: pass balancer_weights to router AND memory_bundle (includes workspace!)
+            if self.use_moe:
+                delta_z = self.operator(
+                    z, u, mask, iteration=i, memory_bundle=memory_bundle, 
+                    balancer_weights=balancer_weights, training=self.training
+                )
+            else:
+                delta_z = self.operator(z, u, mask, iteration=i, memory_bundle=memory_bundle)
             
             # 🔄 TRM-STYLE OUTPUT INJECTION: Decode answer and feed back as context
             # ════════════════════════════════════════════════════════════════════
@@ -2523,6 +3141,65 @@ class DEQBrain(nn.Module):
                             break
             
             z_prev = z
+        
+        # 🔥 ONE-STEP REWIND: Implicit Differentiation Approximation (Neumann-0)
+        # ═══════════════════════════════════════════════════════════════════════
+        # Problem: Naive BPTT through 6 DEQ iterations causes vanishing gradients
+        #          Contraction factor ~0.1 per iteration → grad *= 0.1^6 = 1e-6
+        # Solution: Detach converged z_star, then re-run ONE step with gradients
+        #          This creates direct path: Loss → z_final → operator(memory) → memory
+        #          Gradient multiplier is ~1.0 (one layer) instead of 0.1^6
+        # ═══════════════════════════════════════════════════════════════════════
+        with torch.no_grad():
+            z_star = z.detach().clone()  # Converged fixed point (no gradients)
+        
+        # Re-run operator ONE final time to attach gradients
+        # z_star is treated as constant, but u and memory_bundle carry gradients
+        if self.use_moe:
+            delta_z = self.operator(
+                z_star, u, mask, iteration=i, memory_bundle=memory_bundle,
+                balancer_weights=balancer_weights, training=self.training
+            )
+        else:
+            delta_z = self.operator(z_star, u, mask, iteration=i, memory_bundle=memory_bundle)
+        
+        # Simple stabilization: use last gamma value from loop
+        # Final update: mathematically ≈ z_star (converged), but with gradient path
+        z_final_with_grad = z_star + gamma * delta_z
+        
+        # Use this for output instead of z from loop
+        z = z_final_with_grad
+        
+        # ════════════════════════════════════════════════════════════════════
+        # 🔥 MEMORY BYPASS INJECTION - Direct Gradient Highway
+        # ════════════════════════════════════════════════════════════════════
+        # Inject memory signal AFTER DEQ convergence but BEFORE final projection
+        # This creates a clean gradient path: Loss → z_final → bypass → workspace
+        # Bypassing Stabilizer (α~0.01) and MoE aggregation (complex routing)
+        if memory_bundle is not None and 'workspace_context' in memory_bundle:
+            ws_ctx = memory_bundle['workspace_context']  # [B, T, M, 8, 128]
+            
+            # Simple mean aggregation over memories (M dimension)
+            # Avoid complex MoE logic to guarantee clean gradient flow
+            ws_aggregated = ws_ctx.mean(dim=2)  # [B, T, 8, 128]
+            
+            # Flatten slots: [B, T, 8, 128] → [B, T, 1024]
+            B, T = ws_aggregated.shape[:2]
+            ws_flat = ws_aggregated.reshape(B, T, -1)
+            
+            # 🔥 CRITICAL FIX: Normalize magnitude from ~0.002 → ~1.0
+            # This automatically scales gradients UP by factor of ~500x
+            # Without this, gradients fall below float32 epsilon and vanish
+            ws_norm = self.bypass_norm(ws_flat)  # [B, T, 1024] normalized
+            
+            # Project and inject as residual connection
+            memory_signal = self.memory_bypass(ws_norm)  # [B, T, C]
+            
+            if verbose and not hasattr(self, '_bypass_logged'):
+                print(f"🚀 BYPASS: Memory signal mag={memory_signal.abs().mean().item():.6f}")
+                self._bypass_logged = True
+            
+            z = z + memory_signal  # ResNet-style: Output = Thought + Memory
         
         # Capture complexity and dt metrics (for visualization)
         with torch.no_grad():
@@ -3075,7 +3752,7 @@ class DEQBrain(nn.Module):
         return z_final, i + 1, metrics
     
     def forward(self, u, mask=None, effort=1.0, verbose=False, memory_bundle=None,
-                reflex_module=None, query_embeddings=None):
+                reflex_module=None, query_embeddings=None, balancer_weights=None):
         """
         Dispatch to appropriate solver
         
@@ -3085,16 +3762,16 @@ class DEQBrain(nn.Module):
         3. Standard DEQ - reliable baseline
         
         Legacy solvers (quantum_paths, annealing) deprecated in favor of unified
+        
+        balancer_weights: dict with {w_pred, w_nove, w_nav, w_memo} for MoE routing
         """
         if self.config.quantum_solver:
             return self.solve_unified_quantum(u, mask, effort, verbose, memory_bundle=memory_bundle,
                                                reflex_module=reflex_module, query_embeddings=query_embeddings)
         elif self.config.multiscale:
-            return self.solve_multiscale(u, mask, effort, verbose, memory_bundle=memory_bundle,
-                                          reflex_module=reflex_module, query_embeddings=query_embeddings)
+            return self.solve_multiscale_rg(u, mask, effort, verbose, memory_bundle)
         else:
-            return self.solve(u, mask, effort, verbose, memory_bundle=memory_bundle,
-                              reflex_module=reflex_module, query_embeddings=query_embeddings)
+            return self.solve(u, mask, effort, verbose, memory_bundle, reflex_module, query_embeddings, balancer_weights)
 
 
 # -----------------------------------------------------------------------------
@@ -3403,6 +4080,16 @@ class GrayBoxConfig:
     highway_learning_rate: float = 0.3       # How fast highways strengthen (0.1=slow, 0.5=fast)
                                               # Working uses this directly
                                               # Buffer uses 0.7x, Longterm uses 0.2x
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # 🔥 MIXTURE OF EXPERTS (MoE) - CAPACITY BREAKTHROUGH
+    # ═══════════════════════════════════════════════════════════════════════
+    use_moe: bool = False                    # Enable MoE in DEQ operator
+    num_experts: int = 8                     # Total number of expert operators
+    experts_per_token: int = 2               # Active experts per token (sparse routing)
+    # When enabled: 8 expert DEQOperators with top-2 routing
+    # Gives 4x capacity with only 2x compute via sparse activation
+    # Router uses two-stream design: token features + balancer weights
     # ═══════════════════════════════════════════════════════════════════════
     
     def __post_init__(self):
@@ -3482,7 +4169,7 @@ class GrayBoxDEQ(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, idx, targets=None, effort=1.0, return_metrics=False, training_iter=None, reflex_gate=1.0):
+    def forward(self, idx, targets=None, effort=1.0, return_metrics=False, training_iter=None, reflex_gate=1.0, balancer_weights=None):
         """
         idx: [B, T] token indices
         targets: [B, T] target tokens (for training)
@@ -3516,7 +4203,8 @@ class GrayBoxDEQ(nn.Module):
         context = self.encoder(idx)  # [B, T, C]
         
         # 2. Reflex Module (spinal cord) with memory retrieval
-        reflex, memory_bundle = self.reflex(context, mask)  # [B, T, C], dict or None
+        # Pass token IDs for token-conditioned statistics ("road signs" in trajectory)
+        reflex, memory_bundle = self.reflex(context, mask, token_ids=idx)  # [B, T, C], dict or None
         
         # 3. HOMEOSTATIC REFLEX GATING (the KEY fix for lizard brain optimization)
         # Apply β(t) gate to reflex signal BEFORE entering DEQ brain
@@ -3525,11 +4213,17 @@ class GrayBoxDEQ(nn.Module):
         
         # 4. DEQ Brain (cortex) — find equilibrium WITH MEMORY NAVIGATION
         u = context + gated_reflex  # Combined context (with gated reflex)
+        
+        # Solve DEQ - memory_bundle will include workspace_context (added in next step)
         z_star, num_iters, deq_metrics = self.deq(
             u, mask, effort, memory_bundle=memory_bundle,
             reflex_module=self.reflex,  # Pass reflex for re-querying
-            query_embeddings=context     # Pass original embeddings for re-querying
+            query_embeddings=context,    # Pass original embeddings for re-querying
+            balancer_weights=balancer_weights  # Pass balancer weights for MoE routing
         )
+        
+        # Store z_star for workspace update in training loop
+        self.last_z_star = z_star if self.training else None
         
         # Expose metrics for tracking (e.g., in training loop)
         self.last_complexity = self.deq.last_complexity
@@ -3583,9 +4277,14 @@ class GrayBoxDEQ(nn.Module):
                     eps = 1e-3
                     z_pert = z_star + eps * torch.randn_like(z_star)
                     
-                    # Compute operator output at perturbed point (use final iteration)
-                    delta_pert = self.deq.operator(z_pert, u, mask, iteration=num_iters)
-                    delta_star = self.deq.operator(z_star.detach(), u, mask, iteration=num_iters)
+                    # 🔥 CRITICAL: Pass memory_bundle=None to Jacobian estimation!
+                    # We only want to measure the Jacobian of the core DEQ dynamics,
+                    # not the memory retrieval. Including memory would:
+                    # 1. Sever workspace gradients (z_star.detach() cuts the graph)
+                    # 2. Pollute Jacobian estimate with retrieval noise
+                    # The DEQ Jacobian is: ∂f/∂z where f(z) is the core operator
+                    delta_pert = self.deq.operator(z_pert, u, mask, iteration=num_iters, memory_bundle=None)
+                    delta_star = self.deq.operator(z_star.detach(), u, mask, iteration=num_iters, memory_bundle=None)
                     
                     # Approximate ||∂f/∂z||_F ≈ ||Δf||_F / ||Δz||_F
                     jacobian_norm = (delta_pert - delta_star).norm() / (eps + 1e-12)

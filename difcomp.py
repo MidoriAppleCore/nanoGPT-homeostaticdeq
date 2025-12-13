@@ -184,8 +184,22 @@ class DEQFixedPoint(autograd.Function):
         # Compute Jacobian-vector product (VJP): J^T @ grad_z_star
         JTv = autograd.grad(f_z, z_star, grad_z_star, retain_graph=True)[0]
         
-        # First-order Neumann approximation: v ≈ grad + J^T @ grad
-        v = grad_z_star + 0.7 * JTv  # 0.7 damping for safety (conservative)
+        # ADAPTIVE DAMPING: Safety valve against gradient explosion
+        # Neumann series converges iff spectral radius ρ(J) < 1
+        # During autonomous phase, local Jacobian can spike even if global spectral norm < 0.95
+        # If ||JTv|| >> ||grad||, the Jacobian is amplifying gradients → reduce damping
+        norm_grad = torch.norm(grad_z_star)
+        norm_JTv = torch.norm(JTv)
+        
+        if norm_JTv > 5.0 * norm_grad:
+            # Emergency brake: Trust identity gradient more than Jacobian
+            damping = 0.1
+        else:
+            # Standard damping: Conservative but efficient
+            damping = 0.7
+        
+        # First-order Neumann approximation: v ≈ grad + damping * J^T @ grad
+        v = grad_z_star + damping * JTv
             
         grads = autograd.grad(f_z, (h_ctx, f_emb, W, U, V, alpha), v, allow_unused=True)
         return (None, None, grads[0], grads[1], grads[2], grads[3], grads[4], grads[5], None, None)
@@ -1925,8 +1939,9 @@ class ManifoldSKI(nn.Module):
         # - effective_step (α*γ): contraction strength (local stability)
         # - delta_h: state change magnitude (convergence signal - CRITICAL!)
         # Output: Single scalar ∈ [0,1] representing "should reduce" confidence
+        # Expand policy input by 1 to include explicit reduction_momentum signal
         self.policy = nn.Sequential(
-            nn.Linear(hidden_dim + 2, 1),  # [hidden + effective_step + delta_h] → scalar
+            nn.Linear(hidden_dim + 3, 1),  # [hidden + effective_step + delta_h + momentum] → scalar
             nn.Sigmoid()  # Squash to [0, 1] probability
         )
         
@@ -2098,93 +2113,41 @@ class ManifoldSKI(nn.Module):
                     energy_history=None, complexity_history=None, action_history=None):
         """
         Encode fiber state with geometric coordinates for basin proximity.
-        
-        SPEED OPTIMIZATION: Many expensive tree traversals removed or simplified.
-        Focus on essential features only for training speed.
-        
-        Args:
-            prev_energy: List of previous energy values for computing delta (optional)
-            energy_history: List of ΔH values over trajectory (for ULTRA_PURE trajectory features)
-            complexity_history: List of complexity values over trajectory
-            action_history: List of ['REDUCE'/'HALT'] actions taken
-        
-        Coordinates exposed (depends on use_privileged_features):
-        
-        ALWAYS:
-        1. depth: stack depth (structural)
-        2. complexity: tree depth (structural)
-        3. delta_h: distance-to-equilibrium in DEQ space (convergence signal)
-        
-        IF use_privileged_features=True (HYBRID mode):
-        4. has_redex: binary basin indicator (0=HALT basin, 1=REDUCE basin) [PRIVILEGED]
-        5. redex_depth: radial coordinate inside REDUCE basin (capped at 5) [PRIVILEGED]
-        
-        IF use_privileged_features=False (PURE mode):
-        - Policy must learn halting boundary from structural features + DEQ dynamics alone
-        - Labels still come from SKICore, but network doesn't see the answer as input
-        
-        COUNTERFACTUAL CORRUPTION (corrupt_privileged=True):
-        - Flips privileged features to test causal dependence
-        - If accuracy collapses, proves the model depends on basin coordinates
-        - This is the "ablation by corruption" test for rigor
+        (Rewritten with consistent indentation and safe momentum recording.)
         """
         vecs = []
+        momentum_vals = []
+
         for idx, f in enumerate(fibers):
             depth = float(len(f.S))
-            
+
             # Check if top of stack is an SKITerm
             if f.S and isinstance(f.S[0], SKITerm):
-                # SPEED: Only compute essential features
                 complexity = self.term_complexity(f.S[0])
-                
-                # RULE-DISTANCE GEOMETRY: Simplified - only at root (skip expensive candidate search)
                 d_I, d_K, d_S = SKICore.rule_distance_vector(f.S[0], ultra_pure=self.ultra_pure)
-                
-                # STRUCTURAL INVARIANT GEOMETRY (Category III) - only essential ones
                 node_count = float(SKICore.count_nodes(f.S[0]))
                 count_S, count_K, count_I = SKICore.combinator_counts(f.S[0])
-                skew = 0.0  # SPEED: Skip expensive tree_skew computation
-                
-                # GROWTH/CONTRACTION GEOMETRY (Category IV)
+                skew = 0.0
                 size_delta = SKICore.expected_size_delta(f.S[0])
-                
-                # ENERGY GEOMETRY (Level 3) - SIMPLIFIED for speed
-                # Only use rewrite_energy, skip expensive approximate_redex_count
                 energy = SKICore.rewrite_energy(f.S[0])
-                
-                # TRAJECTORY GEOMETRY (Level 4): Energy Delta Trend
-                # Temporal semantics: is execution making progress?
+
                 if prev_energy is not None and idx < len(prev_energy):
                     energy_delta = energy - prev_energy[idx]
                 else:
-                    energy_delta = 0.0  # No history yet
-                
+                    energy_delta = 0.0
+
                 if self.use_privileged_features:
-                    # HYBRID MODE: ORACLE COORDINATES (explicit rule-aware checks)
-                    # These use combinator identity checks - this is the "privileged" part
-                    # has_redex: Oracle basin boundary (uses identity checks in has_redex())
-                    # redex_depth: Oracle radial coordinate (uses identity checks in leftmost_redex_depth())
                     has_redex = 1.0 if SKICore.has_redex(f.S[0]) else 0.0
-                    
-                    # ORACLE DEPTH: Uses leftmost_redex_depth with identity checks
                     raw_redex_depth = SKICore.leftmost_redex_depth(f.S[0])
                     if raw_redex_depth < 0:
                         redex_depth_norm = 0.0
                     else:
                         redex_depth_norm = min(raw_redex_depth, 5) / 5.0
-                    
-                    # Corruption test (adversarial probe)
                     if corrupt_privileged:
                         has_redex = 1.0 - has_redex
                         redex_depth_norm = 1.0 - redex_depth_norm
                 else:
-                    # PURE MODE: HONEST GEOMETRY ONLY (controlled by ultra_pure)
-                    # Use distance-based depth approximation instead of oracle
                     has_redex = 0.0
-                    
-                    # HONEST DEPTH: Uses distance heuristics
-                    # ultra_pure=True: NO combinator identity checks (leaf vs APP only)
-                    # ultra_pure=False: Checks combinator identity (S/K/I vs VAR)
                     raw_honest_depth = SKICore.honest_redex_depth(f.S[0], ultra_pure=self.ultra_pure)
                     if raw_honest_depth < 0:
                         redex_depth_norm = 0.0
@@ -2192,7 +2155,7 @@ class ManifoldSKI(nn.Module):
                         redex_depth_norm = min(raw_honest_depth, 5) / 5.0
             else:
                 complexity = 0.0
-                d_I, d_K, d_S = 1.0, 1.0, 1.0  # Far from all shapes if no term
+                d_I, d_K, d_S = 1.0, 1.0, 1.0
                 node_count = 0.0
                 count_S, count_K, count_I = 0.0, 0.0, 0.0
                 skew = 0.0
@@ -2201,68 +2164,49 @@ class ManifoldSKI(nn.Module):
                 energy_delta = 0.0
                 has_redex = 0.0
                 redex_depth_norm = 0.0
-            
-            # DEQ CONVERGENCE: Magnitude of last hidden state change
+
             if delta_h_mag is not None and idx < len(delta_h_mag):
                 delta_h_val = delta_h_mag[idx].item()
             else:
                 delta_h_val = 0.0
-            
+
+            # Embeddings (use provided device)
             depth_emb = self.fiber_enc_depth(torch.tensor([[depth]], device=device))
             complex_emb = self.fiber_enc_complexity(torch.tensor([[complexity]], device=device))
             delta_h_emb = self.fiber_enc_delta_h(torch.tensor([[delta_h_val]], device=device))
-            
-            # Rule-distance embeddings (ALWAYS included - structural, not privileged)
+
             rule_I_emb = self.fiber_enc_rule_dist_I(torch.tensor([[d_I]], device=device))
             rule_K_emb = self.fiber_enc_rule_dist_K(torch.tensor([[d_K]], device=device))
             rule_S_emb = self.fiber_enc_rule_dist_S(torch.tensor([[d_S]], device=device))
-            
-            # Structural invariant embeddings (Category III - ALWAYS included)
+
             node_count_emb = self.fiber_enc_node_count(torch.tensor([[node_count]], device=device))
             combS_emb = self.fiber_enc_combinator_S(torch.tensor([[float(count_S)]], device=device))
             combK_emb = self.fiber_enc_combinator_K(torch.tensor([[float(count_K)]], device=device))
             combI_emb = self.fiber_enc_combinator_I(torch.tensor([[float(count_I)]], device=device))
             skew_emb = self.fiber_enc_tree_skew(torch.tensor([[skew]], device=device))
-            
-            # Growth/contraction embeddings (Category IV - ALWAYS included)
+
             size_delta_emb = self.fiber_enc_size_delta(torch.tensor([[size_delta]], device=device))
-            
-            # Energy geometry (Level 3 - ALWAYS included)
             energy_emb = self.fiber_enc_energy(torch.tensor([[energy]], device=device))
-            
-            # Trajectory geometry (Level 4 - ALWAYS included)
             energy_delta_emb = self.fiber_enc_energy_delta(torch.tensor([[energy_delta]], device=device))
-            
-            # DISCRIMINATIVE GEOMETRY (ULTRA_PURE enhancement) - CHEAP APPROXIMATIONS
-            # Use simple heuristics instead of expensive tree traversals
-            # This maintains gradient flow while being fast!
+
             if f.S and isinstance(f.S[0], SKITerm) and self.ultra_pure:
-                arity = float(DiscriminativeGeometry.arity_depth(f.S[0]))  # Cheap - just counts nesting
-                
-                # SPEED: Cheap saturation approximation (maintains gradients!)
-                # Higher arity → more saturated (I=1, K=2, S=3)
-                saturation = min(1.0, arity / 3.0)  # Simple proxy with gradient flow
-                
+                arity = float(DiscriminativeGeometry.arity_depth(f.S[0]))
+                saturation = min(1.0, arity / 3.0)
                 nesting_un, nesting_bi, nesting_ter = DiscriminativeGeometry.nesting_pattern_vector(f.S[0])
-                
-                # SPEED: arg_balance constant (expensive full tree traversal, not worth it)
                 arg_balance = 0.5
             else:
                 arity = 0.0
                 saturation = 0.0
                 nesting_un, nesting_bi, nesting_ter = 0.0, 0.0, 0.0
                 arg_balance = 0.0
-            
-            # Embed discriminative features
+
             arity_emb = self.fiber_enc_arity_depth(torch.tensor([[arity]], device=device))
             saturation_emb = self.fiber_enc_saturation(torch.tensor([[saturation]], device=device))
             nesting_un_emb = self.fiber_enc_nesting_unary(torch.tensor([[nesting_un]], device=device))
             nesting_bi_emb = self.fiber_enc_nesting_binary(torch.tensor([[nesting_bi]], device=device))
             nesting_ter_emb = self.fiber_enc_nesting_ternary(torch.tensor([[nesting_ter]], device=device))
             arg_balance_emb = self.fiber_enc_arg_balance(torch.tensor([[arg_balance]], device=device))
-            
-            # TRAJECTORY FEATURES (ULTRA_PURE temporal context)
-            # Compute trajectory statistics from history
+
             if self.ultra_pure and energy_history is not None:
                 delta_h_trend_val = TrajectoryFeatures.delta_h_trend(energy_history)
                 complexity_trend_val = TrajectoryFeatures.complexity_trend(complexity_history) if complexity_history else 0.0
@@ -2275,20 +2219,14 @@ class ManifoldSKI(nn.Module):
                 reduction_momentum_val = 0.0
                 progress_score_val = 0.5
                 delta_h_volatility_val = 0.0
-            
-            # Embed trajectory features
+
             delta_h_trend_emb = self.fiber_enc_delta_h_trend(torch.tensor([[delta_h_trend_val]], device=device))
             complexity_trend_emb = self.fiber_enc_complexity_trend(torch.tensor([[complexity_trend_val]], device=device))
             reduction_momentum_emb = self.fiber_enc_reduction_momentum(torch.tensor([[reduction_momentum_val]], device=device))
             progress_score_emb = self.fiber_enc_progress_score(torch.tensor([[progress_score_val]], device=device))
             delta_h_volatility_emb = self.fiber_enc_delta_h_volatility(torch.tensor([[delta_h_volatility_val]], device=device))
-            
+
             if self.use_privileged_features:
-                # HYBRID: Oracle depth (uses combinator identity checks)
-                # NOTE: has_redex NOT fed as input (would be trivial label leakage)
-                # Model gets redex_depth_norm as graded signal and must learn boundary
-                # redex_depth_norm uses leftmost_redex_depth() which checks identity
-                # This is the "privileged oracle coordinate" that HYBRID is allowed
                 redex_depth_emb = self.fiber_enc_redex_depth(torch.tensor([[redex_depth_norm]], device=device))
                 vecs.append(torch.tanh(
                     depth_emb + complex_emb + redex_depth_emb + delta_h_emb +
@@ -2297,29 +2235,34 @@ class ManifoldSKI(nn.Module):
                     size_delta_emb + energy_emb + energy_delta_emb
                 ).squeeze(0))
             elif self.ultra_pure:
-                # ULTRA_PURE mode: structural + discriminative + trajectory (NO combinator identity)
-                # REMOVED: combS_emb, combK_emb, combI_emb (these leak combinator presence statistics)
-                # The temporal GNN must learn combinator identity from behavior alone!
                 vecs.append(torch.tanh(
                     depth_emb + complex_emb + delta_h_emb +
                     rule_I_emb + rule_K_emb + rule_S_emb +
-                    node_count_emb + skew_emb +  # Keep total nodes & skew, remove combinator counts
+                    node_count_emb + skew_emb +
                     size_delta_emb + energy_emb + energy_delta_emb +
-                    arity_emb + saturation_emb + 
+                    arity_emb + saturation_emb +
                     nesting_un_emb + nesting_bi_emb + nesting_ter_emb +
                     arg_balance_emb +
                     delta_h_trend_emb + complexity_trend_emb + reduction_momentum_emb +
                     progress_score_emb + delta_h_volatility_emb
                 ).squeeze(0))
             else:
-                # PURE mode (basic): structural + convergence + rule distances + invariants + energy + trajectory
                 vecs.append(torch.tanh(
                     depth_emb + complex_emb + delta_h_emb +
                     rule_I_emb + rule_K_emb + rule_S_emb +
                     node_count_emb + combS_emb + combK_emb + combI_emb + skew_emb +
                     size_delta_emb + energy_emb + energy_delta_emb
                 ).squeeze(0))
-        
+
+            # Record the raw momentum scalar for policy injection later
+            momentum_vals.append(float(reduction_momentum_val))
+
+        # Store last per-fiber reduction_momentum values for use by policy head
+        try:
+            self._last_reduction_momentum = torch.tensor(momentum_vals, device=device, dtype=torch.float32)
+        except Exception:
+            self._last_reduction_momentum = torch.zeros(len(vecs), 1, device=device, dtype=torch.float32)
+
         return torch.stack(vecs)
 
     def forward(self, h, fibers, token_idx, teacher_ops=None, prev_h=None, prev_energy=None, corrupt_privileged=False, use_uniform_routing=False):
@@ -2464,8 +2407,8 @@ class ManifoldSKI(nn.Module):
         
         # Compute policy score EARLY for use in stabilizer (epistemic uncertainty signal)
         # Use h (not h_next) since we haven't updated yet
-        # Note: effective_step not available yet, use zero placeholder
-        policy_input_early = torch.cat([h, torch.zeros(batch_size, 1, device=device, dtype=h.dtype), delta_h_mag], dim=-1)
+        # Note: effective_step and momentum not available yet, use zero placeholders
+        policy_input_early = torch.cat([h, torch.zeros(batch_size, 1, device=device, dtype=h.dtype), delta_h_mag, torch.zeros(batch_size, 1, device=device, dtype=h.dtype)], dim=-1)
         policy_score_early = self.policy(policy_input_early)  # [batch, 1] uncertainty proxy
         
         # Compute prediction uncertainty: how far from confident (0.0 or 1.0)?
@@ -2559,7 +2502,19 @@ class ManifoldSKI(nn.Module):
         # Policy head: Continuous reducibility score
         # Output: scalar ∈ [0, 1] representing P(has_redex)
         # > 0.5 → REDUCE, < 0.5 → HALT (threshold at inference)
-        policy_input = torch.cat([h_next, effective_step, delta_h_mag], dim=-1)  # [batch, hidden_dim + 2]
+        # Get momentum from last embed_fiber call (or use 0 if not available)
+        if hasattr(self, '_last_reduction_momentum') and self._last_reduction_momentum is not None:
+            momentum_val = self._last_reduction_momentum
+            # Ensure correct shape: [batch_size, 1]
+            if momentum_val.dim() == 0:  # scalar
+                momentum_val = momentum_val.unsqueeze(0).unsqueeze(0).expand(batch_size, 1)
+            elif momentum_val.dim() == 1:  # [batch]
+                momentum_val = momentum_val.unsqueeze(1)  # [batch, 1]
+            elif momentum_val.size(0) != batch_size:  # wrong batch size
+                momentum_val = torch.zeros(batch_size, 1, device=device, dtype=h_next.dtype)
+        else:
+            momentum_val = torch.zeros(batch_size, 1, device=device, dtype=h_next.dtype)
+        policy_input = torch.cat([h_next, effective_step, delta_h_mag, momentum_val], dim=-1)  # [batch, hidden_dim + 3]
         policy_score = self.policy(policy_input)  # [batch, 1] continuous score
         
         # BUG FIX #1: Compute current energy for trajectory geometry
@@ -3683,16 +3638,34 @@ def run_ski_curriculum(use_semantic_loss=True, autonomous_reduction_prob=0.3, us
         if hasattr(model, 'clear_memory'):
             model.clear_memory()
         
-        # Progressive curriculum
-        if epoch < 1000:
-            # Stage 1: Master basics
-            task = random.choice(['identity', 'identity', 'constant', 'simple_s'])
-        elif epoch < 2000:
-            # Stage 2: Introduce Church numerals and depth-5
-            task = random.choice(['identity', 'constant', 'simple_s', 'church_0', 'deep_5'])
+        # 🎓 INTERLEAVED CURRICULUM: Smooth difficulty ramping
+        # Instead of rigid stages, expose model to ALL difficulties from the start
+        # but sample easier tasks more frequently early on, gradually shifting to harder ones.
+        # This prevents distribution shift and allows the model to see complex examples
+        # even while it's still learning basics (mimics human learning).
+        
+        # Define task pools with difficulty levels
+        basic_tasks = ['identity', 'constant', 'simple_s']
+        intermediate_tasks = ['church_0', 'deep_5']
+        advanced_tasks = ['deep_7', 'deep_10']
+        
+        # Compute sampling weights based on epoch (smooth transition)
+        progress = min(epoch / 3000.0, 1.0)  # 0.0 → 1.0 over 3000 epochs
+        
+        # Early: 80% basic, 15% intermediate, 5% advanced
+        # Late: 20% basic, 30% intermediate, 50% advanced
+        basic_weight = 0.8 - 0.6 * progress      # 0.8 → 0.2
+        intermediate_weight = 0.15 + 0.15 * progress  # 0.15 → 0.3
+        advanced_weight = 0.05 + 0.45 * progress      # 0.05 → 0.5
+        
+        # Sample task pool based on weights
+        task_pool_choice = random.random()
+        if task_pool_choice < basic_weight:
+            task = random.choice(basic_tasks)
+        elif task_pool_choice < basic_weight + intermediate_weight:
+            task = random.choice(intermediate_tasks)
         else:
-            # Stage 3: Deeper generalization (depth 7-10)
-            task = random.choice(['simple_s', 'church_0', 'deep_5', 'deep_7', 'deep_10'])
+            task = random.choice(advanced_tasks)
         
         inputs, teacher, expected, source_term, gt_term, gt_steps = get_ski_batch(task)
         
@@ -3700,26 +3673,28 @@ def run_ski_curriculum(use_semantic_loss=True, autonomous_reduction_prob=0.3, us
         if len(inputs) > 100:
             continue
         
-        # ⚡ IMPROVED AUTONOMOUS CURRICULUM ⚡
-        # Strategy:
-        # 1. Force autonomous every 10 iterations (ensures balanced exposure)
-        # 2. Ramp up probability over time: 10% → 30% → 50%
-        # 3. Only do autonomous on reducible tasks (deep_* have meaningful reductions)
+        # ⚡ AUTONOMOUS CURRICULUM: Pure Random Sampling ⚡
+        # Strategy: Independent random decision per sample
+        # - No forced intervals (prevents bias toward specific tasks)
+        # - Every task gets proportional autonomous exposure
+        # - Smooth probability ramping over training
         
-        # Ramping schedule
-        if epoch < 1000:
-            auto_prob = 0.1  # 10% in stage 1 (learning basics)
-        elif epoch < 3000:
-            auto_prob = 0.3  # 30% in stage 2 (building skills)
+        # ⚡ AGGRESSIVE AUTONOMOUS RAMPING ⚡
+        # Fast ramp to 50% by epoch 100, then slower climb to 80%
+        # Early epochs: Teacher-forcing for stable gradients
+        # Mid training: 50/50 mix for balanced learning
+        # Late training: Mostly autonomous for real policy learning
+        if epoch < 100:
+            # Fast ramp: 10% → 50% over first 100 epochs
+            auto_prob = 0.1 + 0.4 * (epoch / 100.0)
         else:
-            auto_prob = 0.5  # 50% in stage 3 (mastery)
+            # Slower ramp: 50% → 80% over remaining epochs
+            progress = min((epoch - 100) / 2900.0, 1.0)
+            auto_prob = 0.5 + 0.3 * progress
         
-        # Force autonomous every 10 iterations (ensures we never go too long without practice)
-        force_autonomous = (epoch % 10 == 0)
-        
-        # Decide: teacher-forced or autonomous reduction?
-        # Allow autonomous on ALL tasks (model needs to learn exploration from the start)
-        use_autonomous = (force_autonomous or random.random() < auto_prob)
+        # Independent random decision for THIS sample
+        # No forced intervals = no task bias
+        use_autonomous = (random.random() < auto_prob)
         
         device = next(model.parameters()).device
         
@@ -4057,8 +4032,13 @@ def run_ski_curriculum(use_semantic_loss=True, autonomous_reduction_prob=0.3, us
                                  torch.tensor(weight_reduce, device=device),
                                  torch.tensor(weight_halt, device=device))
             
-            # Vectorized weighted MSE
-            loss_policy = (weights * (preds - labels) ** 2).mean()
+            # VECTORIZED BCE LOSS (better than MSE for probability prediction!)
+            # MSE punishes exploration (policy ≈ 0.5) too hard at decision boundaries
+            # BCE has proper gradient dynamics for binary classification:
+            #   - Near 0/1: Gradients scale inversely with confidence (good!)
+            #   - Near 0.5: Gradients encourage exploration (good!)
+            # Note: preds already in [0,1] from sigmoid, so use F.binary_cross_entropy
+            loss_policy = (weights * F.binary_cross_entropy(preds, labels, reduction='none')).mean()
             
             # Track accuracy (vectorized threshold)
             pred_binary = (preds > 0.5).float()
@@ -4236,7 +4216,7 @@ def run_ski_curriculum(use_semantic_loss=True, autonomous_reduction_prob=0.3, us
             # Weight 0.05 - strong enough to respond quickly, gentle enough to be stable
             loss_adaptive_homeostasis = 0.05 * (expert_usage_entropy - entropy_target_adaptive) ** 2
         
-        # Total loss with RIEMANNIAN GEOMETRY
+    # Total loss with RIEMANNIAN GEOMETRY
         # BEAUTIFUL: Metric loss (curvature + smoothness) replaces old feature engineering!
         total_loss = (routing_loss + loss_policy + loss_routing_entropy + 0.1 * loss_ortho + 
                      loss_spectral + loss_semantic + 
@@ -4244,6 +4224,45 @@ def run_ski_curriculum(use_semantic_loss=True, autonomous_reduction_prob=0.3, us
                      0.1 * loss_metric_geo +  # Metric smoothness
                      0.01 * loss_load_balance + 
                      loss_entropy_homeostasis + loss_adaptive_homeostasis)
+
+        # --- Safety guards for autonomous mode (prevent catastrophic loss spikes) ---
+        # If autonomous reductions end with a term that still has a redex, mark as non-terminating
+        non_terminating = False
+        try:
+            if use_autonomous and built_term is not None:
+                non_terminating = SKICore.has_redex(built_term)
+        except Exception:
+            # conservative default: don't crash training on safety check
+            non_terminating = False
+
+        # Add a small, bounded penalty for non-terminating traces so they don't produce
+        # unbounded objectives (adversarial terms may otherwise blow up metric/energy losses)
+        if non_terminating:
+            nonterm_penalty = torch.tensor(50.0, device=device)  # bounded penalty
+            total_loss = total_loss + nonterm_penalty
+
+        # Clamp / sanitize extreme losses coming from autonomous (unrolled/adversarial) behavior
+        # This prevents runaway gradients and stabilizes training when encountering
+        # non-terminating or adversarial evaluation samples during AUTO mode.
+        LOSS_CLAMP_THRESHOLD = 1e4
+        clipped_for_extreme = False
+        if use_autonomous:
+            # Handle NaN / Inf explicitly
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
+                print(f"Warning: NaN/Inf total_loss detected in AUTO mode (epoch={epoch}). Replacing with clamp={LOSS_CLAMP_THRESHOLD}.")
+                total_loss = torch.tensor(LOSS_CLAMP_THRESHOLD, device=device)
+                clipped_for_extreme = True
+            else:
+                # Clamp very large losses
+                try:
+                    if total_loss.detach().item() > LOSS_CLAMP_THRESHOLD:
+                        print(f"Warning: extreme AUTO loss {total_loss.item():.1f} > {LOSS_CLAMP_THRESHOLD}, clamping.")
+                        total_loss = torch.clamp(total_loss, max=LOSS_CLAMP_THRESHOLD)
+                        clipped_for_extreme = True
+                except Exception:
+                    # In case detach().item() fails, fall back to safe clamping
+                    total_loss = torch.clamp(total_loss, max=LOSS_CLAMP_THRESHOLD)
+                    clipped_for_extreme = True
         
         # GRADIENT ACCUMULATION with Mixed Precision: Scale loss and accumulate
         # Each forward pass creates its own graph - no need to retain!
@@ -4276,25 +4295,21 @@ def run_ski_curriculum(use_semantic_loss=True, autonomous_reduction_prob=0.3, us
             model.constrain_deq_spectral_norm()
         
         # SHOW EVERY ITERATION for monitoring
-        # Show curriculum stage
-        if epoch < 1000:
-            stage = "Stage 1: Basics"
-        elif epoch < 2000:
-            stage = "Stage 2: Church+Depth5"
-        else:
-            stage = "Stage 3: Deep Generalization"
+        # Show curriculum progress (smooth ramping instead of rigid stages)
+        progress = min(epoch / 3000.0, 1.0)
+        basic_pct = int((0.8 - 0.6 * progress) * 100)
+        inter_pct = int((0.15 + 0.15 * progress) * 100)
+        adv_pct = int((0.05 + 0.45 * progress) * 100)
+        stage = f"Curriculum: {basic_pct}%B {inter_pct}%I {adv_pct}%A"
         
         result_str = final_str[:20] if len(final_str) <= 20 else final_str[:17] + "..."
         status = "✓" if success else "✗"
         
-        # Show mode with forced indicator
+        # Show mode (pure random sampling, no forced intervals)
         if use_autonomous:
-            if force_autonomous:
-                mode = "AUTO*"  # Forced autonomous (every 10)
-            else:
-                mode = "AUTO "  # Random autonomous
+            mode = "AUTO "  # Autonomous (random sampling)
         else:
-            mode = "SUPV "
+            mode = "SUPV "  # Supervised (teacher-forced)
         
         # Telemetry
         policy_acc = (policy_correct / policy_total * 100) if policy_total > 0 else 0.0
@@ -4321,6 +4336,50 @@ def run_ski_curriculum(use_semantic_loss=True, autonomous_reduction_prob=0.3, us
             policy_acc = (policy_correct / policy_total * 100) if policy_total > 0 else 0.0
             auto_pct = (auto_count / (auto_count + supv_count) * 100) if (auto_count + supv_count) > 0 else 0.0
             print(f"    [Summary @{epoch}] Policy Acc: {policy_acc:.1f}% | AUTO: {auto_pct:.1f}% | Samples: {auto_count+supv_count}")
+            
+            # 🔬 ULTRA PURE MODE VALIDATION: Visualize GNN Embedding Space
+            # Scientific hypothesis: Temporal GRU should learn combinator identity from behavior
+            # - I reduces in 1 step: I x → x
+            # - K reduces in 1 step: K x y → x  
+            # - S expands then contracts: S x y z → (x z) (y z) → ...
+            # If GNN learns correctly, embeddings should drift apart as it picks up dynamics
+            if ultra_pure and hasattr(model, 'predict_rewrite'):
+                try:
+                    with torch.no_grad():
+                        # Embed atomic combinators
+                        term_I = SKITerm(typ='I')
+                        term_K = SKITerm(typ='K')
+                        term_S = SKITerm(typ='S')
+                        
+                        # Get embeddings from temporal GNN
+                        pred_I = model.predict_rewrite(term_I, device)
+                        pred_K = model.predict_rewrite(term_K, device)
+                        pred_S = model.predict_rewrite(term_S, device)
+                        
+                        if 'tree_emb' in pred_I and 'tree_emb' in pred_K and 'tree_emb' in pred_S:
+                            emb_I = pred_I['tree_emb']
+                            emb_K = pred_K['tree_emb']
+                            emb_S = pred_S['tree_emb']
+                            
+                            # Compute pairwise cosine similarity
+                            sim_IK = F.cosine_similarity(emb_I, emb_K, dim=-1).item()
+                            sim_IS = F.cosine_similarity(emb_I, emb_S, dim=-1).item()
+                            sim_KS = F.cosine_similarity(emb_K, emb_S, dim=-1).item()
+                            
+                            print(f"    [Ultra Pure Analysis] GNN Combinator Separation:")
+                            print(f"      I-K similarity: {sim_IK:+.3f} | I-S: {sim_IS:+.3f} | K-S: {sim_KS:+.3f}")
+                            
+                            # Diagnostic: Are they learning to separate?
+                            avg_sim = (abs(sim_IK) + abs(sim_IS) + abs(sim_KS)) / 3.0
+                            if avg_sim > 0.9:
+                                print(f"      ⚠️  WARNING: High similarity ({avg_sim:.3f}) - GNN not distinguishing yet!")
+                            elif avg_sim < 0.5:
+                                print(f"      ✓ GOOD: Low similarity ({avg_sim:.3f}) - GNN learning semantic identity!")
+                            else:
+                                print(f"      → Learning in progress (avg sim: {avg_sim:.3f})")
+                except Exception as e:
+                    # Don't crash training on visualization bug
+                    print(f"    [Ultra Pure Analysis] Visualization failed: {e}")
             
         # Every 1000 epochs, show detailed telemetry
         if epoch % 1000 == 0 and epoch > 0:

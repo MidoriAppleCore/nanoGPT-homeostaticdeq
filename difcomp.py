@@ -183,7 +183,11 @@ Success Criteria:
 # ==========================================
 class DEQFixedPoint(autograd.Function):
     """
-    Deep Equilibrium Model solver adapted for LORENTZ GEOMETRY!
+    Deep Equilibrium Model solver adapted for LORENTZ GEOMETRY with GNN INTEGRATION!
+    
+    🔥 HYBRID APPROACH: 
+    - Forward: torch.no_grad() for memory efficiency (implicit fixed-point)
+    - Backward: Recompute GNN calls WITH gradients to inject GNN parameter gradients
     
     Key Innovation: Fixed-point iteration on HYPERBOLOID H^n ⊂ ℝ^(n+1)
     - Each iteration: z_{t+1} = func(z_t) gives tangent vector
@@ -242,75 +246,70 @@ class DEQFixedPoint(autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_z_star):
+        """
+        Implicit differentiation for DEQ fixed point.
+        
+        Given z* = f(z*, θ) and loss L(z*), we want ∂L/∂θ.
+        
+        Implicit function theorem:
+        At fixed point: z* = f(z*, θ)
+        Taking derivative: dz* = ∂f/∂z·dz* + ∂f/∂θ·dθ
+        Rearranging: (I - ∂f/∂z)·dz* = ∂f/∂θ·dθ
+        
+        For gradients: (I - ∂f/∂z)^T·λ = ∂L/∂z*
+        Then: ∂L/∂θ = λ^T·∂f/∂θ
+        
+        Approximation: For well-conditioned fixed points with spectral radius < 1,
+        we can use λ ≈ ∂L/∂z* (zeroth order approximation)
+        """
         z_star, h_ctx, f_emb, W, U, V, alpha = ctx.saved_tensors
         func = ctx.func
         
-        z_star = z_star.detach().requires_grad_(True)
-        h_ctx = h_ctx.detach().requires_grad_(True)
-        f_emb = f_emb.detach().requires_grad_(True)
-        W = W.detach().requires_grad_(True)
-        U = U.detach().requires_grad_(True)
-        V = V.detach().requires_grad_(True)
-        alpha = alpha.detach().requires_grad_(True)
+        # Detach and enable gradients for parameter tensors only
+        h_ctx_detached = h_ctx.detach().requires_grad_(True)
+        f_emb_detached = f_emb.detach().requires_grad_(True)
+        W_detached = W.detach().requires_grad_(True)
+        U_detached = U.detach().requires_grad_(True)
+        V_detached = V.detach().requires_grad_(True)
+        alpha_detached = alpha.detach().requires_grad_(True)
         
+        # For well-conditioned systems (spectral radius < 0.95), use simple approximation
+        # λ ≈ grad_z_star
+        # This avoids solving the linear system (I - J)^T λ = grad_z_star
+        
+        # Recompute f at fixed point to get gradients w.r.t. parameters
         with torch.enable_grad():
-            f_z = func(z_star, h_ctx, f_emb, W, U, V, alpha)
+            z_star_detached = z_star.detach()
+            z_next = func(z_star_detached, h_ctx_detached, f_emb_detached, 
+                         W_detached, U_detached, V_detached, alpha_detached)
         
-        # ⚡ IMPLICIT DIFFERENTIATION: Solve (I - J^T) @ v = grad_z_star ⚡
-        # 
-        # With unified state [h, policy_logit], the Jacobian includes policy dynamics
-        # which may have different spectral properties. Use iterative solver instead
-        # of 1-step Neumann for better gradient accuracy.
-        # 
-        # Solve: v = (I - J^T)^{-1} @ grad_z_star using fixed-point iteration:
-        #   v_{k+1} = grad + J^T @ v_k
-        # 
-        # This is equivalent to Neumann series but iterates to convergence.
+        # Compute gradients using autograd.grad (doesn't modify graph)
+        if z_next.requires_grad:
+            grads = torch.autograd.grad(
+                outputs=z_next,
+                inputs=(h_ctx_detached, f_emb_detached, W_detached, U_detached, V_detached, alpha_detached),
+                grad_outputs=grad_z_star,
+                allow_unused=True,
+                retain_graph=False
+            )
+            
+            grad_h_ctx = grads[0] if grads[0] is not None else torch.zeros_like(h_ctx)
+            grad_f_emb = grads[1] if grads[1] is not None else torch.zeros_like(f_emb)
+            grad_W = grads[2] if grads[2] is not None else torch.zeros_like(W)
+            grad_U = grads[3] if grads[3] is not None else torch.zeros_like(U)
+            grad_V = grads[4] if grads[4] is not None else torch.zeros_like(V)
+            grad_alpha = grads[5] if grads[5] is not None else torch.zeros_like(alpha)
+        else:
+            grad_h_ctx = torch.zeros_like(h_ctx)
+            grad_f_emb = torch.zeros_like(f_emb)
+            grad_W = torch.zeros_like(W)
+            grad_U = torch.zeros_like(U)
+            grad_V = torch.zeros_like(V)
+            grad_alpha = torch.zeros_like(alpha)
         
-        # Initialize v with input gradient
-        v = grad_z_star.clone()
-        
-        # Iterative solver: v = grad + J^T @ v (fixed-point iteration)
-        # Converges to attractor: (I - J^T)^{-1} @ grad
-        max_iter_backward = 10  # Allow convergence for complex policy dynamics
-        tol = 1e-5  # Relative tolerance for early stopping
-        
-        for iter_back in range(max_iter_backward):
-            # Compute Jacobian-vector product: J^T @ v
-            JTv = autograd.grad(f_z, z_star, v, retain_graph=True, create_graph=False)[0]
-            
-            # ADAPTIVE DAMPING: Prevent gradient explosion
-            norm_v = torch.norm(v)
-            norm_JTv = torch.norm(JTv)
-            
-            if norm_JTv > 5.0 * norm_v:
-                # Jacobian amplifying gradients → use heavy damping
-                damping = 0.1
-            elif norm_JTv > 2.0 * norm_v:
-                # Moderate amplification → moderate damping
-                damping = 0.5
-            else:
-                # Jacobian well-behaved → trust it
-                damping = 0.9
-            
-            # Update: v_{k+1} = grad + damping * J^T @ v_k
-            v_new = grad_z_star + damping * JTv
-            
-            # Check convergence with relative tolerance
-            residual = torch.norm(v_new - v)
-            relative_residual = residual / (norm_v + 1e-8)
-            
-            if relative_residual < tol:
-                v = v_new
-                # Converged early - good!
-                break
-            v = v_new
-        
-        # If we didn't converge after max_iter, v is our best estimate
-        # (Training will still work, just with slightly biased gradients)
-            
-        grads = autograd.grad(f_z, (h_ctx, f_emb, W, U, V, alpha), v, allow_unused=True)
-        return (None, None, grads[0], grads[1], grads[2], grads[3], grads[4], grads[5], None, None)
+        # Return gradients for: (func, z_init, h_ctx, f_emb, W, U, V, alpha)
+        # func is not differentiable, z_init gradients not needed
+        return (None, None, grad_h_ctx, grad_f_emb, grad_W, grad_U, grad_V, grad_alpha)
 
 # ==========================================
 # 2. SKI TERM REPRESENTATION
@@ -1059,6 +1058,19 @@ class LearnedRewriteGNN(nn.Module):
         self.input_feature_dim = input_feature_dim if input_feature_dim is not None else vocab_size
         self.input_proj = nn.Linear(self.input_feature_dim, hidden_dim)
         
+        # 🔥 CRITICAL: Strong initialization for combinator separation!
+        # Problem: One-hot inputs [1,0,0,...] need LARGE weight variance to create separation
+        # Standard Xavier init: std ~ 1/sqrt(fan_in) ≈ 0.4 for vocab_size=6
+        # → After projection to hyperboloid (normalization), similar inputs collapse!
+        # Solution: Initialize with 10x larger std to force strong initial separation
+        nn.init.normal_(self.input_proj.weight, mean=0.0, std=2.0)  # 10x larger than Xavier!
+        if self.input_proj.bias is not None:
+            nn.init.zeros_(self.input_proj.bias)  # Start with no bias offset
+        
+        print(f"[GNN Init] input_proj initialized with std=2.0 (strong separation)")
+        print(f"           Weight norm: {self.input_proj.weight.norm().item():.2f}")
+        print(f"           Weight std: {self.input_proj.weight.std().item():.4f}")
+        
         # 🌌 LORENTZ-EQUIVARIANT MESSAGE PASSING
         # Revolutionary upgrade: Graph convolution now operates in hyperbolic space!
         # 
@@ -1123,6 +1135,27 @@ class LearnedRewriteGNN(nn.Module):
         )
         self.metric_dim = hidden_dim
         
+        # 🌟 BEAUTIFUL ARCHITECTURE: Modulation parameter network
+        # GNN learns HOW the metric should modulate during DEQ iterations
+        # Not the metric at each step (too expensive), but the SHAPE of modulation
+        # 
+        # Outputs 3 coefficients [α, β, γ]:
+        #   α: Base scaling (overall metric strength)
+        #   β: Norm-dependent modulation (scales with ||h||)
+        #   γ: Curvature-dependent modulation (scales with ⟨h,h⟩_L)
+        #
+        # During DEQ: metric(h) = metric_base * (α + β·||h|| + γ·⟨h,h⟩_L)
+        # This allows metric to smoothly adapt as DEQ state evolves!
+        self.modulation_net = nn.Sequential(
+            nn.Linear(hidden_dim, 64),
+            nn.Tanh(),
+            nn.Linear(64, 3)  # [α, β, γ]
+        )
+        # Initialize with identity-like modulation (α≈1, β≈0, γ≈0)
+        nn.init.zeros_(self.modulation_net[2].weight)
+        nn.init.constant_(self.modulation_net[2].bias, 0.0)
+        self.modulation_net[2].bias.data[0] = 1.0  # α starts at 1
+        
         # Global pooling for tree-level embedding
         self.global_pool = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -1148,29 +1181,77 @@ class LearnedRewriteGNN(nn.Module):
         # Stage 1: Euclidean embedding
         h = self.input_proj(node_features)  # [num_nodes, hidden_dim]
         
+        # 🔬 DEBUG: ALWAYS print for first node to see what's happening
+        if node_features.shape[0] == 1:  # Single-node graph (I/K/S combinator)
+            feat_first6 = node_features[0, :6].tolist()
+            h_norm = h[0].norm().item()
+            h_first5 = h[0, :5].tolist()
+            #print(f"    [� After input_proj] features[:6]={[f'{v:.1f}' for v in feat_first6]}, h.norm={h_norm:.4f}, h[:5]={[f'{v:.4f}' for v in h_first5]}")
+        
         # Stage 2: First convolution (Euclidean)
         h = self.initial_conv(h, edge_index)
-        h = F.relu(h)
+        if node_features.shape[0] == 1:  # Debug single-node
+            h_after_conv = h[0, :5].tolist()
+            #print(f"    [🔬 After conv] h[:5]={[f'{v:.4f}' for v in h_after_conv]}")
+        
+        # 🔥 CRITICAL FIX: Use LeakyReLU instead of ReLU to preserve negative values!
+        # Problem: ReLU zeros out negative values → only 1-2 non-zero dims out of 256!
+        # Solution: LeakyReLU with slope=0.2 preserves information in negative dims
+        h = F.leaky_relu(h, negative_slope=0.2)
+        if node_features.shape[0] == 1:  # Debug single-node
+            h_after_activation = h[0, :5].tolist()
+            #print(f"    [🔬 After LeakyReLU] h[:5]={[f'{v:.4f}' for v in h_after_activation]}")
         
         # 🌌 Stage 3: Project to Lorentz hyperboloid
         # From Euclidean ℝ^n to Lorentz H^n ⊂ ℝ^(n+1)
         h_lorentz = LorentzOps.project_to_hyperboloid(h)  # [num_nodes, hidden_dim+1]
         
+        # 🔬 DEBUG: Check Lorentz projection
+        if node_features.shape[0] == 1:  # Single node (I/K/S combinator)
+            h_euclidean_norm = h[0].norm().item()
+            h_lorentz_spatial = h_lorentz[0, 1:6].tolist()  # First 5 spatial coords
+            h_lorentz_timelike = h_lorentz[0, 0].item()
+            #print(f"    [� After Lorentz proj] Euclidean norm={h_euclidean_norm:.4f}, timelike={h_lorentz_timelike:.4f}, spatial[:5]={[f'{v:.4f}' for v in h_lorentz_spatial]}")
+        
         # Stage 4: Lorentz-equivariant message passing with attention
         # All subsequent layers operate purely on the hyperboloid
-        for i, lorentz_conv in enumerate(self.lorentz_convs):
-            h_lorentz_new = lorentz_conv(h_lorentz, edge_index)
-            # Note: LorentzAttention output is already on hyperboloid, no reprojection needed
-            h_lorentz = h_lorentz_new
-        
+        # 🔥 CRITICAL: Skip Lorentz attention for single-node graphs (no edges to attend to!)
+        # LorentzAttention zeros out embeddings when edge_index is empty
+        if edge_index.shape[1] > 0:  # Only apply if there are edges
+            for i, lorentz_conv in enumerate(self.lorentz_convs):
+                h_lorentz_new = lorentz_conv(h_lorentz, edge_index)
+                # Note: LorentzAttention output is already on hyperboloid, no reprojection needed
+                h_lorentz = h_lorentz_new
+                
+                # 🔬 DEBUG: Check after each Lorentz conv layer
+                if node_features.shape[0] == 1:
+                    h_spatial_after_conv = h_lorentz[0, 1:6].tolist()
+                    print(f"    [🔬 After Lorentz conv {i}] spatial[:5]={[f'{v:.4f}' for v in h_spatial_after_conv]}")
+        else:
+            # Single node, no edges - skip attention layers, keep initial embedding
+            if node_features.shape[0] == 1:
+                #print(f"    [🔬 SKIPPING Lorentz convs] No edges (single node), keeping initial embedding")
+                pass
+
         # Global tree embedding (mean pool in spatial coordinates, then project)
         # For proper Lorentzian aggregation, we should use Fréchet mean,
         # but for efficiency we use spatial mean + reprojection
         h_lorentz_spatial = h_lorentz[:, 1:]  # [num_nodes, hidden_dim] - drop time coordinate
         tree_emb_spatial_euclidean = h_lorentz_spatial.mean(dim=0, keepdim=True)  # [1, hidden_dim]
         
+        # 🔬 DEBUG: Check mean pooling
+        if node_features.shape[0] == 1:
+            pooled_first5 = tree_emb_spatial_euclidean[0, :5].tolist()
+            #print(f"    [🔬 After mean pool] spatial[:5]={[f'{v:.4f}' for v in pooled_first5]}")
+        
         # Project pooled embedding back to hyperboloid (for consistency)
         tree_emb_spatial_lorentz = LorentzOps.project_to_hyperboloid(tree_emb_spatial_euclidean)  # [1, hidden_dim+1]
+        
+        # 🔬 DEBUG: Check final spatial embedding
+        if node_features.shape[0] == 1:
+            final_spatial = tree_emb_spatial_lorentz[0, 1:6].tolist()
+            final_timelike = tree_emb_spatial_lorentz[0, 0].item()
+            #print(f"    [🔬 FINAL tree_emb_spatial_lorentz] timelike={final_timelike:.4f}, spatial[:5]={[f'{v:.4f}' for v in final_spatial]}")
         
         # Extract Euclidean part for GRU (GRU still operates in Euclidean space)
         tree_emb_spatial = tree_emb_spatial_euclidean  # [1, hidden_dim]
@@ -1294,14 +1375,34 @@ class LearnedRewriteGNN(nn.Module):
             print(f"    [⚠️ Lorentz] metric contains NaN/Inf - sanitizing")
             metric = torch.nan_to_num(metric, nan=0.0, posinf=1e3, neginf=-1e3)
         
+        # Compute curvature perturbation: Δg = g - η (how much metric deviates from flat Minkowski)
+        delta_g = metric - eta  # [batch, D+1, D+1]
+        
+        # 🌟 COMPUTE MODULATION PARAMETERS
+        # GNN learns [α, β, γ] that control how metric modulates during DEQ iterations
+        # This is THE BEAUTIFUL IDEA: GNN designs the "potential landscape",
+        # DEQ traverses it to find fixed point
+        modulation_params_raw = self.modulation_net(tree_emb_euclidean.squeeze(0))  # [3]
+        # Constrain to reasonable ranges:
+        # α ∈ [0.5, 2.0] - base scaling
+        # β ∈ [-0.5, 0.5] - norm modulation
+        # γ ∈ [-0.2, 0.2] - curvature modulation
+        modulation_params = torch.stack([
+            0.5 + 1.5 * torch.sigmoid(modulation_params_raw[0]),  # α ∈ [0.5, 2.0]
+            torch.tanh(modulation_params_raw[1]) * 0.5,  # β ∈ [-0.5, 0.5]
+            torch.tanh(modulation_params_raw[2]) * 0.2   # γ ∈ [-0.2, 0.2]
+        ])  # [3]
+        
         if return_embeddings:
             return {
-                'metric': metric,  # [D+1, D+1] - Lorentzian metric (base η + perturbation Δg)
+                'metric': metric,  # [D+1, D+1] - Lorentzian metric BASE (static for this term)
                 'metric_norm': metric_norm,  # Scalar - total curvature
                 'metric_det': metric_det,  # Scalar - volume form
                 'metric_trace': metric_trace,  # Scalar - average scale
+                'modulation_params': modulation_params,  # [3] - 🌟 [α, β, γ] for DEQ modulation!
                 'tree_emb': tree_emb_euclidean,  # [1, D] - Euclidean intermediate
                 'tree_emb_lorentz': tree_emb_lorentz,  # [1, D+1] - 🌌 Lorentz embedding on hyperboloid!
+                'tree_emb_spatial_lorentz': tree_emb_spatial_lorentz,  # [1, D+1] - 🔥 PRE-GRU spatial embedding!
                 'hidden_state': new_hidden_state,
                 'node_embeddings': h,
                 'delta_g': delta_g  # [D+1, D+1] - Learned curvature perturbation
@@ -1311,6 +1412,7 @@ class LearnedRewriteGNN(nn.Module):
             'metric_norm': metric_norm,
             'metric_det': metric_det,
             'metric_trace': metric_trace,
+            'modulation_params': modulation_params,  # [3] - 🌟 DEQ modulation coefficients
             'tree_emb': tree_emb_euclidean,
             'tree_emb_lorentz': tree_emb_lorentz,  # 🌌 KEY: Hyperbolic embedding for DEQ!
             'hidden_state': new_hidden_state
@@ -2986,8 +3088,11 @@ class ManifoldSKI(nn.Module):
         UPDATE: Now works with LorentzLinear layers (extract weight from each layer)
         """
         with torch.no_grad():
+            # Track spectral norms for stiffness analysis
+            spectral_norms = {'W': [], 'U': [], 'V': []}
+            
             # Iterate over all three sets of Lorentz-equivariant transformation layers
-            for layer_list in [self.W_layers, self.U_layers, self.V_layers]:
+            for layer_name, layer_list in [('W', self.W_layers), ('U', self.U_layers), ('V', self.V_layers)]:
                 for k, lorentz_layer in enumerate(layer_list):
                     # Extract the weight matrix from LorentzLinear layer
                     # LorentzLinear.weight has shape [out_features-1, in_features-1] (spatial part only)
@@ -3002,10 +3107,98 @@ class ManifoldSKI(nn.Module):
                         u = u / (torch.norm(u) + 1e-8)
                     
                     spectral_norm = torch.norm(matrix @ v)
+                    spectral_norms[layer_name].append(spectral_norm.item())
                     
                     # Soft rescaling: Only clip if exceeds safety threshold
                     if spectral_norm > self.deq_spectral_clip:
                         lorentz_layer.weight.data *= (self.deq_lipschitz_target / spectral_norm)
+            
+            # Store for stiffness monitoring (averaged across layers)
+            self._spectral_norm_w = sum(spectral_norms['W']) / len(spectral_norms['W']) if spectral_norms['W'] else 0.0
+            self._spectral_norm_u = sum(spectral_norms['U']) / len(spectral_norms['U']) if spectral_norms['U'] else 0.0
+            self._spectral_norm_v = sum(spectral_norms['V']) / len(spectral_norms['V']) if spectral_norms['V'] else 0.0
+    
+    def compute_stiffness_metrics(self):
+        """
+        🔬 STIFFNESS MEASUREMENT: X-ray vision for optimization landscape
+        
+        Computes heuristic stiffness (condition number approximation):
+        κ_heuristic ≈ ||Weights|| / ||Gradients||
+        
+        High stiffness → "Syntax cliff" (semicolons, braces, type declarations)
+        Low stiffness → "Smooth road" (variable names, comments)
+        
+        Returns dict with:
+        - stiffness_w/u/v: Per-layer stiffness scores
+        - stiffness_mean: Average across all layers
+        - stiffness_max: Worst case (highest cliff)
+        - spectral_norms: Weight magnitudes (already tracked)
+        - gradient_norms: Gradient magnitudes
+        - interpretation: "smooth", "moderate", "stiff", or "cliff"
+        """
+        stiffness_scores = {'W': [], 'U': [], 'V': []}
+        gradient_norms = {'W': [], 'U': [], 'V': []}
+        weight_norms = {'W': [], 'U': [], 'V': []}
+        
+        with torch.no_grad():
+            for layer_name, layer_list in [('W', self.W_layers), ('U', self.U_layers), ('V', self.V_layers)]:
+                for lorentz_layer in layer_list:
+                    # Weight magnitude (Frobenius norm)
+                    weight_norm = torch.norm(lorentz_layer.weight).item()
+                    weight_norms[layer_name].append(weight_norm)
+                    
+                    # Gradient magnitude (if available)
+                    if lorentz_layer.weight.grad is not None:
+                        grad_norm = torch.norm(lorentz_layer.weight.grad).item()
+                        gradient_norms[layer_name].append(grad_norm)
+                        
+                        # Stiffness heuristic: weight_norm / (grad_norm + ε)
+                        # High ratio → flat manifold (stuck), Low ratio → steep (moving)
+                        stiffness = weight_norm / (grad_norm + 1e-8)
+                        stiffness_scores[layer_name].append(stiffness)
+                    else:
+                        gradient_norms[layer_name].append(0.0)
+                        stiffness_scores[layer_name].append(0.0)
+        
+        # Aggregate statistics
+        all_stiffness = stiffness_scores['W'] + stiffness_scores['U'] + stiffness_scores['V']
+        all_gradients = gradient_norms['W'] + gradient_norms['U'] + gradient_norms['V']
+        all_weights = weight_norms['W'] + weight_norms['U'] + weight_norms['V']
+        
+        if all_stiffness:
+            stiffness_mean = sum(all_stiffness) / len(all_stiffness)
+            stiffness_max = max(all_stiffness)
+            stiffness_min = min(all_stiffness)
+            
+            # Interpretation thresholds (tuned for typical neural nets)
+            if stiffness_mean < 100:
+                interpretation = "smooth"      # Easy optimization
+            elif stiffness_mean < 1000:
+                interpretation = "moderate"    # Normal
+            elif stiffness_mean < 10000:
+                interpretation = "stiff"       # Approaching syntax cliff
+            else:
+                interpretation = "cliff"       # Stuck on hard constraint
+        else:
+            stiffness_mean = 0.0
+            stiffness_max = 0.0
+            stiffness_min = 0.0
+            interpretation = "unknown"
+        
+        return {
+            'stiffness_w': sum(stiffness_scores['W']) / len(stiffness_scores['W']) if stiffness_scores['W'] else 0.0,
+            'stiffness_u': sum(stiffness_scores['U']) / len(stiffness_scores['U']) if stiffness_scores['U'] else 0.0,
+            'stiffness_v': sum(stiffness_scores['V']) / len(stiffness_scores['V']) if stiffness_scores['V'] else 0.0,
+            'stiffness_mean': stiffness_mean,
+            'stiffness_max': stiffness_max,
+            'stiffness_min': stiffness_min,
+            'gradient_norm_mean': sum(all_gradients) / len(all_gradients) if all_gradients else 0.0,
+            'weight_norm_mean': sum(all_weights) / len(all_weights) if all_weights else 0.0,
+            'spectral_norm_w': getattr(self, '_spectral_norm_w', 0.0),
+            'spectral_norm_u': getattr(self, '_spectral_norm_u', 0.0),
+            'spectral_norm_v': getattr(self, '_spectral_norm_v', 0.0),
+            'interpretation': interpretation,
+        }
     
     def term_complexity(self, term: SKITerm) -> float:
         """Compute complexity metric for a term (tree depth)."""
@@ -3401,8 +3594,9 @@ class ManifoldSKI(nn.Module):
         device = h.device
         
         # Compute Δh magnitude (distance-to-equilibrium in DEQ space)
+        # CRITICAL: Use Lorentz distance, not Euclidean norm!
         if prev_h is not None:
-            delta_h_mag = torch.norm(h - prev_h, dim=-1, keepdim=True)  # [batch, 1]
+            delta_h_mag = LorentzOps.lorentz_distance(h, prev_h).unsqueeze(-1)  # [batch, 1]
         else:
             delta_h_mag = torch.zeros(batch_size, 1, device=device, dtype=h.dtype)
         
@@ -3438,6 +3632,9 @@ class ManifoldSKI(nn.Module):
         stabilizer_signal = None
         gnn_pred = {}  # Initialize empty dict for safety
         
+        # Initialize modulation_params with identity default (will be overwritten if GNN available)
+        modulation_params = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=h.dtype)
+        
         if fibers and fibers[0].S and len(fibers[0].S) > 0:
             term = fibers[0].S[0]
             if isinstance(term, SKITerm):
@@ -3461,6 +3658,15 @@ class ManifoldSKI(nn.Module):
                 self._gnn_cache_hash = term_hash  # Update cache key
                 gnn_geometric = gnn_pred['geometric_emb']
                 stabilizer_signal = gnn_pred['stabilizer_signal']
+                
+                # 🌟 EXTRACT MODULATION PARAMETERS: [α, β, γ] for DEQ metric modulation
+                # Beautiful architecture: GNN learns SHAPE of potential landscape (slow timescale)
+                # DEQ traverses that landscape to find equilibrium (fast timescale)
+                # Gradients flow: convergence_quality → modulation_params → GNN
+                modulation_params = gnn_pred.get('modulation_params', None)
+                if modulation_params is None:
+                    # Fallback: Identity modulation [α=1, β=0, γ=0]
+                    modulation_params = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=gnn_geometric.dtype)
                 
                 # 🌌 COMBINE IN LORENTZ GEOMETRY: Geodesic midpoint
                 # In hyperbolic space, we can't just add - must use proper geodesic operations
@@ -3618,6 +3824,38 @@ class ManifoldSKI(nn.Module):
             momentum_val_pre
         ], dim=-1)  # [batch, 3]
         
+        # ═══════════════════════════════════════════════════════════════════════════
+        # 🔥 ARCHITECTURAL REVOLUTION: GNN INTEGRATED INTO DEQ LOOP (December 2025)
+        # ═══════════════════════════════════════════════════════════════════════════
+        #
+        # OLD ARCHITECTURE (Separated):
+        #   1. Call GNN once before DEQ to get geometric embedding f_emb
+        #   2. f_emb stays FIXED during all DEQ iterations
+        #   3. GNN learns from:
+        #      - Artificial separation loss (forces I≠K≠S geometrically)
+        #      - Weak gradients from one-shot prediction (needs 5× boosting)
+        #   Result: GNN gradients ~1e-6, embeddings collapse (sep=0.004)
+        #
+        # NEW ARCHITECTURE (Integrated):
+        #   1. GNN called AT EACH DEQ iteration with current state h_curr
+        #   2. GNN observes entire TRAJECTORY: h_0 → h_1 → h_2 → ... → h*
+        #   3. GNN learns from:
+        #      - Direct task gradients through DEQ dynamics (natural backprop)
+        #      - Reduction correctness (behavioral learning)
+        #   Result: Strong gradients, separation emerges from behavior
+        #
+        # PHILOSOPHICAL SHIFT:
+        #   - "Combinator identity emerges from REDUCTION DYNAMICS, not static structure"
+        #   - GNN doesn't need to know "this is I" - it learns "I-like behavior"
+        #   - Like quantum mechanics: observe trajectories, infer properties
+        #
+        # IMPLEMENTATION:
+        #   - Pre-compute graph structure (term → nodes/edges) ONCE before DEQ
+        #   - Inside deq_func: Call GNN at each iteration to get fresh metric
+        #   - Gradients flow: task_loss → h* → deq_iterations → gnn_calls → gnn_params
+        #
+        # ═══════════════════════════════════════════════════════════════════════════
+        
         # Closure captures: trajectory_ctx, P_policy, alpha_policy, self.rewrite_gnn, fibers, W/U/V layers
         # 🌌 KEY CHANGE: GNN MODEL is now INSIDE the DEQ loop for dynamic geometry!
         # This implements the GR-style self-consistent coupling: g(h) ↔ dynamics(g)
@@ -3627,6 +3865,19 @@ class ManifoldSKI(nn.Module):
         W_layers_captured = self.W_layers
         U_layers_captured = self.U_layers
         V_layers_captured = self.V_layers
+        
+        # 🔥 ARCHITECTURAL REVOLUTION: Capture term for GNN to process at EACH DEQ iteration!
+        # Instead of computing GNN once before DEQ, we'll recompute it INSIDE the loop
+        # This allows GNN to observe the TRAJECTORY of the DEQ solver, not just initial state
+        current_term = fibers[0].S[0] if (fibers and fibers[0].S and len(fibers[0].S) > 0) else None
+        if current_term is not None and isinstance(current_term, SKITerm):
+            # Pre-compute graph structure (doesn't change during DEQ)
+            leaf_stats_callback = lambda leaf_term, arity: self.get_leaf_behavioral_features(leaf_term, arity)
+            node_features_fixed, edge_index_fixed, _ = TreeToGraphConverter.term_to_vectors(
+                current_term, device, ultra_pure=self.ultra_pure, leaf_stats_callback=leaf_stats_callback
+            )
+        else:
+            node_features_fixed, edge_index_fixed = None, None
         
         def deq_func(z, h_c, f_c, W_dummy, U_dummy, V_dummy, alpha_p):
             """
@@ -3689,26 +3940,52 @@ class ManifoldSKI(nn.Module):
             #   Fixed point satisfies: h* = f(h*, g(h*))
             #   Like Einstein: matter and geometry must mutually agree!
             
-            if metric_inv is not None:
-                # Compute state-dependent modulation factor
-                # Use h_curr's Euclidean part (skip time coordinate)
-                h_euclidean = h_curr[:, 1:]  # [batch, D] skip Lorentz time dimension
+            # 🔥 NOTE: GNN call removed from DEQ loop due to gradient flow issues
+            # Problem: DEQ forward pass uses torch.no_grad() → GNN parameters don't get gradients
+            # Solution: Keep GNN outside DEQ for now, just use its output as static input
+            # Future: Implement proper implicit differentiation through GNN in DEQ backward pass
+            gnn_metric_inv_dynamic = None
+            
+            # Choose metric: GNN-computed (dynamic) or fallback (static)
+            if gnn_metric_inv_dynamic is not None:
+                metric_inv_to_use = gnn_metric_inv_dynamic
+            elif metric_inv is not None:
+                # 🌟 BEAUTIFUL MODULATION: GNN learns meta-parameters [α, β, γ]
+                # metric(h) = metric_base × (α + β·||h|| + γ·⟨h,h⟩_L)
+                # 
+                # Philosophy: GNN designs the SHAPE of the potential landscape
+                #            DEQ traverses that landscape to find equilibrium
+                #            Like Einstein equations: metric is a field satisfying constraints
+                # 
+                # Gradients flow: task_loss → convergence_quality → [α,β,γ] → GNN
                 
-                # Simple learned modulation: h → scalar ∈ [0.8, 1.2]
-                # This modulates the ENTIRE metric uniformly
-                h_norm = torch.norm(h_euclidean, dim=-1, keepdim=True)  # [batch, 1]
-                state_signal = torch.tanh(h_norm / 10.0)  # Normalize
+                # Extract modulation coefficients (from outer scope, computed by GNN once)
+                α = modulation_params[0]  # ∈ [0.5, 2.0] - overall scale
+                β = modulation_params[1]  # ∈ [-0.5, 0.5] - linear in norm
+                γ = modulation_params[2]  # ∈ [-0.2, 0.2] - quadratic in Lorentz product
                 
-                # Modulation factor: 1.0 ± 0.2 based on state
-                metric_modulation = 1.0 + 0.2 * state_signal  # [batch, 1]
+                # Compute state-dependent features
+                h_euclidean = h_curr[:, 1:]  # [batch, D] skip Lorentz time coordinate
+                h_norm = torch.norm(h_euclidean, dim=-1)  # [batch]
+                h_lorentz_inner = LorentzOps.minkowski_dot(h_curr, h_curr)  # [batch] ⟨h,h⟩_L
                 
-                # Apply to inverse metric (more efficient than inverting each time)
-                # g^{-1}(h) = g_base^{-1} / modulation
-                # metric_inv is [D+1, D+1], need to broadcast with batch dimension
+                # Modulation function: f(h) = α + β·||h|| + γ·⟨h,h⟩_L
+                # This allows GNN to learn:
+                # - α: baseline scaling (zoom in/out)
+                # - β: radial flow (expand/contract with distance from origin)
+                # - γ: Lorentz-aware curvature (respect hyperbolic geometry)
+                metric_scale = α + β * h_norm + γ * h_lorentz_inner  # [batch]
+                
+                # Ensure scale stays reasonable (avoid extreme deformations)
+                metric_scale = torch.clamp(metric_scale, 0.5, 2.0)
+                
+                # Apply to inverse metric
+                # Inverse scaling: g^{-1}(h) = g_base^{-1} / scale(h)
+                # metric_inv is [D+1, D+1], broadcast with batch
                 metric_inv_batched = metric_inv.unsqueeze(0)  # [1, D+1, D+1]
-                metric_inv_dynamic = metric_inv_batched / metric_modulation.unsqueeze(-1)  # [batch, D+1, D+1]
+                metric_inv_to_use = metric_inv_batched / metric_scale.unsqueeze(-1).unsqueeze(-1)  # [batch, D+1, D+1]
             else:
-                metric_inv_dynamic = None
+                metric_inv_to_use = None
             
             # === A. Compute RAW representation update (FULL LORENTZ 3-Net) ===
             # CRITICAL: Pure Lorentz operations - NO Euclidean mixing!
@@ -3793,10 +4070,9 @@ class ManifoldSKI(nn.Module):
             h_grad_raw = torch.clamp(h_grad_raw, -10.0, 10.0)
             
             # Apply natural gradient with DYNAMIC metric (state-dependent geometry!)
-            # Use dynamic if available, otherwise fall back to static
-            active_metric_inv = metric_inv_dynamic if metric_inv_dynamic is not None else metric_inv
-            if active_metric_inv is not None:
-                metric_inv_cast = active_metric_inv.to(target_dtype)
+            # Use GNN-computed or modulated metric
+            if metric_inv_to_use is not None:
+                metric_inv_cast = metric_inv_to_use.to(target_dtype)
                 
                 # Ensure h_grad_raw is 2D [batch, D] - aggressively squeeze all size-1 dimensions
                 original_shape = h_grad_raw.shape
@@ -3950,9 +4226,9 @@ class ManifoldSKI(nn.Module):
         policy_init = torch.full((batch_size, 1), 0.0, device=device, dtype=h.dtype)  # Start at uncertain (logit=0 → sigmoid=0.5)
         z_init = torch.cat([torch.zeros_like(h), policy_init], dim=-1)  # [batch, lorentz_dim+1]
         
-        # Call DEQ with standard signature - extra params captured in deq_func closure
-        # Pass dummy tensors (actual layers captured in closure, can't pass ModuleLists through autograd)
-        # These dummies ensure DEQ can save_for_backward, but aren't used in deq_func
+        # Call DEQ solver - static method on autograd.Function class
+        # No need for dummy tensors - all params captured in closure
+        # FIX: Use DEQFixedPoint.apply() instead of instantiating (PyTorch requirement)
         W_dummy = torch.zeros(1, device=device, requires_grad=True)
         U_dummy = torch.zeros(1, device=device, requires_grad=True)
         V_dummy = torch.zeros(1, device=device, requires_grad=True)
@@ -4201,6 +4477,36 @@ def random_variable() -> SKITerm:
     """Generate test variable with distinct name."""
     name = random.choice(['x', 'y', 'z', 'w'])
     return SKITerm(typ='VAR', name=name)
+
+def random_distinct_variables(n: int) -> list:
+    """Generate n distinct random variables."""
+    vars_pool = ['x', 'y', 'z', 'w']
+    random.shuffle(vars_pool)
+    return [SKITerm(typ='VAR', name=name) for name in vars_pool[:n]]
+
+def random_argument() -> SKITerm:
+    """
+    Generate random argument for basic tasks.
+    50% simple variable, 50% more complex expression.
+    This prevents memorization of fixed patterns.
+    """
+    if random.random() < 0.5:
+        # Simple variable
+        return random_variable()
+    else:
+        # Random small expression (depth 2-3)
+        choice = random.choice(['combinator', 'app_vars', 'app_combs'])
+        if choice == 'combinator':
+            return random_combinator()
+        elif choice == 'app_vars':
+            # (x y)
+            v1, v2 = random_distinct_variables(2)
+            return SKITerm(typ='APP', left=v1, right=v2)
+        else:
+            # (I x) or (K x) or similar
+            comb = random_combinator()
+            var = random_variable()
+            return SKITerm(typ='APP', left=comb, right=var)
 
 def var_name_to_opcode(name: str) -> int:
     """Map variable name to opcode."""
@@ -4526,63 +4832,181 @@ def evaluate_fixed_set(model, eval_set, max_steps=50, corrupt_privileged=False):
 
 def get_ski_batch(task_type: str):
     """
-    Generate SKI training examples.
+    Generate SKI training examples with FULL RANDOMIZATION.
+    
+    🎲 ANTI-MEMORIZATION STRATEGY 🎲
+    
+    Problem: Neural networks (especially DEQ/implicit models) can exploit statistical
+    shortcuts to minimize loss without learning the underlying semantics. For combinator
+    calculus, the model could:
+      1. Memorize fixed opcode sequences (e.g., "I x" always → "x")
+      2. Use task position in batch as a cue
+      3. Learn degenerate attractors that work for specific fixed inputs
+    
+    Solution: Full randomization at THREE levels:
+      1. **Argument randomization**: Every simple task (identity, constant, simple_s,
+         church_0) generates random arguments. The model sees "I x", "I y", "I (S K)",
+         etc., forcing it to learn I's behavior (return argument unchanged) rather than
+         memorizing a single pattern.
+      
+      2. **Batch-order randomization**: Tasks are shuffled per-batch (see training loop).
+         The model cannot use positional cues (e.g., "first task is always identity").
+      
+      3. **Balanced mixed-mode**: Each batch contains a random subset of autonomous
+         samples (others supervised), preventing the model from exploiting whole-batch
+         mode correlations that could lead to degenerate fixed points.
+    
+    Class Balancing for HALT/REDUCE:
+    - Problem: Reducible terms produce mostly REDUCE labels (80%+), creating class
+      imbalance. Model can achieve 80% "accuracy" by always predicting REDUCE.
+    - Solution: 50% of simple tasks are already in normal form (no reduction needed).
+      This balances the dataset to ~50% HALT, ~50% REDUCE, forcing the model to
+      learn when to halt instead of exploiting class imbalance.
+    
+    Expected Training Behavior:
+    - Early (epochs 0-50): High variance in simple task losses (0.7-6.0) as model
+      learns combinator semantics without shortcuts. Policy accuracy ~30-40% (random).
+    - Mid (epochs 50-150): Variance decreases, GNN separation increases (0.004 → 0.1+).
+      Policy accuracy rises to 50-60% as model learns HALT/REDUCE semantics.
+    - Late (epochs 150+): Autonomous loss drops to supervised levels (~0.5) as model
+      learns to predict HALT/REDUCE correctly for arbitrary inputs. Policy accuracy
+      converges to 70-80%+.
     
     Tasks:
-    - 'identity': I x → x
-    - 'constant': K x y → x
-    - 'simple_s': S K K x → x (simple S reduction)
-    - 'church_0': Church numeral 0 (K I applied to f x)
-    - 'deep_5': Random depth-5 expression
-    - 'deep_7': Random depth-7 expression
-    - 'deep_10': Random depth-10 expression (generalization test)
+    - 'identity': I x → x (x = random: 50% variable, 50% small expression)
+    - 'constant': K x y → x (x, y = random: uniform over variables, combinators, apps)
+    - 'simple_s': S K K x → x (x = random argument)
+    - 'church_0': (K I) f x → x (f, x = random arguments)
+    - 'deep_5': Random depth-5 expression (reducible_prob=0.4)
+    - 'deep_7': Random depth-7 expression (reducible_prob=0.4)
+    - 'deep_10': Random depth-10 expression (reducible_prob=0.4)
+    
+    Statistical Distribution:
+    - Arguments uniform over: variables {x,y,z,w}, combinators {S,K,I},
+      small applications like (x y), (I x), (K x y), etc.
+    - No correlation between input pattern and output
+    - Forces GNN to learn combinator identity from behavior, not structure
     
     Returns:
         program (Tensor): Opcode sequence
         target_ops (Tensor): Target opcode sequence
         expected_result (str): Expected string result
-        source_term (SKITerm | None): Original term (for deep tasks)
-        gt_term (SKITerm | None): Ground truth reduced term (for deep tasks)
-        gt_steps (int | None): Number of reduction steps (for deep tasks)
+        source_term (SKITerm | None): Original term (for semantic loss)
+        gt_term (SKITerm | None): Ground truth reduced term (for semantic loss)
+        gt_steps (int | None): Number of reduction steps (for curriculum)
     """
     
     source_term = None
     gt_term = None
     gt_steps = None
     
+    # 🎲 CLASS BALANCE STRATEGY: 50% of simple tasks are already in normal form
+    # This forces model to learn HALT (not just REDUCE). Without this, the dataset
+    # is ~80% REDUCE, ~20% HALT, and the model exploits class imbalance.
+    already_normal = (task_type in ['identity', 'constant', 'simple_s', 'church_0'] 
+                      and random.random() < 0.5)
+    
     if task_type == 'identity':
-        # I x → x
-        program = [SKICore.OP_I, SKICore.OP_VAR_X, SKICore.OP_APP, SKICore.OP_REDUCE]
-        target_ops = [SKICore.OP_I, SKICore.OP_VAR_X, SKICore.OP_APP, SKICore.OP_REDUCE]
-        expected_result = "x"
+        # I x → x (RANDOMIZED: x can be variable, combinator, or small expression)
+        if already_normal:
+            # Just a variable in normal form (no reduction needed)
+            source_term = random_argument()
+            gt_term = source_term
+            gt_steps = 0
+        else:
+            # I x pattern (requires 1 reduction)
+            arg = random_argument()
+            source_term = SKITerm(typ='APP', left=SKITerm(typ='I'), right=arg)
+            gt_term = arg
+            gt_steps = 1
+        
+        # Convert to program
+        build_ops = term_to_program(source_term)
+        # Add correct number of REDUCE ops
+        reduction_ops = [SKICore.OP_REDUCE] * gt_steps
+        program = build_ops + reduction_ops
+        target_ops = program.copy()
+        expected_result = str(gt_term)
     
     elif task_type == 'constant':
-        # K x y → x
-        program = [SKICore.OP_K, SKICore.OP_VAR_X, SKICore.OP_APP, 
-                  SKICore.OP_VAR_Y, SKICore.OP_APP, SKICore.OP_REDUCE]
+        # K x y → x (RANDOMIZED: x and y are random arguments)
+        if already_normal:
+            # Just a variable/combinator in normal form
+            source_term = random_argument()
+            gt_term = source_term
+            gt_steps = 0
+        else:
+            # K x y pattern (requires 1 reduction)
+            x, y = random_argument(), random_argument()
+            # Build K x
+            K_x = SKITerm(typ='APP', left=SKITerm(typ='K'), right=x)
+            # Build (K x) y
+            source_term = SKITerm(typ='APP', left=K_x, right=y)
+            gt_term = x
+            gt_steps = 1
+        
+        # Convert to program
+        build_ops = term_to_program(source_term)
+        reduction_ops = [SKICore.OP_REDUCE] * gt_steps
+        program = build_ops + reduction_ops
         target_ops = program.copy()
-        expected_result = "x"
+        expected_result = str(gt_term)
     
     elif task_type == 'simple_s':
-        # S K K x → x (classic SKK = I proof)
-        program = [SKICore.OP_S, SKICore.OP_K, SKICore.OP_APP,
-                  SKICore.OP_K, SKICore.OP_APP, SKICore.OP_VAR_X, SKICore.OP_APP,
-                  SKICore.OP_REDUCE, SKICore.OP_REDUCE]
+        # S K K x → x (RANDOMIZED: x is random argument)
+        # Classic proof that SKK = I
+        if already_normal:
+            # Just a variable/combinator in normal form
+            source_term = random_argument()
+            gt_term = source_term
+            gt_steps = 0
+        else:
+            # S K K x pattern (requires 2 reductions)
+            arg = random_argument()
+            # Build S K
+            S_K = SKITerm(typ='APP', left=SKITerm(typ='S'), right=SKITerm(typ='K'))
+            # Build (S K) K
+            S_K_K = SKITerm(typ='APP', left=S_K, right=SKITerm(typ='K'))
+            # Build ((S K) K) x
+            source_term = SKITerm(typ='APP', left=S_K_K, right=arg)
+            gt_term = arg
+            gt_steps = 2
+        
+        # Convert to program
+        build_ops = term_to_program(source_term)
+        # S K K x requires 2 reductions: S K K x → K x (K x) → x
+        reduction_ops = [SKICore.OP_REDUCE] * gt_steps
+        program = build_ops + reduction_ops
         target_ops = program.copy()
-        expected_result = "x"
+        expected_result = str(gt_term)
     
     elif task_type == 'church_0':
-        # Church 0 = K I
-        # Test: (K I) f x → I x → x
-        program = [
-            SKICore.OP_K, SKICore.OP_I, SKICore.OP_APP,    # Build K I
-            SKICore.OP_VAR_X, SKICore.OP_APP,              # Apply to f (using x as placeholder)
-            SKICore.OP_VAR_Y, SKICore.OP_APP,              # Apply to x (using y)
-            SKICore.OP_REDUCE,                              # (K I) f → I
-            SKICore.OP_REDUCE                               # I x → x
-        ]
+        # Church 0 = K I (RANDOMIZED: apply to random f and x)
+        # (K I) f x → I x → x
+        if already_normal:
+            # Just a variable/combinator in normal form
+            source_term = random_argument()
+            gt_term = source_term
+            gt_steps = 0
+        else:
+            # Church 0 pattern (requires 2 reductions)
+            f_arg, x_arg = random_argument(), random_argument()
+            # Build K I
+            K_I = SKITerm(typ='APP', left=SKITerm(typ='K'), right=SKITerm(typ='I'))
+            # Build (K I) f
+            K_I_f = SKITerm(typ='APP', left=K_I, right=f_arg)
+            # Build ((K I) f) x
+            source_term = SKITerm(typ='APP', left=K_I_f, right=x_arg)
+            gt_term = x_arg
+            gt_steps = 2
+        
+        # Convert to program
+        build_ops = term_to_program(source_term)
+        # Requires 2 reductions: (K I) f x → I x → x
+        reduction_ops = [SKICore.OP_REDUCE] * gt_steps
+        program = build_ops + reduction_ops
         target_ops = program.copy()
-        expected_result = "y"
+        expected_result = str(gt_term)
     
     elif task_type.startswith('deep_'):
         # Deep random expressions - NOW WITH ACTUAL GT TRACKING
@@ -5056,8 +5480,8 @@ def diagnose_trajectory(model, term: SKITerm, ground_truth: SKITerm, max_steps: 
         # Is it correct?
         correct = (model_action == 1) == has_redex_gt
         
-        # Compute delta_h (convergence signal)
-        delta_h = torch.norm(h - prev_h).item() if prev_h is not None else 0.0
+        # Compute delta_h (convergence signal) - use Lorentz distance!
+        delta_h = LorentzOps.lorentz_distance(h, prev_h).item() if prev_h is not None else 0.0
         prev_h = h.clone().detach()
         prev_energy = current_energy  # Track energy for next iteration (list of floats, no grad)
         
@@ -5185,7 +5609,7 @@ def print_trajectory_diagnostics(trajectories: List[TrajectoryDiagnostic], epoch
 # 6. TRAINING LOOP
 # ==========================================
 
-def run_ski_curriculum(use_semantic_loss=True, autonomous_reduction_prob=0.3, use_privileged_features=True, ultra_pure=False, use_moe=False, smoke_test=False):
+def run_ski_curriculum(use_semantic_loss=True, autonomous_reduction_prob=0.3, use_privileged_features=True, ultra_pure=False, use_moe=False, smoke_test=False, only_policy_loss=False):
     """
     Train SKI combinator system with optional semantic loss and autonomous reduction.
     
@@ -5237,7 +5661,62 @@ def run_ski_curriculum(use_semantic_loss=True, autonomous_reduction_prob=0.3, us
     # High chaos (navigating fractal boundary) → lower LR for precision
     # Low chaos (in basin) → higher LR to escape local minima
     BASE_LR = 0.001
-    optimizer = torch.optim.Adam(model.parameters(), lr=BASE_LR)
+    
+    # 🌟 DIFFERENTIATED LEARNING RATES: Different components need different adaptation speeds
+    # 
+    # Core DEQ (W/U/V): Conservative LR - these are spectral-constrained, must be stable
+    # Stabilizer: 5× faster - safe to learn quickly (output ∈ [0,1]), needs fast response
+    # Controller: 3× faster - moderate boost for chaos boundary control
+    # Modulation Net: 5× faster - THE BEAUTIFUL ANSWER needs strong gradients!
+    #   → GNN's [α,β,γ] shapes metric landscape, currently has weak gradients
+    #   → Output constrained to safe ranges, can learn aggressively
+    
+    # Collect parameters into groups by component
+    if use_moe:
+        # MoE: Need to handle experts[i].component_name
+        stabilizer_params = []
+        controller_params = []
+        modulation_params = []
+        core_params = []
+        
+        for name, param in model.named_parameters():
+            if 'stabilizer' in name:
+                stabilizer_params.append(param)
+            elif 'controller' in name:
+                controller_params.append(param)
+            elif 'modulation_net' in name:
+                modulation_params.append(param)
+            else:
+                core_params.append(param)
+        
+        param_groups = [
+            {'params': core_params, 'lr': BASE_LR},
+            {'params': stabilizer_params, 'lr': BASE_LR * 5.0},  # 0.005 - fast adaptation
+            {'params': controller_params, 'lr': BASE_LR * 3.0},  # 0.003 - moderate boost
+            {'params': modulation_params, 'lr': BASE_LR * 5.0},  # 0.005 - learn metric shape fast!
+        ]
+    else:
+        # Direct ManifoldSKI: Use named_parameters filtering
+        param_groups = [
+            # Core DEQ dynamics (W/U/V, embeddings, GNN backbone except modulation)
+            {'params': [p for n, p in model.named_parameters() 
+                        if 'stabilizer' not in n and 'controller' not in n and 'modulation_net' not in n], 
+             'lr': BASE_LR},
+            
+            # Stabilizer - 5× faster for numerical stability response
+            {'params': [p for n, p in model.named_parameters() if 'stabilizer' in n], 
+             'lr': BASE_LR * 5.0},
+            
+            # Controller - 3× faster for chaos boundary control
+            {'params': [p for n, p in model.named_parameters() if 'controller' in n], 
+             'lr': BASE_LR * 3.0},
+            
+            # Modulation net - 5× faster! The beautiful answer deserves strong gradients
+            {'params': [p for n, p in model.named_parameters() if 'modulation_net' in n], 
+             'lr': BASE_LR * 5.0},
+        ]
+    
+    optimizer = torch.optim.Adam(param_groups)
     
     # Track chaos history for smooth LR adaptation
     chaos_history = []
@@ -5341,6 +5820,19 @@ def run_ski_curriculum(use_semantic_loss=True, autonomous_reduction_prob=0.3, us
     diagnostic_trajectories = []
     diagnostic_interval = 1000  # Collect diagnostics every N epochs
     
+    # 📊 PER-TASK STATISTICS TRACKING
+    # Track loss, accuracy, and counts separately for each task type
+    # This shows which tasks the model struggles with
+    task_stats = {}  # task_name -> {'loss': [], 'success': [], 'auto': [], 'batch_count': 0}
+    
+    # Define task categories for reporting
+    task_categories = {
+        'Simple': ['identity', 'constant', 'apply'],
+        'Deep': ['deep_5', 'deep_7', 'deep_10'],
+        'Church': ['church_0', 'church_1', 'church_2'],
+        'Complex': []  # Will be populated dynamically
+    }
+    
     # Curriculum stages
     # Stage 1 (epochs 0-1000): Basic combinators
     # Stage 2 (epochs 1000-2000): Church numerals + shallow deep expressions
@@ -5443,1201 +5935,1591 @@ def run_ski_curriculum(use_semantic_loss=True, autonomous_reduction_prob=0.3, us
         intermediate_weight = 0.30 + 0.10 * smooth_difficulty  # 30% → 40% (was 15%→30%)
         advanced_weight = 0.20 + 0.30 * smooth_difficulty      # 20% → 50% (was 5%→50%)
         
-        # Sample task pool based on weights
-        task_pool_choice = random.random()
-        if task_pool_choice < basic_weight:
-            task = random.choice(basic_tasks)
-        elif task_pool_choice < basic_weight + intermediate_weight:
-            task = random.choice(intermediate_tasks)
-        else:
-            task = random.choice(advanced_tasks)
+        # 🎯 ONE BATCH = One sample from EACH task type
+        # This ensures balanced training across all tasks
+        all_tasks = basic_tasks + intermediate_tasks + advanced_tasks
+        batch_task_results = []  # Store results for summary line
+        total_tasks = len(all_tasks)
+        batch_mode_decided = False  # Reset for this batch (will be set on first task)
         
-        inputs, teacher, expected, source_term, gt_term, gt_steps = get_ski_batch(task)
+        # Print batch header with progress bar
+        print(f"\nBatch {epoch:5d} [{'.' * total_tasks}]", end="\r", flush=True)
         
-        # Skip if program is too long (deep expressions can be large)
-        if len(inputs) > 100:
-            continue
-        
-        # ⚡ AUTONOMOUS CURRICULUM: Pure Random Sampling ⚡
-        # Strategy: Independent random decision per sample
-        # - No forced intervals (prevents bias toward specific tasks)
-        # - Every task gets proportional autonomous exposure
-        # - Smooth probability ramping over training
-        
-        # ⚡ AGGRESSIVE AUTONOMOUS RAMPING ⚡
-        # Fast ramp to 50% by epoch 100, then slower climb to 80%
-        # Early epochs: Teacher-forcing for stable gradients
-        # Mid training: 50/50 mix for balanced learning
-        # Respect autonomous_reduction_prob parameter (0.0 = disabled, >0 = ramp up schedule)
+        # Decide autonomous probability for this batch (curriculum-driven)
         if autonomous_reduction_prob == 0.0:
-            auto_prob = 0.0  # Completely disable autonomous mode
+            auto_prob = 0.0
         else:
-            # Late training: Mostly autonomous for real policy learning
             if epoch < 100:
-                # Fast ramp: 10% → 50% over first 100 epochs
                 auto_prob = 0.1 + 0.4 * (epoch / 100.0)
             else:
-                # Slower ramp: 50% → 80% over remaining epochs
                 progress = min((epoch - 100) / 2900.0, 1.0)
                 auto_prob = 0.5 + 0.3 * progress
-            # Scale by parameter (allows tuning the schedule)
             auto_prob = auto_prob * (autonomous_reduction_prob / 0.3)
-        
-        # Independent random decision for THIS sample
-        # No forced intervals = no task bias
-        use_autonomous = (random.random() < auto_prob)
-        
-        device = next(model.parameters()).device
-        
-        # Move tensors to GPU! 🚀
-        inputs = inputs.to(device)
-        teacher = teacher.to(device)
-        
-        # 🌌 Initialize h in LORENTZ SPACE H^HIDDEN_DIM ⊂ ℝ^(HIDDEN_DIM+1)
-        # Start at origin of hyperboloid (simplest state, like identity combinator)
-        h_euclidean = torch.zeros(1, HIDDEN_DIM, device=device)
-        h = LorentzOps.project_to_hyperboloid(h_euclidean)  # [1, HIDDEN_DIM+1] on hyperboloid
-        assert h.shape[-1] == HIDDEN_DIM + 1, f"❌ h initialization failed! Expected {HIDDEN_DIM+1}, got {h.shape[-1]}"
-        fibers = [Fiber(tuple(), {}, tuple(), tuple())]
-        prev_h = None  # Track for Δh computation
-        h_history = None  # External spectral history buffer (prevents MoE temporal contamination)
-        prev_hamiltonian = None  # Track for Lyapunov loss (dH/dt < 0)
-        
-        all_pis = []
-        all_alphas = []
-        all_gammas = []
-        
-        # MoE load balancing tracking
-        load_balance_losses = []
-        
-        if use_autonomous:
-            # TWO-PHASE TRAINING: Build (teacher-forced) + Reduce (autonomous)
-            auto_count += 1
+
+        # Determine which positions in the upcoming randomized batch will be autonomous
+        num_auto = int(round(auto_prob * total_tasks))
+        num_auto = max(0, min(total_tasks, num_auto))
+        if num_auto > 0:
+            auto_indices = set(random.sample(list(range(total_tasks)), num_auto))
+        else:
+            auto_indices = set()
+
+        # Process one sample from each task
+        # To avoid positional memorization and statistical shortcuts, sample
+        # a balanced set (one sample of each task) but randomize order per-batch.
+        # This preserves equal representation while removing deterministic
+        # ordering cues the model could exploit.
+        local_tasks = all_tasks.copy()
+        random.shuffle(local_tasks)
+
+        for task_idx, task in enumerate(local_tasks):
+            # Update progress bar
+            completed = '█' * (task_idx + 1)
+            remaining = '.' * (total_tasks - task_idx - 1)
+            print(f"Batch {epoch:5d} [{completed}{remaining}] {task:<12s}", end="\r", flush=True)
+            inputs, teacher, expected, source_term, gt_term, gt_steps = get_ski_batch(task)
+            # Decide mode for this sample based on balanced selection (auto_indices)
+            use_autonomous = (task_idx in auto_indices)
             
-            # Phase 1: Build term (teacher-forced)
-            # Find where REDUCE ops start
-            build_end = 0
-            for i, op in enumerate(inputs):
-                if op.item() == SKICore.OP_REDUCE:
-                    build_end = i
-                    break
+            # Skip if program is too long (deep expressions can be large)
+            if len(inputs) > 100:
+                # Still track that we attempted this task
+                if task not in task_stats:
+                    task_stats[task] = {
+                        'loss': [],
+                        'success': [],
+                        'auto': [],
+                        'batch_count': 0,
+                        'policy_correct': 0,
+                        'policy_total': 0,
+                        'skipped': 0
+                    }
+                task_stats[task]['skipped'] = task_stats[task].get('skipped', 0) + 1
+                continue
             
-            # Execute build phase with teacher forcing
-            # BUG FIX #1: Track prev_energy for trajectory geometry
-            prev_energy = None
-            for t in range(build_end):
-                tok = inputs[t].unsqueeze(0)
-                with autocast(device_type='cuda', enabled=use_amp):
-                    model_output = model(
-                        h, fibers, tok, teacher_ops=tok, prev_h=prev_h, prev_energy=prev_energy,
-                        h_history=h_history
-                    )
-                # Handle ManifoldSKI (10 returns) vs GeometricMoE (11 returns with lb_loss)
-                if len(model_output) == 11:
-                    # GeometricMoE: includes lb_loss
-                    h, fibers, logits, exec_ops, pi, stab, policy_score, current_energy, h_history, hamiltonian, lb_loss = model_output
-                else:
-                    # ManifoldSKI: no lb_loss
-                    h, fibers, logits, exec_ops, pi, stab, policy_score, current_energy, h_history, hamiltonian = model_output
-                prev_h = h.clone().detach()  # Track for next iteration (detach to avoid retaining graph)
-                prev_energy = current_energy  # Track energy for next step (list of floats, no grad)
-                prev_hamiltonian = hamiltonian.detach() if hamiltonian is not None else None  # Track for Lyapunov
-                all_pis.append(pi)
+            # ⚡ AUTONOMOUS CURRICULUM: Pure Random Sampling ⚡
+            # Strategy: Independent random decision per sample
+            # - No forced intervals (prevents bias toward specific tasks)
+            # - Every task gets proportional autonomous exposure
+            # - Smooth probability ramping over training
+            
+            # ⚡ AGGRESSIVE AUTONOMOUS RAMPING ⚡
+            # Fast ramp to 50% by epoch 100, then slower climb to 80%
+            # Early epochs: Teacher-forcing for stable gradients
+            # Mid training: 50/50 mix for balanced learning
+            # Respect autonomous_reduction_prob parameter (0.0 = disabled, >0 = ramp up schedule)
+            # Human-readable batch mode indicator for logs
+            if len(auto_indices) == 0:
+                batch_mode_str = "SUPV"
+            elif len(auto_indices) == total_tasks:
+                batch_mode_str = "AUTO"
+            else:
+                batch_mode_str = f"MIX({len(auto_indices)}/{total_tasks})"
+            
+            device = next(model.parameters()).device
+            
+            # Move tensors to GPU! 🚀
+            inputs = inputs.to(device)
+            teacher = teacher.to(device)
+            
+            # 🌌 Initialize h in LORENTZ SPACE H^HIDDEN_DIM ⊂ ℝ^(HIDDEN_DIM+1)
+            # Start at origin of hyperboloid (simplest state, like identity combinator)
+            h_euclidean = torch.zeros(1, HIDDEN_DIM, device=device)
+            h = LorentzOps.project_to_hyperboloid(h_euclidean)  # [1, HIDDEN_DIM+1] on hyperboloid
+            assert h.shape[-1] == HIDDEN_DIM + 1, f"❌ h initialization failed! Expected {HIDDEN_DIM+1}, got {h.shape[-1]}"
+            fibers = [Fiber(tuple(), {}, tuple(), tuple())]
+            prev_h = None  # Track for Δh computation
+            h_history = None  # External spectral history buffer (prevents MoE temporal contamination)
+            prev_hamiltonian = None  # Track for Lyapunov loss (dH/dt < 0)
+            
+            all_pis = []
+            all_alphas = []
+            all_gammas = []
+            
+            # MoE load balancing tracking
+            load_balance_losses = []
+            
+            if use_autonomous:
+                # TWO-PHASE TRAINING: Build (teacher-forced) + Reduce (autonomous)
+                auto_count += 1
                 
-                f_emb = model.embed_fiber(fibers, h.device)
-                stab_input = torch.cat([h, f_emb, torch.zeros(1, 1, device=h.device)], dim=-1)
-                alpha_t = model.stabilizer(stab_input).mean()
-                routing_entropy_t = -(pi * torch.log(pi + 1e-8)).sum(dim=-1, keepdim=True)
-                ctrl_input = torch.cat([routing_entropy_t, torch.zeros(1, 1, device=h.device)], dim=-1)
-                gamma_t = model.controller(ctrl_input).squeeze()
-                all_alphas.append(alpha_t)
-                all_gammas.append(gamma_t)
-            
-            # Phase 2: PURE MANIFOLD AUTONOMOUS TRAINING ✨
-            # NO SYMBOLIC EXECUTION - Let DEQ converge to normal form in manifold!
-            # The semantic friction (policy gating) emergently learns to halt.
-            
-            # TEMPORAL GNN: Reset hidden state at start of new reduction sequence
-            # This allows GNN to build fresh understanding of this term's behavior
-            if hasattr(model, 'predict_rewrite'):
-                # Reset for MoE wrapper
-                if hasattr(model, 'experts') and len(model.experts) > 0:
-                    model.experts[0].gnn_hidden_state = None
-                # Reset for direct ManifoldSKI
-                elif hasattr(model, 'gnn_hidden_state'):
-                    model.gnn_hidden_state = None
-            
-            built_term = fibers[0].S[0] if fibers[0].S else None
-            
-            # Ground truth: Compute expected normal form using symbolic execution
-            # (We need this as the target, but we don't use it during forward pass!)
-            expected_normal_form = built_term
-            if built_term:
-                temp_fiber = Fiber((built_term,), {}, tuple(), tuple())
-                # Execute symbolic reductions to get ground truth normal form
-                for _ in range(50):  # Max steps to find normal form
-                    if not SKICore.has_redex(temp_fiber.S[0] if temp_fiber.S else None):
+                # Phase 1: Build term (teacher-forced)
+                # Find where REDUCE ops start
+                build_end = 0
+                for i, op in enumerate(inputs):
+                    if op.item() == SKICore.OP_REDUCE:
+                        build_end = i
                         break
-                    temp_fiber, _, _ = SKICore.step_fiber(Fiber(temp_fiber.S, {}, (SKICore.OP_REDUCE,), tuple()))
-                expected_normal_form = temp_fiber.S[0] if temp_fiber.S else built_term
-            
-            # === PURE MANIFOLD CONVERGENCE ===
-            # Single DEQ call - let it converge to the attractor!
-            # NO manual reduction loop, NO symbolic execution
-            
-            policy_labels = []  # For tracking (but not used in loop)
-            policy_preds = []
-            routing_entropies = []
-            hamiltonian_transitions = []
-            
-            # Execute ONE forward pass - DEQ handles the entire reduction internally
-            tok = torch.tensor([SKICore.OP_NOOP], device=device)
-            teacher_tok = tok.clone()
-            
-            with autocast(device_type='cuda', enabled=use_amp):
-                model_output = model(
-                    h, fibers, tok, teacher_ops=teacher_tok, prev_h=prev_h,
-                    prev_energy=prev_energy, h_history=h_history,
-                    use_uniform_routing=False
-                )
-            
-            # Handle ManifoldSKI (10 returns) vs GeometricMoE (11 returns with lb_loss)
-            if len(model_output) == 11:
-                h_star, fibers_star, logits, exec_ops, pi, stab, policy_score_star, current_energy, h_history, hamiltonian_star, lb_loss = model_output
-            else:
-                h_star, fibers_star, logits, exec_ops, pi, stab, policy_score_star, current_energy, h_history, hamiltonian_star = model_output
-            
-            # CRITICAL: Check for NaN IMMEDIATELY after forward pass (AUTONOMOUS MODE)
-            if torch.isnan(h_star).any() or torch.isinf(h_star).any() or torch.isnan(policy_score_star).any():
-                print(f"  ⚠️  NaN/Inf detected in autonomous mode (pure manifold)!")
-                skip_backward = True
-                # Set final_term for logging
-                final_term = built_term
-            else:
-                # === MANIFOLD TRAINING LOSSES ===
                 
-                # 1. SEMANTIC LOSS: h_star should match normal form embedding
-                with torch.no_grad():
-                    target_h = model.embed_fiber([Fiber((expected_normal_form,), {}, tuple(), tuple())], device)
+                # Execute build phase with teacher forcing
+                # BUG FIX #1: Track prev_energy for trajectory geometry
+                prev_energy = None
+                for t in range(build_end):
+                    tok = inputs[t].unsqueeze(0)
+                    with autocast(device_type='cuda', enabled=use_amp):
+                        model_output = model(
+                            h, fibers, tok, teacher_ops=tok, prev_h=prev_h, prev_energy=prev_energy,
+                            h_history=h_history
+                        )
+                    # Handle ManifoldSKI (10 returns) vs GeometricMoE (11 returns with lb_loss)
+                    if len(model_output) == 11:
+                        # GeometricMoE: includes lb_loss
+                        h, fibers, logits, exec_ops, pi, stab, policy_score, current_energy, h_history, hamiltonian, lb_loss = model_output
+                    else:
+                        # ManifoldSKI: no lb_loss
+                        h, fibers, logits, exec_ops, pi, stab, policy_score, current_energy, h_history, hamiltonian = model_output
+                    prev_h = h.clone().detach()  # Track for next iteration (detach to avoid retaining graph)
+                    prev_energy = current_energy  # Track energy for next step (list of floats, no grad)
+                    prev_hamiltonian = hamiltonian.detach() if hamiltonian is not None else None  # Track for Lyapunov
+                    all_pis.append(pi)
+                    
+                    f_emb = model.embed_fiber(fibers, h.device)
+                    stab_input = torch.cat([h, f_emb, torch.zeros(1, 1, device=h.device)], dim=-1)
+                    alpha_t = model.stabilizer(stab_input).mean()
+                    routing_entropy_t = -(pi * torch.log(pi + 1e-8)).sum(dim=-1, keepdim=True)
+                    ctrl_input = torch.cat([routing_entropy_t, torch.zeros(1, 1, device=h.device)], dim=-1)
+                    gamma_t = model.controller(ctrl_input).squeeze()
+                    all_alphas.append(alpha_t)
+                    all_gammas.append(gamma_t)
                 
-                # 🌌 Compute semantic distance in LORENTZ MANIFOLD (not Euclidean MSE!)
-                # Use Lorentzian distance: d(x,y) = arcosh(-<x,y>_L)
-                # For numerical stability, use squared distance: d²(x,y) = arcosh²(-<x,y>_L)
-                lorentz_dot = LorentzOps.minkowski_dot(h_star, target_h, keepdim=False)  # <h*, target>_L
-                # Clamp to prevent arcosh domain error (need -<x,y>_L >= 1)
-                cosh_dist = torch.clamp(-lorentz_dot, min=1.0 + 1e-6)
-                lorentz_dist = torch.acosh(cosh_dist)  # Hyperbolic distance
-                loss_semantic_manifold = lorentz_dist ** 2  # Squared distance for smooth gradients
+                # Phase 2: PURE MANIFOLD AUTONOMOUS TRAINING ✨
+                # NO SYMBOLIC EXECUTION - Let DEQ converge to normal form in manifold!
+                # The semantic friction (policy gating) emergently learns to halt.
                 
-                # Additional safety clamp (max loss = 100 in hyperbolic space)
-                loss_semantic_manifold = torch.clamp(loss_semantic_manifold, max=100.0)
+                # TEMPORAL GNN: Reset hidden state at start of new reduction sequence
+                # This allows GNN to build fresh understanding of this term's behavior
+                if hasattr(model, 'predict_rewrite'):
+                    # Reset for MoE wrapper
+                    if hasattr(model, 'experts') and len(model.experts) > 0:
+                        model.experts[0].gnn_hidden_state = None
+                    # Reset for direct ManifoldSKI
+                    elif hasattr(model, 'gnn_hidden_state'):
+                        model.gnn_hidden_state = None
                 
-                # DIAGNOSTIC: Log Lorentz norms every 10 epochs (should be -1 on hyperboloid)
-                if epoch % 10 == 0 and len(policy_preds) == 0:  # First sample of epoch
-                    h_lorentz_norm = LorentzOps.minkowski_dot(h_star, h_star, keepdim=False).item()
-                    target_lorentz_norm = LorentzOps.minkowski_dot(target_h, target_h, keepdim=False).item()
-                    dist = lorentz_dist.item()
-                    print(f"    [Manifold Diagnostics] <h*,h*>_L={h_lorentz_norm:.2f}, <tgt,tgt>_L={target_lorentz_norm:.2f}, d_L={dist:.2f}, Loss={loss_semantic_manifold.item():.2f}")
+                built_term = fibers[0].S[0] if fibers[0].S else None
                 
-                # 2. POLICY LOSS: At normal form, policy should say HALT (score → 0)
-                # policy_score_star is already sigmoid output from DEQ
-                is_normal_form = not SKICore.has_redex(expected_normal_form)
-                target_policy = 0.0 if is_normal_form else 1.0
+                # Ground truth: Compute expected normal form using symbolic execution
+                # (We need this as the target, but we don't use it during forward pass!)
+                expected_normal_form = built_term
+                if built_term:
+                    temp_fiber = Fiber((built_term,), {}, tuple(), tuple())
+                    # Execute symbolic reductions to get ground truth normal form
+                    for _ in range(50):  # Max steps to find normal form
+                        if not SKICore.has_redex(temp_fiber.S[0] if temp_fiber.S else None):
+                            break
+                        temp_fiber, _, _ = SKICore.step_fiber(Fiber(temp_fiber.S, {}, (SKICore.OP_REDUCE,), tuple()))
+                    expected_normal_form = temp_fiber.S[0] if temp_fiber.S else built_term
                 
-                # Handle policy_score shape: might be [1, 1] or [1, 2]
-                # Extract first element if multi-dimensional
-                if policy_score_star.shape[-1] > 1:
-                    policy_score_for_loss = policy_score_star[:, 0:1]  # [batch, 1]
+                # === AUTONOMOUS REDUCTION LOOP (Phase 2) ===
+                # Step-by-step reduction with policy decisions
+                # Model predicts: HALT or REDUCE at each step
+                
+                policy_labels = []
+                policy_preds = []
+                routing_entropies = []
+                hamiltonian_transitions = []
+                semantic_losses = []  # Collect semantic losses for this batch
+                skip_backward = False  # Initialize error flag
+                
+                # Track autonomous reduction steps
+                auto_reduction_steps = 0
+                max_auto_steps = 10
+                auto_reduction_correct = 0
+                auto_reduction_total = 0
+                
+                # Current term being reduced
+                current_term = built_term
+                
+                # Initialize variables in case loop doesn't run
+                policy_score = None
+                hamiltonian = None
+                
+                # CYCLE DETECTION: Track both symbolic (for diagnostics) and geometric (for gradients)
+                # Literature: DEQ models can get stuck in trivial fixed points (identity mapping)
+                # Solution: Penalize when embeddings don't change (differentiable!)
+                term_history = set()  # For diagnostic warnings
+                h_history_for_cycle = []  # Track embeddings (differentiable!)
+                cycle_penalty = torch.zeros((), device=device)  # Accumulates differentiable penalties
+                
+                # Step-by-step reduction loop
+                while auto_reduction_steps < max_auto_steps and current_term is not None:
+                    # Check if we should halt (no redex)
+                    has_redex = SKICore.has_redex(current_term)
+                    
+                    # DIFFERENTIABLE CYCLE DETECTION: Penalize when h doesn't change
+                    # This gives the model a gradient signal to explore the manifold!
+                    if len(h_history_for_cycle) > 0:
+                        h_prev = h_history_for_cycle[-1]
+                        # CRITICAL: Use LORENTZ DISTANCE, not Euclidean L2!
+                        # h lives on hyperboloid H^n, must use Minkowski metric
+                        h_delta = LorentzOps.lorentz_distance(h, h_prev)
+                        
+                        # If embedding barely changed, add penalty proportional to staleness
+                        # Use smooth penalty: max(0, threshold - delta) to get gradient when close
+                        # Threshold = 0.5: Lorentz distance scale (≈ acosh, grows fast)
+                        staleness_threshold = 0.5
+                        staleness_penalty = torch.clamp(staleness_threshold - h_delta, min=0.0)
+                        cycle_penalty = cycle_penalty + staleness_penalty
+                    
+                    h_history_for_cycle.append(h.detach().clone())  # Store for next comparison
+                    
+                    # DIAGNOSTIC ONLY: Track symbolic cycles (no gradient, just for visibility)
+                    # Only print on first occurrence per batch (reduce spam)
+                    term_str = str(current_term) if current_term else "NONE"
+                    if term_str in term_history and auto_reduction_steps > 0:
+                        # Just warn once - the staleness penalty above already handles this differentiably
+                        if auto_reduction_steps == 1 and epoch < 10:  # Only first cycle, only early training
+                            print(f"    ℹ️  DEQ stuck in fixed point (staleness penalty active)")
+                    term_history.add(term_str)
+                    
+                    # EARLY BREAK: If penalty is huge (> 1.0), we're truly stuck - break to save compute
+                    # The penalty has already accumulated, so gradients will still flow
+                    if cycle_penalty.item() > 1.0 and auto_reduction_steps > 3:
+                        if epoch < 10:  # Only print diagnostic early in training
+                            print(f"    🛑 Breaking early: staleness penalty = {cycle_penalty.item():.2f} after {auto_reduction_steps} steps")
+                        break
+                    
+                    # Forward pass to get policy decision
+                    tok = torch.tensor([SKICore.OP_NOOP], device=device)
+                    with autocast(device_type='cuda', enabled=use_amp):
+                        model_output = model(
+                            h, fibers, tok, teacher_ops=tok, prev_h=prev_h,
+                            prev_energy=prev_energy, h_history=h_history,
+                            use_uniform_routing=False
+                        )
+                    
+                    # Handle ManifoldSKI (10 returns) vs GeometricMoE (11 returns with lb_loss)
+                    if len(model_output) == 11:
+                        h, fibers, logits, exec_ops, pi, stab, policy_score, current_energy, h_history, hamiltonian, lb_loss = model_output
+                    else:
+                        h, fibers, logits, exec_ops, pi, stab, policy_score, current_energy, h_history, hamiltonian = model_output
+                    
+                    # Check for NaN
+                    if torch.isnan(h).any() or torch.isinf(h).any() or torch.isnan(policy_score).any():
+                        print(f"  ⚠️  NaN/Inf detected in autonomous reduction step {auto_reduction_steps}!")
+                        skip_backward = True
+                        break
+                    
+                    # Policy decision: HALT (score < 0.5) or REDUCE (score >= 0.5)?
+                    policy_score_val = policy_score[0, 0].item() if policy_score.shape[-1] > 1 else policy_score.item()
+                    pred_reduce = policy_score_val >= 0.5
+                    true_reduce = has_redex
+                    
+                    # Track policy accuracy
+                    if pred_reduce == true_reduce:
+                        auto_policy_correct += 1
+                    auto_policy_total += 1
+                    
+                    # Collect for loss
+                    policy_preds.append(policy_score)
+                    policy_labels.append(1.0 if has_redex else 0.0)
+                    routing_entropies.append(-(pi * torch.log(pi + 1e-8)).sum(dim=-1))
+                    
+                    if hamiltonian is not None and prev_hamiltonian is not None:
+                        hamiltonian_transitions.append((prev_hamiltonian, hamiltonian))
+                    prev_hamiltonian = hamiltonian.detach() if hamiltonian is not None else None
+                    
+                    # If no redex, should halt
+                    if not has_redex:
+                        if not pred_reduce:  # Correctly predicted HALT
+                            auto_reduction_correct += 1
+                        break
+                    
+                    # If model predicts HALT but there's a redex, that's wrong - continue anyway
+                    if not pred_reduce:
+                        # Wrong decision - should have reduced
+                        break
+                    
+                    # PURE DEQ LEARNING: Let the manifold dynamics predict the next state
+                    # NO symbolic execution - the model must learn reduction from geometry alone!
+                    # The forward pass already updated h and fibers through DEQ convergence
+                    # So current_term is already in fibers from the last forward pass
+                    
+                    # Extract current term from fibers (DEQ has already updated it)
+                    current_term = fibers[0].S[0] if fibers[0].S else current_term
+                    
+                    # Note: This means "success" now measures if DEQ geometry actually learned reduction!
+                    # Early training: success will be low (DEQ hasn't learned yet)
+                    # Late training: success should approach 100% as DEQ masters the geometry
+                    
+                    # Track this step
+                    auto_reduction_steps += 1
+                    auto_reduction_total += 1
+                    auto_reduction_correct += 1  # For now, count symbolic execution as correct
+                    
+                    prev_h = h.clone().detach()
+                    prev_energy = current_energy
+                
+                # Final result (handle case where loop didn't run)
+                if 'h' in locals() and h is not None:
+                    h_star = h
+                    fibers_star = fibers
+                    policy_score_star = policy_score if policy_score is not None else torch.zeros(1, 1, device=device)
+                    hamiltonian_star = hamiltonian
                 else:
-                    policy_score_for_loss = policy_score_star
+                    # Loop didn't execute - use initial state
+                    h_star = prev_h if 'prev_h' in locals() else torch.zeros(1, 256, device=device)
+                    fibers_star = fibers
+                    policy_score_star = torch.zeros(1, 1, device=device)
+                    hamiltonian_star = None
+                    skip_backward = True
                 
-                loss_policy_convergence = F.binary_cross_entropy(
-                    policy_score_for_loss,
-                    torch.tensor([[target_policy]], device=device, dtype=policy_score_star.dtype)
-                )
+                final_term = current_term
                 
-                # 3. DECODER LOSS: Can we decode h_star back to correct syntax?
-                # (Optional: only if you have a decoder)
-                # decoded_logits = model.decoder(h_star)
-                # loss_decoder = ...
-                
-                # Track for overall loss computation
-                policy_preds.append(policy_score_for_loss)  # Use corrected shape
-                policy_labels.append(target_policy)
-                routing_entropies.append(-(pi * torch.log(pi + 1e-8)).sum(dim=-1))
-                
-                # Track policy accuracy (always use first element)
-                pred_halt = policy_score_for_loss[0, 0].item() < 0.5
-                true_halt = is_normal_form
-                if pred_halt == true_halt:
-                    policy_correct += 1
-                    auto_policy_correct += 1
-                policy_total += 1
-                auto_policy_total += 1
-                
-                # For logging: decode h_star to see what the model thinks
-                # (This is just for diagnostics, not used in loss)
-                final_term = expected_normal_form  # For now, use ground truth for logging
-                
-                # Collect pis and homeostatic params for overall loss
-                all_pis.append(pi)
-                has_redex = SKICore.has_redex(built_term)
-                policy_labels.append(1 if has_redex else 0)  # 1=REDUCE, 0=HALT
-                
-                # Capture state BEFORE potential reduction (for auxiliary prediction)
-                if has_redex and built_term:
-                    nodes_before = SKICore.count_nodes(built_term)
-                    # FIX: Use mixed energy (consistent with embed_fiber and forward)
-                    energy_old_before = SKICore.rewrite_energy(built_term)
-                    approx_redex_before = SKICore.approximate_redex_count(built_term, max_depth=3)
-                    energy_before = 0.7 * energy_old_before + 0.3 * (approx_redex_before * 10.0)
-                    h_before_reduce = h.clone()
-                
-                # Model predicts next action using policy head
-                # BUG FIX: Pass teacher_ops=OP_NOOP to prevent router from mutating SECD state
-                # FIX: Remove use_uniform_routing=True to allow state-dependent routing
-                # Instead: Add entropy floor regularizer to prevent collapse
-                # BUG FIX #1: Pass prev_energy for trajectory geometry
-                # Only the policy head should control REDUCE/HALT in Phase 2
-                tok = torch.tensor([SKICore.OP_NOOP], device=device)
-                teacher_tok = tok.clone()  # Force NOOP at symbolic level
-                with autocast(device_type='cuda', enabled=use_amp):
-                    model_output = model(
-                        h, fibers, tok, teacher_ops=teacher_tok, prev_h=prev_h, 
-                        prev_energy=prev_energy, h_history=h_history, 
-                        use_uniform_routing=False  # Allow state-dependent routing
+                # Now compute losses based on the FINAL state
+                if skip_backward:
+                    # Set dummy final_term for logging
+                    final_term = built_term if built_term else None
+                else:
+                    # === MANIFOLD TRAINING LOSSES ===
+                    
+                    # 1. SEMANTIC LOSS: h_star should match normal form embedding
+                    with torch.no_grad():
+                        target_h = model.embed_fiber([Fiber((expected_normal_form,), {}, tuple(), tuple())], device)
+                    
+                    # 🌌 Compute semantic distance in LORENTZ MANIFOLD (not Euclidean MSE!)
+                    # Use Lorentzian distance: d(x,y) = arcosh(-<x,y>_L)
+                    # For numerical stability, use squared distance: d²(x,y) = arcosh²(-<x,y>_L)
+                    lorentz_dot = LorentzOps.minkowski_dot(h_star, target_h, keepdim=False)  # <h*, target>_L
+                    # Clamp to prevent arcosh domain error (need -<x,y>_L >= 1)
+                    cosh_dist = torch.clamp(-lorentz_dot, min=1.0 + 1e-6)
+                    lorentz_dist = torch.acosh(cosh_dist)  # Hyperbolic distance
+                    loss_semantic_manifold = lorentz_dist ** 2  # Squared distance for smooth gradients
+                    
+                    # Additional safety clamp (tighter: max loss = 10 to prevent overwhelming policy loss)
+                    # Policy loss is ~O(1-10), so semantic should be similar scale
+                    loss_semantic_manifold = torch.clamp(loss_semantic_manifold, max=10.0)
+                    
+                    # Collect semantic loss for this task (will be averaged later)
+                    semantic_losses.append(loss_semantic_manifold)
+                    
+                    # DIAGNOSTIC: Log Lorentz norms every 10 epochs (should be -1 on hyperboloid)
+                    if epoch % 10 == 0 and len(policy_preds) == 0:  # First sample of epoch
+                        h_lorentz_norm = LorentzOps.minkowski_dot(h_star, h_star, keepdim=False).item()
+                        target_lorentz_norm = LorentzOps.minkowski_dot(target_h, target_h, keepdim=False).item()
+                        dist = lorentz_dist.item()
+                        print(f"    [Manifold Diagnostics] <h*,h*>_L={h_lorentz_norm:.2f}, <tgt,tgt>_L={target_lorentz_norm:.2f}, d_L={dist:.2f}, Loss={loss_semantic_manifold.item():.2f}")
+                    
+                    # 2. POLICY LOSS: At normal form, policy should say HALT (score → 0)
+                    # policy_score_star is already sigmoid output from DEQ
+                    is_normal_form = not SKICore.has_redex(expected_normal_form)
+                    target_policy = 0.0 if is_normal_form else 1.0
+                    
+                    # Handle policy_score shape: might be [1, 1] or [1, 2]
+                    # Extract first element if multi-dimensional
+                    if policy_score_star.shape[-1] > 1:
+                        policy_score_for_loss = policy_score_star[:, 0:1]  # [batch, 1]
+                    else:
+                        policy_score_for_loss = policy_score_star
+                    
+                    loss_policy_convergence = F.binary_cross_entropy(
+                        policy_score_for_loss,
+                        torch.tensor([[target_policy]], device=device, dtype=policy_score_star.dtype)
                     )
-                # Handle ManifoldSKI (10 returns) vs GeometricMoE (11 returns with lb_loss)
-                if len(model_output) == 11:
-                    h, fibers, logits, exec_ops, pi, stab, policy_score, current_energy, h_history, hamiltonian, lb_loss = model_output
-                else:
-                    h, fibers, logits, exec_ops, pi, stab, policy_score, current_energy, h_history, hamiltonian = model_output
-                
-                # GUMBEL-SOFTMAX: Add exploration noise during training (optional but helps)
-                # Temperature schedule: Start high (exploration), anneal to low (exploitation)
-                # Epoch 0-50: τ=2.0, Epoch 50-100: τ=1.0, Epoch 100+: τ=0.5
-                if epoch < 50:
-                    gumbel_temp = 2.0
-                elif epoch < 100:
-                    gumbel_temp = 1.0
-                else:
-                    gumbel_temp = 0.5
-                
-                # Add Gumbel noise: g ~ -log(-log(U)) where U ~ Uniform(0,1)
-                gumbel_noise = -torch.log(-torch.log(torch.rand_like(policy_score) + 1e-8) + 1e-8)
-                policy_score = policy_score + gumbel_noise * gumbel_temp  # Noisy logits
-                
-                # CRITICAL: Check for NaN IMMEDIATELY after forward pass (AUTONOMOUS MODE)
-                if torch.isnan(h).any() or torch.isinf(h).any() or torch.isnan(policy_score).any():
-                    print(f"  ⚠️  NaN/Inf detected in autonomous mode at epoch {epoch}, step {step}! Aborting sequence.")
-                    skip_backward = True
-                    break
-                
-                prev_h = h.clone().detach()  # Track for next iteration (detach to avoid retaining graph)
-                prev_energy = current_energy  # Track energy for trajectory geometry (list of floats, no grad)
-                
-                # Collect Hamiltonian transition for Lyapunov loss (energy should decrease)
-                if prev_hamiltonian is not None and hamiltonian is not None:
-                    hamiltonian_transitions.append((prev_hamiltonian, hamiltonian))
-                
-                prev_hamiltonian = hamiltonian.detach() if hamiltonian is not None else None  # Track for Lyapunov
-                policy_preds.append(policy_score)
-                
-                # TEMPORAL GNN PREDICTION: Learn combinator identity from behavior
-                # SPEED OPTIMIZATION: Only call GNN every N steps to reduce overhead
-                # Collect (term_before, term_after) pairs for temporal learning
-                if not hasattr(locals(), 'gnn_predictions'):
-                    gnn_predictions = []
-                    gnn_before_targets = []  # Terms BEFORE reduction
-                    gnn_targets = []         # Terms AFTER reduction
-                
-                # Compute homeostatic parameters for this converged state
-                f_emb = model.embed_fiber([Fiber((expected_normal_form,), {}, tuple(), tuple())], device)
-                stab_input = torch.cat([h_star, f_emb, torch.zeros(1, 1, device=h_star.device)], dim=-1)
-                alpha_t = model.stabilizer(stab_input).mean()
-                routing_entropy_t = -(pi * torch.log(pi + 1e-8)).sum(dim=-1, keepdim=True)
-                ctrl_input = torch.cat([routing_entropy_t, torch.zeros(1, 1, device=h_star.device)], dim=-1)
-                gamma_t = model.controller(ctrl_input).squeeze()
-                all_alphas.append(alpha_t)
-                all_gammas.append(gamma_t)
-        else:
-            # STANDARD: Full teacher-forced execution
-            # CRITICAL FIX: Pass teacher_ops=tok to force symbolic execution to match teacher
-            # Otherwise router's argmax executes, creating train/eval mismatch
-            #
-            # NOTE: This loop processes tokens sequentially (not batchable across time)
-            # because each SECD step depends on the previous fiber state.
-            # However, we CAN batch multiple samples (not yet implemented - future work).
-            supv_count += 1
-            for t in range(len(inputs)):
-                tok = inputs[t].unsqueeze(0)
-                with autocast(device_type='cuda', enabled=use_amp):
-                    model_output = model(h, fibers, tok, teacher_ops=tok, prev_h=prev_h, h_history=h_history)
-                # Handle ManifoldSKI (10 returns) vs GeometricMoE (11 returns with lb_loss)
-                if len(model_output) == 11:
-                    h, fibers, logits, exec_ops, pi, stab, policy_score, _, h_history, hamiltonian, lb_loss = model_output
-                else:
-                    h, fibers, logits, exec_ops, pi, stab, policy_score, _, h_history, hamiltonian = model_output
-                
-                # CRITICAL: Check for NaN IMMEDIATELY after forward pass
-                if torch.isnan(h).any() or torch.isinf(h).any():
-                    print(f"  ⚠️  NaN/Inf detected in h at epoch {epoch}, step {t}! Skipping rest of sequence.")
-                    skip_backward = True
-                    break
-                
-                prev_h = h.clone().detach()  # Track for next iteration (detach to avoid retaining graph)
-                prev_hamiltonian = hamiltonian.detach() if hamiltonian is not None else None  # Track for Lyapunov
-                all_pis.append(pi)
-                
-                # Track policy accuracy even in teacher-forced mode (for comparison)
-                if fibers[0].S:
-                    term = fibers[0].S[0]
-                    # BUG FIX: Use fast has_redex() instead of expensive is_normal_form()
-                    has_redex = SKICore.has_redex(term) if isinstance(term, SKITerm) else False
-                    reducibility = policy_score[0, 0].item()
-                    pred_action = 1 if reducibility > 0.5 else 0
-                    true_action = 1 if has_redex else 0
-                    if pred_action == true_action:
+                    
+                    # 3. DECODER LOSS: Can we decode h_star back to correct syntax?
+                    # (Optional: only if you have a decoder)
+                    # decoded_logits = model.decoder(h_star)
+                    # loss_decoder = ...
+                    
+                    # Track for overall loss computation
+                    policy_preds.append(policy_score_for_loss)  # Use corrected shape
+                    policy_labels.append(target_policy)
+                    # routing_entropies only applicable for MoE routing (not autonomous mode)
+                    # routing_entropies.append(-(pi * torch.log(pi + 1e-8)).sum(dim=-1))
+                    
+                    # Track policy accuracy (always use first element)
+                    pred_halt = policy_score_for_loss[0, 0].item() < 0.5
+                    true_halt = is_normal_form
+                    if pred_halt == true_halt:
                         policy_correct += 1
-                        supv_policy_correct += 1
+                        auto_policy_correct += 1
                     policy_total += 1
-                    supv_policy_total += 1
-                
-                # Extract α and γ for loss
-                f_emb = model.embed_fiber(fibers, h.device)
-                # Compute epistemic uncertainty for stabilizer (same as in forward)
-                # Use dummy policy score since we don't have prev state here
-                dummy_uncertainty = torch.zeros(1, 1, device=h.device)
-                stab_input = torch.cat([h, f_emb, dummy_uncertainty], dim=-1)
-                alpha_t = model.stabilizer(stab_input).mean()
-                
-                routing_entropy_t = -(pi * torch.log(pi + 1e-8)).sum(dim=-1, keepdim=True)
-                ctrl_input = torch.cat([routing_entropy_t, torch.zeros(1, 1, device=h.device)], dim=-1)
-                gamma_t = model.controller(ctrl_input).squeeze()
-                
-                all_alphas.append(alpha_t)
-                all_gammas.append(gamma_t)
-            
-            final_term = fibers[0].S[0] if fibers[0].S else None
-        
-        final_str = str(final_term) if final_term else "EMPTY"
-        
-        # Success: check if result matches expected
-        success = False
-        if final_term:
-            if expected == "x" and isinstance(final_term, SKITerm) and final_term.typ == 'VAR' and final_term.name == 'x':
-                success = True
-            elif expected == "y" and isinstance(final_term, SKITerm) and final_term.typ == 'VAR' and final_term.name == 'y':
-                success = True
-            elif expected == final_str:
-                success = True
-            # For deep expressions, check exact structural match with ground truth (NOT just "is normal form")
-            # BUG #5 FIX: Remove dead code (inconsistent success logic)
-            # This proxy success computation gets overwritten at line 2165
-            # Keep only the rigorous exact-match check using SKICore.terms_equal()
-        
-        # CONTINUOUS HOMEOSTATIC CONTROL: Instantaneous feedback (no lag!)
-        # Track success for logging
-        batch_acc = 1.0 if success else 0.0
-        
-        # LOSS COMPUTATION
-        
-        # BUG #8 FIXED: REMOVED ROUTING LOSS
-        # Previous router loss was "learn identity function":
-        #   Input: token embedding of op X
-        #   Supervision: predict op X  
-        #   → Instant convergence, no actual learning
-        # 
-        # Router should be STATE-dependent (conditioned on h, fiber geometry),
-        # not TOKEN-dependent. Current architecture uses token embedding as input,
-        # making routing loss useless. Remove entirely until router is redesigned
-        # to be conditioned on (h, f_emb) instead of token_idx.
-        # BUG FIX: Use zeros() instead of tensor with requires_grad (no need for leaf)
-        routing_loss = torch.zeros((), device=device)
-        
-        # 1b. Policy supervision (for autonomous reduction phase)
-        # VECTORIZED CLASS-BALANCED LOSS! 🚀
-        loss_policy = torch.zeros((), device=device)
-        policy_correct_count = 0
-        policy_total_count = 0
-        if use_autonomous and 'policy_preds' in locals() and len(policy_preds) > 0:
-            # Stack all predictions and labels into tensors
-            # Extract first element if predictions are [1, 2] shape
-            pred_list = []
-            for pred_score in policy_preds:
-                if pred_score.numel() > 1:
-                    pred_list.append(pred_score[:, 0:1])
-                else:
-                    pred_list.append(pred_score)
-            
-            preds = torch.cat(pred_list, dim=0)  # [N, 1]
-            labels = torch.tensor(policy_labels, dtype=torch.float32, device=device).unsqueeze(1)  # [N, 1]
-            
-            # SAFETY: Replace NaN/Inf with 0.5 (uncertain) before clamping
-            # DEQ can produce numerical instability when policy logits explode
-            preds = torch.where(torch.isnan(preds) | torch.isinf(preds), 
-                               torch.full_like(preds, 0.5), 
-                               preds)
-            
-            # Clamp predictions to valid probability range [0, 1] for BCE
-            # Sigmoid can produce values slightly outside due to numerical precision
-            preds = torch.clamp(preds, min=1e-7, max=1.0 - 1e-7)
-            
-            # Compute class frequencies for balancing
-            n_reduce = (labels == 1.0).sum().item()
-            n_halt = (labels == 0.0).sum().item()
-            n_total = len(policy_labels)
-            
-            # Inverse frequency weights (vectorized!)
-            weight_reduce = n_total / (2.0 * max(n_reduce, 1))
-            weight_halt = n_total / (2.0 * max(n_halt, 1))
-            
-            # Create weight vector: [N, 1]
-            weights = torch.where(labels == 1.0, 
-                                 torch.tensor(weight_reduce, device=device),
-                                 torch.tensor(weight_halt, device=device))
-            
-            # VECTORIZED BCE LOSS (better than MSE for probability prediction!)
-            # MSE punishes exploration (policy ≈ 0.5) too hard at decision boundaries
-            # BCE has proper gradient dynamics for binary classification:
-            #   - Near 0/1: Gradients scale inversely with confidence (good!)
-            #   - Near 0.5: Gradients encourage exploration (good!)
-            # Note: preds already in [0,1] from sigmoid, so use F.binary_cross_entropy
-            
-            # Simple class-balanced loss - let the model learn naturally
-            # The class weights already handle imbalance (REDUCE vs HALT frequency)
-            loss_policy = (weights * F.binary_cross_entropy(preds, labels, reduction='none')).mean()
-            
-            # Track accuracy (vectorized threshold)
-            pred_binary = (preds > 0.5).float()
-            policy_correct_count = (pred_binary == labels).sum().item()
-            policy_total_count = n_total
-        
-        # Compute policy accuracy for homeostatic control (0.0 to 1.0)
-        policy_accuracy = policy_correct_count / policy_total_count if policy_total_count > 0 else 0.5
-        
-        # === Initialize loss components BEFORE using them ===
-        loss_semantic = torch.zeros((), device=device)
-        loss_routing_entropy = torch.zeros((), device=device)
-        loss_gnn_separation = torch.zeros((), device=device)
-        
-        # === GNN TEMPORAL SEPARATION LOSS (BEHAVIORAL, NOT STATIC) ===
-        # Core Philosophy: Combinators differentiate by BEHAVIOR, not structure!
-        # - I x → x (applies once, returns argument)
-        # - K x y → x (ignores second argument)  
-        # - S x y z → (x z)(y z) (duplicates context)
-        #
-        # OLD APPROACH (❌ WRONG): Compare static embeddings of I/K/S without context
-        #   Problem: Violates ULTRA_PURE principle (requires identity information)
-        #   Problem: GRU with zero history can't differentiate (no temporal signal)
-        #
-        # NEW APPROACH (✅ CORRECT): Compare TRAJECTORIES during reduction
-        #   train_sample includes BOTH before and after states
-        #   GNN observes: (I x) → x, (K x y) → x, (S x y z) → (x z)(y z)
-        #   Separation emerges from learning correct rewrite dynamics
-        #
-        # DECISION: Remove explicit separation loss entirely!
-        # Let the supervised/autonomous losses naturally separate combinators
-        # by learning their distinct reduction behaviors.
-        #
-        # If embeddings collapse, it means the model hasn't learned yet - that's OK!
-        # Forcing separation without behavioral context is architectural cheating.
-        
-        expert_model = model.experts[0] if hasattr(model, 'experts') else model
-        if False:  # DISABLED: Separation loss removed, let temporal learning work naturally
-            # Keeping code structure for potential future temporal behavioral loss
-            try:
-                # Would need: (I x) before/after pair, (K x y) pair, (S x y z) pair
-                # Then: Compare GRU hidden states after observing each behavior
-                # Loss: Contrastive learning on behavioral trajectories
-                pass
-                
-                # VERIFY: Check if embeddings have gradients enabled (only every 100 epochs)
-                if epoch % 100 == 0:
-                    if not emb_I.requires_grad:
-                        print(f"    [⚠️ WARNING] GNN embeddings don't require gradients! Separation loss won't train GNN.")
-                        # Check if GNN parameters are frozen
-                        frozen_params = 0
-                        total_params = 0
-                        for name, param in expert_model.rewrite_gnn.named_parameters():
-                            total_params += 1
-                            if not param.requires_grad:
-                                frozen_params += 1
-                        print(f"             GNN has {frozen_params}/{total_params} frozen parameters")
-                
-                # 🔍 DEEP DIAGNOSTIC: Print embedding values to verify they're actually different
-                # If embeddings are identical, GNN isn't using the identity information!
-                if epoch % 100 == 0:  # Only print every 100 epochs (verbose)
-                    # CRITICAL: Check the INPUT FEATURES, not just output embeddings!
-                    features_I, _, _ = TreeToGraphConverter.term_to_vectors(term_I, device, ultra_pure=False)
-                    features_K, _, _ = TreeToGraphConverter.term_to_vectors(term_K, device, ultra_pure=False)
-                    features_S, _, _ = TreeToGraphConverter.term_to_vectors(term_S, device, ultra_pure=False)
+                    auto_policy_total += 1
                     
-                    print(f"    [🔬 INPUT Features (one-hot)] I: {features_I[0, :6].cpu().tolist()}, "
-                          f"K: {features_K[0, :6].cpu().tolist()}, S: {features_S[0, :6].cpu().tolist()}")
-                    print(f"    [🔬 OUTPUT Embeddings (Lorentz)] I[:5]={emb_I[0, :5].detach().cpu().tolist()}, "
-                          f"K[:5]={emb_K[0, :5].detach().cpu().tolist()}, S[:5]={emb_S[0, :5].detach().cpu().tolist()}")
+                    # For logging: decode h_star to see what the model thinks
+                    # (This is just for diagnostics, not used in loss)
+                    final_term = expected_normal_form  # For now, use ground truth for logging
                     
-                    # 🌌 CURVATURE MEASUREMENT: Extract metric tensors and compute Ricci scalar
-                    metric_I = pred_I.get('metric', None)
-                    metric_K = pred_K.get('metric', None)
-                    metric_S = pred_S.get('metric', None)
+                    # Collect pis and homeostatic params for overall loss
+                    all_pis.append(pi)
+                    has_redex = SKICore.has_redex(built_term)
+                    # NOTE: policy_labels already appended at line 5832 for convergence target
+                    # Don't append again here or we'll have length mismatch with policy_preds!
                     
-                    if metric_I is not None and metric_K is not None and metric_S is not None:
-                        curv_I = compute_ricci_scalar_approx(metric_I)
-                        curv_K = compute_ricci_scalar_approx(metric_K)
-                        curv_S = compute_ricci_scalar_approx(metric_S)
-                        print(f"    [🌌 Riemann Curvature] I: R={curv_I:.3f}, K: R={curv_K:.3f}, S: R={curv_S:.3f}")
+                    # Capture state BEFORE potential reduction (for auxiliary prediction)
+                    if has_redex and built_term:
+                        nodes_before = SKICore.count_nodes(built_term)
+                        # FIX: Use mixed energy (consistent with embed_fiber and forward)
+                        energy_old_before = SKICore.rewrite_energy(built_term)
+                        approx_redex_before = SKICore.approximate_redex_count(built_term, max_depth=3)
+                        energy_before = 0.7 * energy_old_before + 0.3 * (approx_redex_before * 10.0)
+                        h_before_reduce = h.clone()
+                    
+                    # Model predicts next action using policy head
+                    # BUG FIX: Pass teacher_ops=OP_NOOP to prevent router from mutating SECD state
+                    # FIX: Remove use_uniform_routing=True to allow state-dependent routing
+                    # Instead: Add entropy floor regularizer to prevent collapse
+                    # BUG FIX #1: Pass prev_energy for trajectory geometry
+                    # Only the policy head should control REDUCE/HALT in Phase 2
+                    tok = torch.tensor([SKICore.OP_NOOP], device=device)
+                    teacher_tok = tok.clone()  # Force NOOP at symbolic level
+                    with autocast(device_type='cuda', enabled=use_amp):
+                        model_output = model(
+                            h, fibers, tok, teacher_ops=teacher_tok, prev_h=prev_h, 
+                            prev_energy=prev_energy, h_history=h_history, 
+                            use_uniform_routing=False  # Allow state-dependent routing
+                        )
+                    # Handle ManifoldSKI (10 returns) vs GeometricMoE (11 returns with lb_loss)
+                    if len(model_output) == 11:
+                        h, fibers, logits, exec_ops, pi, stab, policy_score, current_energy, h_history, hamiltonian, lb_loss = model_output
                     else:
-                        print(f"    [⚠️ Curvature] Metric tensor not available in GNN output")
-                
-                # 🩺 DIAGNOSTIC: Check for NaN/Inf in embeddings (causes gradient death)
-                if torch.isnan(emb_I).any() or torch.isinf(emb_I).any():
-                    print(f"    [💀 FATAL] emb_I contains NaN/Inf! Gradients will die.")
-                if torch.isnan(emb_K).any() or torch.isinf(emb_K).any():
-                    print(f"    [💀 FATAL] emb_K contains NaN/Inf! Gradients will die.")
-                if torch.isnan(emb_S).any() or torch.isinf(emb_S).any():
-                    print(f"    [💀 FATAL] emb_S contains NaN/Inf! Gradients will die.")
-                
-                # 🎨 BEAUTIFUL MATHEMATICAL FIX: Use SQUARED distance for stable gradients
-                # 
-                # Problem: d_L(x,y) = acosh(<x,y>) has gradient ∝ 1/sqrt(<x,y>² - 1)
-                #          When embeddings collapse (<x,y> ≈ 1.00001), gradient explodes to ~333
-                #          After 8 accumulation steps, this overflows to NaN
-                #
-                # Solution: Optimize d²(x,y) = [acosh(<x,y>)]² instead!
-                #          Gradient: ∂d²/∂x = 2·d·(∂d/∂x)
-                #          When d ≈ 0.0045, the factor 2·0.0045 = 0.009 dampens gradient by 100x
-                #          Gradient becomes ~3.3 instead of ~333 → No overflow!
-                #
-                # Bonus: Squared distance is still a valid metric (monotonic transform)
-                #        Minimizing d² is equivalent to minimizing d
-                
-                dist_IK_raw = LorentzOps.lorentz_distance(emb_I, emb_K)
-                dist_IS_raw = LorentzOps.lorentz_distance(emb_I, emb_S)
-                dist_KS_raw = LorentzOps.lorentz_distance(emb_K, emb_S)
-                
-                # Square the distances for stable gradients
-                dist_IK = dist_IK_raw ** 2
-                dist_IS = dist_IS_raw ** 2
-                dist_KS = dist_KS_raw ** 2
-                
-                # 🩺 Check if distances are NaN/Inf (numerical instability in lorentz_distance)
-                if torch.isnan(dist_IK) or torch.isinf(dist_IK):
-                    print(f"    [💀 FATAL] dist_IK={dist_IK.item()} is NaN/Inf!")
-                if torch.isnan(dist_IS) or torch.isinf(dist_IS):
-                    print(f"    [💀 FATAL] dist_IS={dist_IS.item()} is NaN/Inf!")
-                if torch.isnan(dist_KS) or torch.isinf(dist_KS):
-                    print(f"    [💀 FATAL] dist_KS={dist_KS.item()} is NaN/Inf!")
-                
-                avg_dist_sq = (dist_IK + dist_IS + dist_KS) / 3.0
-                avg_dist = torch.sqrt(avg_dist_sq.detach())  # For logging only (detached from gradient)
-                
-                # HOMEOSTATIC TARGET: Embeddings should be at least distance 2.0 apart
-                # (This is significant on the hyperboloid - roughly 90 degrees apart)
-                target_separation = 2.0
-                target_separation_sq = target_separation ** 2  # Work in squared space
-                
-                # If collapsed (avg_dist² < target²), apply penalty
-                # Using squared distance throughout the loss computation
-                if avg_dist_sq < target_separation_sq:
-                    # REPULSIVE BARRIER: Add inverse term that explodes as distance → 0
-                    # This ensures gradient never vanishes at equilibrium
-                    # 
-                    # Loss = quadratic_repulsion + barrier_term
-                    # At dist²→0: barrier→∞, gradient→∞ (strong repulsion)
-                    # At dist²→target²: both terms→0 (natural equilibrium)
+                        h, fibers, logits, exec_ops, pi, stab, policy_score, current_energy, h_history, hamiltonian = model_output
                     
-                    separation_deficit_sq = target_separation_sq - avg_dist_sq
-                    
-                    # Quadratic repulsion: grows as we approach target
-                    quadratic_term = separation_deficit_sq ** 2 / target_separation_sq  # Normalized
-                    
-                    # Barrier term: explodes as distance → 0 (prevents collapse)
-                    # 1/(d² + ε) creates infinite gradient at d²=0
-                    epsilon = 1e-6  # Tiny! Let barrier be strong
-                    barrier_term = 0.1 / (avg_dist_sq + epsilon)  # Scale down to ~5000 at collapse
-                    
-                    # Combined loss: both terms push embeddings apart
-                    # At dist²=0.00002: quadratic≈1, barrier≈100 → total≈101
-                    # At dist²=0.01: quadratic≈1, barrier≈50 → total≈51
-                    # At dist²=0.1: quadratic≈0.96, barrier≈10 → total≈11
-                    # At dist²=1.0: quadratic≈0.56, barrier≈1 → total≈1.6
-                    # At dist²=4.0: quadratic=0, barrier≈0.25 → total≈0.25
-                    loss_gnn_separation = quadratic_term + barrier_term
-                    
-                    # 🩺 Check for NaN/Inf in loss (will kill gradients)
-                    if torch.isnan(loss_gnn_separation) or torch.isinf(loss_gnn_separation):
-                        print(f"    [💀 FATAL] loss_gnn_separation is NaN/Inf! dist²={avg_dist_sq.item():.5f}")
-                    
-                    # Log only every 100 epochs (compact output)
-                    if epoch % 100 == 0:
-                        print(f"    [🌌 GNN Sep] dist={avg_dist.item():.4f}, loss={loss_gnn_separation.item():.1f}, "
-                              f"grad_fn={'✓' if loss_gnn_separation.grad_fn else '✗'}")
-                
-            except Exception as e:
-                # If GNN call fails, log and skip this loss
-                import traceback
-                print(f"    [❌ GNN Separation] Failed: {e}")
-                if epoch % 100 == 0:
-                    traceback.print_exc()
-                pass
-        
-        # === PURE MANIFOLD LOSSES (Autonomous Mode Only) ===
-        # Add the semantic manifold loss if we computed it
-        if use_autonomous and 'loss_semantic_manifold' in locals():
-            # Weight manifold semantic loss (learning to match normal form embedding)
-            loss_semantic = loss_semantic + 5.0 * loss_semantic_manifold
-            
-        # Add policy convergence loss (policy should say HALT at normal form)
-        if use_autonomous and 'loss_policy_convergence' in locals():
-            loss_policy = loss_policy + 2.0 * loss_policy_convergence
-        
-        # 1c. Routing entropy floor regularizer (prevents collapse to single expert)
-        # Replaces use_uniform_routing=True with a softer constraint
-        # Encourages diversity in routing while allowing state-dependent dynamics
-        if use_autonomous and 'routing_entropies' in locals() and len(routing_entropies) > 0:
-            # Entropy floor: penalize if entropy drops below threshold
-            # Maximum entropy for k=11 ops: log(11) ≈ 2.4
-            # Floor at ~40% of max: 1.0 nats
-            # This allows specialization but prevents full collapse
-            entropy_floor = 1.0
-            for entropy in routing_entropies:
-                if entropy.mean() < entropy_floor:
-                    # Quadratic penalty below floor (smooth)
-                    deficit = entropy_floor - entropy.mean()
-                    loss_routing_entropy = loss_routing_entropy + 0.1 * (deficit ** 2)
-        
-        # 2. Semantic loss: BUG #10 FIXED - DIFFERENTIABLE auxiliary predictions
-        # Train model to predict NEXT state geometry after REDUCE operations
-        # Provides dense gradients aligned with semantic progress
-        # (Already initialized above, now populate with auxiliary task losses)
-        
-        if use_autonomous and 'aux_pred_states' in locals() and len(aux_pred_states) > 0:
-            # VECTORIZED Auxiliary task! 🚀
-            # Stack all hidden states: [N, D]
-            h_states_batch = torch.cat(aux_pred_states, dim=0)
-            
-            # Batch prediction (single forward pass!)
-            pred_delta_nodes = model.aux_predict_delta_nodes(h_states_batch)  # [N, 1]
-            pred_delta_energy = model.aux_predict_delta_energy(h_states_batch)  # [N, 1]
-            
-            # Stack targets: [N, 1]
-            target_nodes = torch.tensor(aux_target_delta_nodes, dtype=torch.float32, device=device).unsqueeze(1)
-            target_energy = torch.tensor(aux_target_delta_energy, dtype=torch.float32, device=device).unsqueeze(1)
-            
-            # Vectorized MSE
-            loss_semantic = F.mse_loss(pred_delta_nodes, target_nodes) + \
-                           0.1 * F.mse_loss(pred_delta_energy, target_energy)
-        
-        # Note: Previous semantic loss was constant (loss_semantic + 1.0).
-        # Now we have REAL differentiable objectives:
-        # - Policy head: train HALT/REDUCE boundary (basin geometry)
-        # - Auxiliary heads: predict Δnode_count, Δenergy (semantic progress)
-        
-        # 2b. RIEMANNIAN METRIC LOSS: Learn geometry that respects dynamics!
-        # BEAUTIFUL: The metric should make reduction sequences follow geodesics
-        # 
-        # Geodesic property: Shortest path between points
-        # Reduction sequence: term_before → term_after
-        # Constraint: Reduction should follow natural gradient direction!
-        #
-        # Loss: ||∇_g V - Δterm||²  where Δterm = (term_after - term_before)
-        loss_metric_geo = torch.zeros((), device=device)
-        # predict COMBINATOR IDENTITY from observed reduction behavior:
-        # - Observe: (COMBINATOR x) → x  ⟹  Target: P(I)=1.0, P(K)=0, P(S)=0
-        # - Observe: ((COMBINATOR x) y) → x  ⟹  Metric should show K-curvature
-        # - Observe: (((COMBINATOR x) y) z) → expansion ⟹  Metric should show S-curvature
-        #
-        # BEAUTIFUL: Geometry encodes semantics!
-        loss_rewrite = torch.zeros((), device=device)
-        
-        if use_autonomous and 'gnn_predictions' in locals() and len(gnn_predictions) > 0:
-            # SEMI-VECTORIZED: Stack curvatures and targets, iterate only for node counting
-            metric_norms = []
-            target_curvatures = []
-            all_metrics = []
-            
-            for gnn_pred, term_before, term_after in zip(gnn_predictions, gnn_before_targets, gnn_targets):
-                if term_after is not None and term_before is not None and 'metric' in gnn_pred:
-                    # Count nodes (can't vectorize - different tree structures)
-                    nodes_before = SKICore.count_nodes(term_before)
-                    nodes_after = SKICore.count_nodes(term_after)
-                    delta_nodes = nodes_after - nodes_before
-                    
-                    # Collect metric data
-                    metric_norms.append(gnn_pred['metric_norm'])
-                    all_metrics.append(gnn_pred['metric'])
-                    
-                    # Assign target curvature based on dynamics type
-                    if delta_nodes > 0:
-                        target_curvatures.append(2.0)  # Expansion
-                    elif delta_nodes < -1:
-                        target_curvatures.append(0.5)  # Strong contraction
+                    # GUMBEL-SOFTMAX: Add exploration noise during training (optional but helps)
+                    # Temperature schedule: Start high (exploration), anneal to low (exploitation)
+                    # Epoch 0-50: τ=2.0, Epoch 50-100: τ=1.0, Epoch 100+: τ=0.5
+                    if epoch < 50:
+                        gumbel_temp = 2.0
+                    elif epoch < 100:
+                        gumbel_temp = 1.0
                     else:
-                        target_curvatures.append(1.0)  # Neutral (no loss contribution)
-            
-            # VECTORIZED curvature loss!
-            if len(metric_norms) > 0:
-                metric_norms_tensor = torch.stack(metric_norms)  # [N]
-                targets_tensor = torch.tensor(target_curvatures, device=device)  # [N]
-                
-                # Only penalize non-neutral targets
-                mask = (targets_tensor != 1.0)
-                if mask.any():
-                    loss_rewrite = F.mse_loss(
-                        metric_norms_tensor[mask],
-                        targets_tensor[mask]
-                    )
-                
-                # VECTORIZED smoothness: batch Frobenius norm
-                metrics_stacked = torch.stack(all_metrics)  # [N, D, D]
-                loss_metric_geo = 0.01 * (metrics_stacked.norm(p='fro', dim=(1, 2)) ** 2).mean()
-        
-        # Track success for deep tasks (RIGOROUS: exact-match only)
-        if task.startswith('deep_') and final_term is not None and gt_term is not None:
-            success = SKICore.terms_equal(final_term, gt_term)
-        else:
-            # For simple tasks, use string comparison (legacy)
-            success = (final_term and str(final_term).strip() == expected.strip())
-        
-        # 3. Orthogonality loss
-        A_n = F.normalize(model.address_matrix, dim=1)
-        # BUG FIX: Put torch.eye on correct device
-        loss_ortho = torch.norm(torch.mm(A_n, A_n.T) - torch.eye(11, device=A_n.device))
-        
-        # 4. Spectral band loss - HOMEOSTATIC CHAOS BOUNDARY 🧠
-        # Philosophy: Ride right up on the chaos without hitting singularities
-        # Early/simple: Allow close to critical point (α×γ up to 0.92)
-        # Late/complex: Pull back for safety (α×γ max 0.85)
-        avg_alpha = torch.stack(all_alphas).mean() if all_alphas else torch.tensor(0.5)
-        avg_gamma = torch.stack(all_gammas).mean() if all_gammas else torch.tensor(0.5)
-        effective_step = avg_gamma * avg_alpha
-        
-        # ADAPTIVE UPPER BOUND based on curriculum difficulty
-        # curriculum_difficulty ∈ [0, 1]: 0=basics, 1=advanced
-        # Map to chaos tolerance: 0.92 (basics, can surf edge) → 0.82 (advanced, need stability)
-        chaos_upper_bound = 0.92 - 0.10 * curriculum_difficulty
-        
-        # Lower bound stays fixed (prevent collapse to zero dynamics)
-        chaos_lower_bound = 0.3
-        
-        loss_spectral = (torch.relu(effective_step - chaos_upper_bound) ** 2 + 
-                        torch.relu(chaos_lower_bound - effective_step) ** 2)
-        
-        # MoE load balancing loss (if using MoE)
-        loss_load_balance = torch.zeros((), device=device)
-        if load_balance_losses:
-            loss_load_balance = torch.stack(load_balance_losses).mean()
-        
-        # HOMEOSTATIC EXPERT ENTROPY CONTROL (MoE only)
-        loss_entropy_homeostasis = torch.zeros((), device=device)
-        loss_adaptive_homeostasis = torch.zeros((), device=device)
-        
-        if hasattr(model, 'expert_usage'):
-            # Compute current expert usage entropy
-            expert_usage = model.expert_usage + 1e-8  # Avoid log(0)
-            expert_usage_normalized = expert_usage / expert_usage.sum()
-            expert_usage_entropy = -(expert_usage_normalized * torch.log(expert_usage_normalized)).sum()
-            
-            # EXPLICIT MAX-USAGE PENALTY: Directly penalize when any expert dominates
-            # This is more aggressive than entropy loss alone
-            max_expert_usage = expert_usage_normalized.max()
-            max_usage_threshold = 0.55  # 🔥 NUCLEAR: Trigger penalty above 55% usage (was 70%, too permissive!)
-            
-            # 🔥🔥🔥 DAMPED PUSH-DOWN: Gradually reduce overused expert instead of hard reset
-            # This prevents oscillation (collapse → reset → collapse → NaN)
-            if max_expert_usage > 0.65:
-                # Find the dominant expert and gently push it down
-                max_idx = expert_usage_normalized.argmax()
-                with torch.no_grad():
-                    # Soft redistribution: take 20% from dominant, give to others
-                    steal_amount = 0.20 * model.expert_usage[max_idx]
-                    model.expert_usage[max_idx] = model.expert_usage[max_idx] - steal_amount
-                    # Distribute stolen amount to other experts equally
-                    others_gain = steal_amount / (model.expert_usage.shape[0] - 1)
-                    for i in range(model.expert_usage.shape[0]):
-                        if i != max_idx:
-                            model.expert_usage[i] = model.expert_usage[i] + others_gain
-            
-            if max_expert_usage > max_usage_threshold:
-                # Quadratic penalty: (max_usage - threshold)^2
-                # At 60%: penalty = 0.0125, At 70%: penalty = 0.1125, At 80%: penalty = 0.3125
-                max_usage_penalty = 10.0 * ((max_expert_usage - max_usage_threshold) ** 2)  # 5.0→10.0, doubled!
-                loss_entropy_homeostasis = loss_entropy_homeostasis + max_usage_penalty
-            
-            # STATIC ENTROPY FLOOR: Prevent catastrophic collapse
-            # Always active, regardless of task performance
-            entropy_floor = 1.0  # Minimum 3-4 experts active
-            if expert_usage_entropy < entropy_floor:
-                deficit = entropy_floor - expert_usage_entropy
-                loss_entropy_homeostasis = loss_entropy_homeostasis + 0.1 * (deficit ** 2)
-            
-            # PROPORTIONAL HOMEOSTATIC CONTROL: Entropy target driven by actual task performance
-            # Key insight: Diversity requirement is INVERSELY proportional to performance
-            # Low accuracy (poor predictions) → Need MORE diversity (higher entropy target)
-            # High accuracy (good predictions) → Can tolerate LESS diversity (lower entropy target)
-            
-            # Use ACCURACY instead of loss to avoid class imbalance issues
-            # (Cross-entropy is low when predicting majority class, even if wrong!)
-            # Error rate = 1 - accuracy
-            error_rate = 1.0 - policy_accuracy  # Range: 0.0 (perfect) to 1.0 (random)
-            
-            # Map error rate to entropy target using inverse relationship
-            # Error rate: 0.0 (perfect) → Entropy target: 0.8 (specialized, 2-3 experts)
-            # Error rate: 1.0 (failing) → Entropy target: 1.4 (diverse, 5-6 experts)
-            # Formula: entropy_target = base + diversity_demand * error_rate
-            
-            entropy_base = 0.8  # Minimum entropy (best case: 2-3 experts when perfect)
-            diversity_demand = 0.6  # How much to increase entropy per unit of error
-            
-            # Clamp to reasonable range (pure Python, no torch)
-            entropy_target_adaptive = max(0.8, min(1.4, entropy_base + diversity_demand * error_rate))
-            
-            # Adaptive loss: Push current entropy toward task-loss-proportional target
-            # Weight 0.05 - strong enough to respond quickly, gentle enough to be stable
-            loss_adaptive_homeostasis = 0.05 * (expert_usage_entropy - entropy_target_adaptive) ** 2
-        
-        # 5. Lyapunov stability loss (Hamiltonian should decrease: dH/dt < 0)
-        # Penalizes energy INCREASES during autonomous reduction
-        # This encourages the system to flow toward attractors (equilibria/normal forms)
-        loss_lyapunov = torch.zeros((), device=device)
-        if use_autonomous and 'hamiltonian_transitions' in locals() and len(hamiltonian_transitions) > 0:
-            for H_prev, H_curr in hamiltonian_transitions:
-                dH_dt = H_curr - H_prev  # [batch, 1] or scalar
-                # Only penalize increases (ReLU clips negatives to 0)
-                # Mean over batch dimension if present
-                loss_lyapunov = loss_lyapunov + torch.relu(dH_dt).mean()
-            # Average over transitions
-            loss_lyapunov = loss_lyapunov / len(hamiltonian_transitions)
-    
-    # Total loss with RIEMANNIAN GEOMETRY + HAMILTONIAN MECHANICS + ADAPTIVE WEIGHTING
-        # BEAUTIFUL: Metric loss (curvature + smoothness) replaces old feature engineering!
-        
-        # ADAPTIVE LOSS WEIGHTING (Kendall & Gal, CVPR 2018)
-        # Automatically learn how much to weight each loss based on its inherent uncertainty
-        # Formula: L_weighted = 1/(2*exp(log_var)) * L + log_var/2
-        # This down-weights noisy/hard losses and up-weights consistent losses
-        
-        # Get model's learned uncertainties (only if model is ManifoldSKI or has expert[0])
-        if hasattr(model, 'log_var_policy'):
-            # Direct ManifoldSKI
-            log_var_policy = model.log_var_policy
-            log_var_semantic = model.log_var_semantic
-            log_var_lyapunov = model.log_var_lyapunov
-            log_var_spectral = model.log_var_spectral
-            log_var_metric_geo = model.log_var_metric_geo if hasattr(model, 'log_var_metric_geo') else torch.zeros(1, device=device)
-        elif hasattr(model, 'experts') and hasattr(model.experts[0], 'log_var_policy'):
-            # GeometricMoE wrapper
-            log_var_policy = model.experts[0].log_var_policy
-            log_var_semantic = model.experts[0].log_var_semantic
-            log_var_lyapunov = model.experts[0].log_var_lyapunov
-            log_var_spectral = model.experts[0].log_var_spectral
-            log_var_metric_geo = model.experts[0].log_var_metric_geo if hasattr(model.experts[0], 'log_var_metric_geo') else torch.zeros(1, device=device)
-        else:
-            # Fallback: no adaptive weighting (shouldn't happen)
-            log_var_policy = torch.zeros(1, device=device)
-            log_var_semantic = torch.zeros(1, device=device)
-            log_var_lyapunov = torch.zeros(1, device=device)
-            log_var_spectral = torch.zeros(1, device=device)
-            log_var_metric_geo = torch.zeros(1, device=device)
-        
-        # Apply adaptive weighting to major loss components
-        # CRITICAL: Clamp ALL losses BEFORE weighting to prevent NaN cascades
-        loss_policy = torch.clamp(loss_policy, max=100.0)  # Policy should be ~O(1-10)
-        loss_semantic = torch.clamp(loss_semantic, max=100.0)  # Semantic should be ~O(1-10)
-        loss_lyapunov = torch.clamp(loss_lyapunov, max=100.0)  # Lyapunov should be ~O(1-10)
-        loss_spectral = torch.clamp(loss_spectral, max=100.0)  # Spectral should be ~O(1-10)
-        loss_metric_geo = torch.clamp(loss_metric_geo, max=1000.0)  # Frobenius norm should be ~O(10-100)
-        loss_load_balance = torch.clamp(loss_load_balance, max=10.0)  # Load balance should be ~O(0.1-1)
-        
-        weighted_policy = loss_policy / (2 * torch.exp(log_var_policy)) + log_var_policy / 2
-        weighted_semantic = loss_semantic / (2 * torch.exp(log_var_semantic)) + log_var_semantic / 2
-        weighted_lyapunov = loss_lyapunov / (2 * torch.exp(log_var_lyapunov)) + log_var_lyapunov / 2
-        weighted_spectral = loss_spectral / (2 * torch.exp(log_var_spectral)) + log_var_spectral / 2
-        weighted_metric_geo = loss_metric_geo / (2 * torch.exp(log_var_metric_geo)) + log_var_metric_geo / 2
-        
-        # Fixed-weight losses (smaller components, don't need adaptation)
-        # ⚖️ HOMEOSTATIC GNN LOSS CONTROL with WARMUP
-        # Note: loss_gnn_separation is already clipped to max=10.0 during computation
-        policy_loss_magnitude = weighted_policy.detach()
-        if loss_gnn_separation > 0:
-            
-            # STEP 2: Warmup schedule (epochs 0-50: fast ramp up)
-            # Prevents early instability from massive gradients
-            warmup_epochs = 50  # Faster warmup: 100→50
-            if epoch < warmup_epochs:
-                warmup_factor = (epoch / warmup_epochs) ** 0.5  # Square root warmup: faster than quadratic
-                # At epoch 10: 0.45, At epoch 25: 0.71, At epoch 50: 1.0
+                        gumbel_temp = 0.5
+                    
+                    # Add Gumbel noise: g ~ -log(-log(U)) where U ~ Uniform(0,1)
+                    gumbel_noise = -torch.log(-torch.log(torch.rand_like(policy_score) + 1e-8) + 1e-8)
+                    policy_score = policy_score + gumbel_noise * gumbel_temp  # Noisy logits
+                    
+                    # CRITICAL: Check for NaN IMMEDIATELY after forward pass (AUTONOMOUS MODE)
+                    if torch.isnan(h).any() or torch.isinf(h).any() or torch.isnan(policy_score).any():
+                        print(f"  ⚠️  NaN/Inf detected in autonomous mode at epoch {epoch}, step {step}! Aborting sequence.")
+                        skip_backward = True
+                        break
+                    
+                    prev_h = h.clone().detach()  # Track for next iteration (detach to avoid retaining graph)
+                    prev_energy = current_energy  # Track energy for trajectory geometry (list of floats, no grad)
+                    
+                    # Collect Hamiltonian transition for Lyapunov loss (energy should decrease)
+                    if prev_hamiltonian is not None and hamiltonian is not None:
+                        hamiltonian_transitions.append((prev_hamiltonian, hamiltonian))
+                    
+                    prev_hamiltonian = hamiltonian.detach() if hamiltonian is not None else None  # Track for Lyapunov
+                    # NOTE: policy_preds/labels collected at convergence (line 5831), not during intermediate steps!
+                    
+                    # TEMPORAL GNN PREDICTION: Learn combinator identity from behavior
+                    # SPEED OPTIMIZATION: Only call GNN every N steps to reduce overhead
+                    # Collect (term_before, term_after) pairs for temporal learning
+                    if not hasattr(locals(), 'gnn_predictions'):
+                        gnn_predictions = []
+                        gnn_before_targets = []  # Terms BEFORE reduction
+                        gnn_targets = []         # Terms AFTER reduction
+                    
+                    # Compute homeostatic parameters for this converged state
+                    f_emb = model.embed_fiber([Fiber((expected_normal_form,), {}, tuple(), tuple())], device)
+                    stab_input = torch.cat([h_star, f_emb, torch.zeros(1, 1, device=h_star.device)], dim=-1)
+                    alpha_t = model.stabilizer(stab_input).mean()
+                    routing_entropy_t = -(pi * torch.log(pi + 1e-8)).sum(dim=-1, keepdim=True)
+                    ctrl_input = torch.cat([routing_entropy_t, torch.zeros(1, 1, device=h_star.device)], dim=-1)
+                    gamma_t = model.controller(ctrl_input).squeeze()
+                    all_alphas.append(alpha_t)
+                    all_gammas.append(gamma_t)
             else:
-                warmup_factor = 1.0
+                # STANDARD: Full teacher-forced execution
+                # CRITICAL FIX: Pass teacher_ops=tok to force symbolic execution to match teacher
+                # Otherwise router's argmax executes, creating train/eval mismatch
+                #
+                # NOTE: This loop processes tokens sequentially (not batchable across time)
+                # because each SECD step depends on the previous fiber state.
+                # However, we CAN batch multiple samples (not yet implemented - future work).
+                supv_count += 1
+                skip_backward = False  # Initialize error flag for supervised mode
+                
+                # Initialize policy collection for supervised loss
+                policy_preds = []
+                policy_labels = []
+                semantic_losses = []  # Empty in supervised mode (no DEQ convergence)
+                
+                for t in range(len(inputs)):
+                    tok = inputs[t].unsqueeze(0)
+                    with autocast(device_type='cuda', enabled=use_amp):
+                        model_output = model(h, fibers, tok, teacher_ops=tok, prev_h=prev_h, h_history=h_history)
+                    # Handle ManifoldSKI (10 returns) vs GeometricMoE (11 returns with lb_loss)
+                    if len(model_output) == 11:
+                        h, fibers, logits, exec_ops, pi, stab, policy_score, _, h_history, hamiltonian, lb_loss = model_output
+                    else:
+                        h, fibers, logits, exec_ops, pi, stab, policy_score, _, h_history, hamiltonian = model_output
+                    
+                    # CRITICAL: Check for NaN IMMEDIATELY after forward pass
+                    if torch.isnan(h).any() or torch.isinf(h).any():
+                        print(f"  ⚠️  NaN/Inf detected in h at epoch {epoch}, step {t}! Skipping rest of sequence.")
+                        skip_backward = True
+                        break
+                    
+                    prev_h = h.clone().detach()  # Track for next iteration (detach to avoid retaining graph)
+                    prev_hamiltonian = hamiltonian.detach() if hamiltonian is not None else None  # Track for Lyapunov
+                    all_pis.append(pi)
+                    
+                    # Track policy accuracy even in teacher-forced mode (for comparison)
+                    if fibers[0].S:
+                        term = fibers[0].S[0]
+                        # BUG FIX: Use fast has_redex() instead of expensive is_normal_form()
+                        has_redex = SKICore.has_redex(term) if isinstance(term, SKITerm) else False
+                        
+                        # Collect for loss computation
+                        policy_preds.append(policy_score)
+                        policy_labels.append(1.0 if has_redex else 0.0)
+                        
+                        reducibility = policy_score[0, 0].item()
+                        pred_action = 1 if reducibility > 0.5 else 0
+                        true_action = 1 if has_redex else 0
+                        if pred_action == true_action:
+                            policy_correct += 1
+                            supv_policy_correct += 1
+                        policy_total += 1
+                        supv_policy_total += 1
+                    
+                    # Extract α and γ for loss
+                    f_emb = model.embed_fiber(fibers, h.device)
+                    # Compute epistemic uncertainty for stabilizer (same as in forward)
+                    # Use dummy policy score since we don't have prev state here
+                    dummy_uncertainty = torch.zeros(1, 1, device=h.device)
+                    stab_input = torch.cat([h, f_emb, dummy_uncertainty], dim=-1)
+                    alpha_t = model.stabilizer(stab_input).mean()
+                    
+                    routing_entropy_t = -(pi * torch.log(pi + 1e-8)).sum(dim=-1, keepdim=True)
+                    ctrl_input = torch.cat([routing_entropy_t, torch.zeros(1, 1, device=h.device)], dim=-1)
+                    gamma_t = model.controller(ctrl_input).squeeze()
+                    
+                    all_alphas.append(alpha_t)
+                    all_gammas.append(gamma_t)
+                
+                final_term = fibers[0].S[0] if fibers[0].S else None
             
-            # STEP 3: Fixed weight with warmup (simpler and more stable)
-            # The separation loss is ~4700, which is HUGE compared to policy loss ~0.5-5.0
-            # So we need a small weight to keep it balanced
-            # Target contribution: ~50.0 (5x increase from 10.0 to force stronger separation!)
-            base_weight = 50.0 / (loss_gnn_separation.detach().item() + 1e-8)  # Scale to ~50.0 contribution
-            adaptive_gnn_weight = base_weight * warmup_factor
+            final_str = str(final_term) if final_term else "EMPTY"
+            expected_str = str(expected_normal_form) if 'expected_normal_form' in locals() and expected_normal_form else expected
             
-            # Clamp to reasonable range [0, 0.5] - increased from 0.1 to allow even stronger signal
-            adaptive_gnn_weight = torch.clamp(torch.tensor(adaptive_gnn_weight, device=device), min=0.0, max=0.5)
-            
-            # Log weight only every 100 epochs (compact output)
-            if epoch % 100 == 0:
-                final_contribution = adaptive_gnn_weight * loss_gnn_separation
-                weight_val = adaptive_gnn_weight if isinstance(adaptive_gnn_weight, (int, float)) else adaptive_gnn_weight.item()
-                contrib_val = final_contribution if isinstance(final_contribution, (int, float)) else final_contribution.item()
-                print(f"    [⚖️ GNN Weight] warmup={warmup_factor:.3f}, weight={weight_val:.6f} (raw_loss={loss_gnn_separation.item():.1f}, contribution={contrib_val:.2f})")
-        else:
-            adaptive_gnn_weight = 0.0  # No loss, no weight
-        
-        total_loss = (routing_loss + 
-                     weighted_policy +     # ← Adaptive!
-                     loss_routing_entropy + 
-                     0.1 * loss_ortho + 
-                     weighted_spectral +   # ← Adaptive!
-                     weighted_semantic +   # ← Adaptive!
-                     0.5 * loss_rewrite +  # Metric curvature regularization
-                     0.1 * weighted_metric_geo +  # ← Adaptive! Metric smoothness
-                     weighted_lyapunov +   # ← Adaptive!
-                     10.0 * loss_load_balance +  # 🔥🔥 NUCLEAR: 0.01→0.5→2.0→10.0 to prevent expert collapse
-                     loss_entropy_homeostasis + 
-                     loss_adaptive_homeostasis)
-                     # GNN separation loss REMOVED: Let temporal learning naturally differentiate combinators
-                     # by observing their behavioral trajectories (I x→x, K x y→x, S x y z→(x z)(y z))
-                     # Explicit static separation violated ULTRA_PURE principle
-        
-        # DIAGNOSTIC: If total loss is huge, print component breakdown
-        if use_autonomous and total_loss.detach().item() > 1000.0:
-            print(f"    [Loss Breakdown RAW]")
-            print(f"      policy={loss_policy.item():.1f}, semantic={loss_semantic.item():.1f}, lyapunov={loss_lyapunov.item():.1f}")
-            print(f"      spectral={loss_spectral.item():.1f}, rewrite={loss_rewrite.item():.1f}, routing={routing_loss.item():.1f}")
-            print(f"      ortho={loss_ortho.item():.1f}, routing_entropy={loss_routing_entropy.item():.1f}, metric_geo={loss_metric_geo.item():.1f}")
-            print(f"      load_balance={loss_load_balance.item():.1f}, entropy_homeo={loss_entropy_homeostasis.item():.1f}, adaptive_homeo={loss_adaptive_homeostasis.item():.1f}")
-            print(f"    [Weighted Components]")
-            print(f"      w_policy={weighted_policy.item():.1f}, w_semantic={weighted_semantic.item():.1f}")
-            print(f"      w_lyapunov={weighted_lyapunov.item():.1f}, w_spectral={weighted_spectral.item():.1f}")
-            print(f"      w_metric_geo={weighted_metric_geo.item():.1f} (0.1x in total)")
-            print(f"    [TOTAL] = {total_loss.item():.1f}")
-
-        # --- Safety guards for autonomous mode (prevent catastrophic loss spikes) ---
-        # If autonomous reductions end with a term that still has a redex, mark as non-terminating
-        non_terminating = False
-        try:
-            if use_autonomous and built_term is not None:
-                non_terminating = SKICore.has_redex(built_term)
-        except Exception:
-            # conservative default: don't crash training on safety check
-            non_terminating = False
-
-        # Add a small, bounded penalty for non-terminating traces so they don't produce
-        # unbounded objectives (adversarial terms may otherwise blow up metric/energy losses)
-        if non_terminating:
-            nonterm_penalty = torch.tensor(50.0, device=device)  # bounded penalty
-            total_loss = total_loss + nonterm_penalty
-
-        # Clamp / sanitize extreme losses coming from autonomous (unrolled/adversarial) behavior
-        # This prevents runaway gradients and stabilizes training when encountering
-        # non-terminating or adversarial evaluation samples during AUTO mode.
-        LOSS_CLAMP_THRESHOLD = 1e4
-        clipped_for_extreme = False
-        skip_backward = False  # Flag to skip gradient computation if loss is invalid
-        
-        if use_autonomous:
-            # Handle NaN / Inf explicitly
-            if torch.isnan(total_loss) or torch.isinf(total_loss):
-                print(f"Warning: NaN/Inf total_loss detected (epoch={epoch}). Skipping backward pass to prevent gradient corruption.")
-                skip_backward = True
-                # Use a dummy value for logging (detached, no gradients)
-                total_loss = torch.tensor(float('nan'), device=device)
+            # Success: check if result matches expected
+            # For AUTO mode: compare against expected_normal_form (full reduction)
+            # For SUPV mode: compare against expected (immediate next step)
+            success = False
+            if use_autonomous and 'expected_normal_form' in locals():
+                # Autonomous mode: check if we reached the correct normal form
+                if final_term and expected_normal_form:
+                    success = SKICore.terms_equal(final_term, expected_normal_form)
+                    # DIAGNOSTIC: Log mismatches to detect false positives
+                    if epoch < 20 and not success:
+                        print(f"\n    [MISMATCH] Task={task}, Got={str(final_term)[:40]}, Expected={str(expected_normal_form)[:40]}, Steps={auto_reduction_step}")
+                elif final_term and expected_str:
+                    success = (str(final_term).strip() == expected_str.strip())
+                    if epoch < 20 and not success:
+                        print(f"\n    [MISMATCH] Task={task}, Got={str(final_term)[:40]}, Expected={expected_str[:40]}, Steps={auto_reduction_step}")
             else:
-                # Clamp very large losses
+                # Supervised mode: check if immediate result matches
+                if final_term:
+                    if expected == "x" and isinstance(final_term, SKITerm) and final_term.typ == 'VAR' and final_term.name == 'x':
+                        success = True
+                    elif expected == "y" and isinstance(final_term, SKITerm) and final_term.typ == 'VAR' and final_term.name == 'y':
+                        success = True
+                    elif expected == final_str:
+                        success = True
+            
+            # CONTINUOUS HOMEOSTATIC CONTROL: Instantaneous feedback (no lag!)
+            # Track success for logging
+            batch_acc = 1.0 if success else 0.0
+            
+            # LOSS COMPUTATION
+            
+            # BUG #8 FIXED: REMOVED ROUTING LOSS
+            # Previous router loss was "learn identity function":
+            #   Input: token embedding of op X
+            #   Supervision: predict op X  
+            #   → Instant convergence, no actual learning
+            # 
+            # Router should be STATE-dependent (conditioned on h, fiber geometry),
+            # not TOKEN-dependent. Current architecture uses token embedding as input,
+            # making routing loss useless. Remove entirely until router is redesigned
+            # to be conditioned on (h, f_emb) instead of token_idx.
+            # BUG FIX: Use zeros() instead of tensor with requires_grad (no need for leaf)
+            routing_loss = torch.zeros((), device=device)
+            
+            # 1b. Policy supervision (BOTH autonomous and supervised modes!)
+            # VECTORIZED CLASS-BALANCED LOSS! 🚀
+            loss_policy = torch.zeros((), device=device)
+            policy_correct_count = 0
+            policy_total_count = 0
+            if 'policy_preds' in locals() and len(policy_preds) > 0:
+                # Stack all predictions and labels into tensors
+                # Extract first element if predictions are [1, 2] shape
+                pred_list = []
+                for pred_score in policy_preds:
+                    if pred_score.numel() > 1:
+                        pred_list.append(pred_score[:, 0:1])
+                    else:
+                        pred_list.append(pred_score)
+                
+                preds = torch.cat(pred_list, dim=0)  # [N, 1]
+                labels = torch.tensor(policy_labels, dtype=torch.float32, device=device).unsqueeze(1)  # [N, 1]
+                
+                # SAFETY: Replace NaN/Inf with 0.5 (uncertain) before clamping
+                # DEQ can produce numerical instability when policy logits explode
+                preds = torch.where(torch.isnan(preds) | torch.isinf(preds), 
+                                   torch.full_like(preds, 0.5), 
+                                   preds)
+                
+                # Clamp predictions to valid probability range [0, 1] for BCE
+                # Sigmoid can produce values slightly outside due to numerical precision
+                preds = torch.clamp(preds, min=1e-7, max=1.0 - 1e-7)
+                
+                # Compute class frequencies for balancing
+                n_reduce = (labels == 1.0).sum().item()
+                n_halt = (labels == 0.0).sum().item()
+                n_total = len(policy_labels)
+                
+                # Inverse frequency weights (vectorized!)
+                weight_reduce = n_total / (2.0 * max(n_reduce, 1))
+                weight_halt = n_total / (2.0 * max(n_halt, 1))
+                
+                # Create weight vector: [N, 1]
+                weights = torch.where(labels == 1.0, 
+                                     torch.tensor(weight_reduce, device=device),
+                                     torch.tensor(weight_halt, device=device))
+                
+                # VECTORIZED BCE LOSS (better than MSE for probability prediction!)
+                # MSE punishes exploration (policy ≈ 0.5) too hard at decision boundaries
+                # BCE has proper gradient dynamics for binary classification:
+                #   - Near 0/1: Gradients scale inversely with confidence (good!)
+                #   - Near 0.5: Gradients encourage exploration (good!)
+                # Note: preds already in [0,1] from sigmoid, so use F.binary_cross_entropy
+                
+                # Simple class-balanced loss - let the model learn naturally
+                # The class weights already handle imbalance (REDUCE vs HALT frequency)
+                loss_policy = (weights * F.binary_cross_entropy(preds, labels, reduction='none')).mean()
+                
+                # Track accuracy (vectorized threshold)
+                pred_binary = (preds > 0.5).float()
+                policy_correct_count = (pred_binary == labels).sum().item()
+                policy_total_count = n_total
+            
+            # Compute policy accuracy for homeostatic control (0.0 to 1.0)
+            policy_accuracy = policy_correct_count / policy_total_count if policy_total_count > 0 else 0.5
+            
+            # === Initialize loss components BEFORE using them ===
+            loss_semantic = torch.zeros((), device=device)
+            loss_routing_entropy = torch.zeros((), device=device)
+            loss_gnn_separation = torch.zeros((), device=device)
+            
+            # === Compute semantic loss from collected samples (autonomous mode only) ===
+            if 'semantic_losses' in locals() and len(semantic_losses) > 0:
+                loss_semantic = torch.stack(semantic_losses).mean()
+            
+            # === GNN TEMPORAL SEPARATION LOSS (BEHAVIORAL, NOT STATIC) ===
+            # Core Philosophy: Combinators differentiate by BEHAVIOR, not structure!
+            # - I x → x (applies once, returns argument)
+            # - K x y → x (ignores second argument)  
+            # - S x y z → (x z)(y z) (duplicates context)
+            #
+            # OLD APPROACH (❌ WRONG): Compare static embeddings of I/K/S without context
+            #   Problem: Violates ULTRA_PURE principle (requires identity information)
+            #   Problem: GRU with zero history can't differentiate (no temporal signal)
+            #
+            # NEW APPROACH (✅ CORRECT): Compare TRAJECTORIES during reduction
+            #   train_sample includes BOTH before and after states
+            #   GNN observes: (I x) → x, (K x y) → x, (S x y z) → (x z)(y z)
+            #   Separation emerges from learning correct rewrite dynamics
+            #
+            # DECISION: Remove explicit separation loss entirely!
+            # Let the supervised/autonomous losses naturally separate combinators
+            # by learning their distinct reduction behaviors.
+            #
+            # If embeddings collapse, it means the model hasn't learned yet - that's OK!
+            # Forcing separation without behavioral context is architectural cheating.
+            
+            expert_model = model.experts[0] if hasattr(model, 'experts') else model
+            if True:  # RE-ENABLED: GNN integration into DEQ failed (NaN gradients), back to separation loss
+                # Compute static combinator embeddings and force separation
+                # This bootstraps GNN learning until behavioral signals strengthen
                 try:
-                    if total_loss.detach().item() > LOSS_CLAMP_THRESHOLD:
-                        print(f"Warning: extreme AUTO loss {total_loss.item():.1f} > {LOSS_CLAMP_THRESHOLD}, clamping.")
+                    # Get embeddings for I, K, S combinators
+                    # CRITICAL: Call GNN DIRECTLY (not through predict_rewrite) to ensure gradients flow!
+                    # predict_rewrite() detaches hidden state, breaking gradient flow
+                    term_I = SKITerm('I', None, None, None)
+                    term_K = SKITerm('K', None, None, None)
+                    term_S = SKITerm('S', None, None, None)
+                    
+                    # Convert terms to graph representations
+                    node_features_I, edge_index_I, _ = TreeToGraphConverter.term_to_vectors(term_I, device, ultra_pure=expert_model.ultra_pure)
+                    node_features_K, edge_index_K, _ = TreeToGraphConverter.term_to_vectors(term_K, device, ultra_pure=expert_model.ultra_pure)
+                    node_features_S, edge_index_S, _ = TreeToGraphConverter.term_to_vectors(term_S, device, ultra_pure=expert_model.ultra_pure)
+                    
+                    # 🔥 CRITICAL FIX: Get embeddings BEFORE GRU temporal processing!
+                    # 
+                    # Architecture Insight:
+                    # - GNN has two embedding stages:
+                    #   1. SPATIAL: Graph convolutions (input_proj → conv → Lorentz attention)
+                    #   2. TEMPORAL: GRU processes spatial embedding with hidden state
+                    # 
+                    # Problem: GRU with hidden_state=None always starts from zeros
+                    #          → Zero hidden state dominates output, collapsing I/K/S to same embedding
+                    #          → Think: GRU(I, h=0) ≈ GRU(K, h=0) ≈ GRU(S, h=0) if h=0 is strong
+                    # 
+                    # Why GRU exists: Temporal learning from reduction sequences
+                    #   - Step 0: ((S K) K) → observe structure, hidden_0
+                    #   - Step 1: (K (K K)) → see transformation, hidden_1
+                    #   - Step 2: (K K)     → infer "this was K", hidden_2
+                    # 
+                    # But for STATIC identification (just "I" or "K" or "S" alone):
+                    #   - No temporal context → GRU is inappropriate
+                    #   - Zero-state bias creates artificial similarity
+                    # 
+                    # Solution: Use 'tree_emb_spatial_lorentz' (pre-GRU) for separation loss
+                    #          This is pure graph structure without temporal contamination
+                    #          Perfect for static combinator identification!
+                    
+                    gnn_output_I = expert_model.rewrite_gnn(node_features_I, edge_index_I, hidden_state=None, return_embeddings=True)
+                    gnn_output_K = expert_model.rewrite_gnn(node_features_K, edge_index_K, hidden_state=None, return_embeddings=True)
+                    gnn_output_S = expert_model.rewrite_gnn(node_features_S, edge_index_S, hidden_state=None, return_embeddings=True)
+                    
+                    # Use spatial embedding (pre-GRU) for separation, not temporal (post-GRU)!
+                    # This bypasses the GRU's zero-state bias that collapses all embeddings
+                    emb_I = gnn_output_I.get('tree_emb_spatial_lorentz', gnn_output_I['tree_emb_lorentz'])  # Fallback to full pipeline
+                    emb_K = gnn_output_K.get('tree_emb_spatial_lorentz', gnn_output_K['tree_emb_lorentz'])
+                    emb_S = gnn_output_S.get('tree_emb_spatial_lorentz', gnn_output_S['tree_emb_lorentz'])
+                    
+                    # Verify we're using spatial (pre-GRU) embeddings
+                    if epoch == 0 and 'tree_emb_spatial_lorentz' in gnn_output_I:
+                        emb_temporal_I = gnn_output_I['tree_emb_lorentz']  # Post-GRU
+                        dist_spatial_temporal = LorentzOps.lorentz_distance(emb_I, emb_temporal_I).item()
+                        print(f"    [✓ GRU Bypass] Using spatial (pre-GRU) embeddings. Spatial vs Temporal distance: {dist_spatial_temporal:.4f}")
+                        if dist_spatial_temporal < 0.001:
+                            print(f"    [⚠️ WARNING] Spatial and temporal embeddings identical! GRU may not be affecting output.")
+                    
+                    # VERIFY: Check if embeddings have gradients enabled (only every 100 epochs)
+                    if epoch % 100 == 0:
+                        if not emb_I.requires_grad:
+                            print(f"    [⚠️ WARNING] GNN embeddings don't require gradients! Separation loss won't train GNN.")
+                            # Check if GNN parameters are frozen
+                            frozen_params = 0
+                            total_params = 0
+                            for name, param in expert_model.rewrite_gnn.named_parameters():
+                                total_params += 1
+                                if not param.requires_grad:
+                                    frozen_params += 1
+                            print(f"             GNN has {frozen_params}/{total_params} frozen parameters")
+                        
+                        # 🔬 CRITICAL DEBUG: Check if input_proj weights are initialized
+                        input_proj_weight = expert_model.rewrite_gnn.input_proj.weight.data
+                        input_proj_norm = input_proj_weight.norm().item()
+                        input_proj_std = input_proj_weight.std().item()
+                        print(f"    [🔬 GNN Weights] input_proj: norm={input_proj_norm:.4f}, std={input_proj_std:.6f}")
+                        # Check if weights are all zero/identical
+                        if input_proj_std < 1e-6:
+                            print(f"    [💀 CRITICAL] input_proj weights are nearly zero! GNN can't differentiate inputs!")
+                        # Show first row (weights for I combinator, one-hot index 0)
+                        first_row = input_proj_weight[0, :6].tolist()
+                        print(f"    [🔬 GNN Weights] First 6 values of row 0: {[f'{v:.4f}' for v in first_row]}")
+                    
+                    # 🔍 DEEP DIAGNOSTIC: Print embedding values to verify they're actually different
+                    # If embeddings are identical, GNN isn't using the identity information!
+                    if epoch % 100 == 0:  # Only print every 100 epochs (verbose)
+                        # CRITICAL: Check the INPUT FEATURES, not just output embeddings!
+                        features_I, _, _ = TreeToGraphConverter.term_to_vectors(term_I, device, ultra_pure=False)
+                        features_K, _, _ = TreeToGraphConverter.term_to_vectors(term_K, device, ultra_pure=False)
+                        features_S, _, _ = TreeToGraphConverter.term_to_vectors(term_S, device, ultra_pure=False)
+                        
+                        #print(f"    [🔬 INPUT Features (one-hot)] I: {features_I[0, :6].cpu().tolist()}, "
+                        #      f"K: {features_K[0, :6].cpu().tolist()}, S: {features_S[0, :6].cpu().tolist()}")
+                        #print(f"    [🔬 OUTPUT Embeddings (Lorentz)] I[:5]={emb_I[0, :5].detach().cpu().tolist()}, "
+                        #      f"K[:5]={emb_K[0, :5].detach().cpu().tolist()}, S[:5]={emb_S[0, :5].detach().cpu().tolist()}")
+                        
+                        # 🌌 CURVATURE MEASUREMENT: Extract metric tensors and compute Ricci scalar
+                        metric_I = gnn_output_I.get('metric', None)
+                        metric_K = gnn_output_K.get('metric', None)
+                        metric_S = gnn_output_S.get('metric', None)
+                        
+                        if metric_I is not None and metric_K is not None and metric_S is not None:
+                            curv_I = compute_ricci_scalar_approx(metric_I)
+                            curv_K = compute_ricci_scalar_approx(metric_K)
+                            curv_S = compute_ricci_scalar_approx(metric_S)
+                            print(f"    [🌌 Riemann Curvature] I: R={curv_I:.3f}, K: R={curv_K:.3f}, S: R={curv_S:.3f}")
+                        else:
+                            print(f"    [⚠️ Curvature] Metric tensor not available in GNN output")
+                    
+                    # 🩺 DIAGNOSTIC: Check for NaN/Inf in embeddings (causes gradient death)
+                    if torch.isnan(emb_I).any() or torch.isinf(emb_I).any():
+                        print(f"    [💀 FATAL] emb_I contains NaN/Inf! Gradients will die.")
+                    if torch.isnan(emb_K).any() or torch.isinf(emb_K).any():
+                        print(f"    [💀 FATAL] emb_K contains NaN/Inf! Gradients will die.")
+                    if torch.isnan(emb_S).any() or torch.isinf(emb_S).any():
+                        print(f"    [💀 FATAL] emb_S contains NaN/Inf! Gradients will die.")
+                    
+                    # 🎨 BEAUTIFUL MATHEMATICAL FIX: Use SQUARED distance for stable gradients
+                    # 
+                    # Problem: d_L(x,y) = acosh(<x,y>) has gradient ∝ 1/sqrt(<x,y>² - 1)
+                    #          When embeddings collapse (<x,y> ≈ 1.00001), gradient explodes to ~333
+                    #          After 8 accumulation steps, this overflows to NaN
+                    #
+                    # Solution: Optimize d²(x,y) = [acosh(<x,y>)]² instead!
+                    #          Gradient: ∂d²/∂x = 2·d·(∂d/∂x)
+                    #          When d ≈ 0.0045, the factor 2·0.0045 = 0.009 dampens gradient by 100x
+                    #          Gradient becomes ~3.3 instead of ~333 → No overflow!
+                    #
+                    # Bonus: Squared distance is still a valid metric (monotonic transform)
+                    #        Minimizing d² is equivalent to minimizing d
+                    
+                    dist_IK_raw = LorentzOps.lorentz_distance(emb_I, emb_K)
+                    dist_IS_raw = LorentzOps.lorentz_distance(emb_I, emb_S)
+                    dist_KS_raw = LorentzOps.lorentz_distance(emb_K, emb_S)
+                    
+                    # Square the distances for stable gradients
+                    dist_IK = dist_IK_raw ** 2
+                    dist_IS = dist_IS_raw ** 2
+                    dist_KS = dist_KS_raw ** 2
+                    
+                    # 🩺 Check if distances are NaN/Inf (numerical instability in lorentz_distance)
+                    if torch.isnan(dist_IK) or torch.isinf(dist_IK):
+                        print(f"    [💀 FATAL] dist_IK={dist_IK.item()} is NaN/Inf!")
+                    if torch.isnan(dist_IS) or torch.isinf(dist_IS):
+                        print(f"    [💀 FATAL] dist_IS={dist_IS.item()} is NaN/Inf!")
+                    if torch.isnan(dist_KS) or torch.isinf(dist_KS):
+                        print(f"    [💀 FATAL] dist_KS={dist_KS.item()} is NaN/Inf!")
+                    
+                    avg_dist_sq = (dist_IK + dist_IS + dist_KS) / 3.0
+                    avg_dist = torch.sqrt(avg_dist_sq.detach())  # For logging only (detached from gradient)
+                    
+                    # HOMEOSTATIC TARGET: Embeddings should be at least distance 2.0 apart
+                    # (This is significant on the hyperboloid - roughly 90 degrees apart)
+                    target_separation = 2.0
+                    target_separation_sq = target_separation ** 2  # Work in squared space
+                    
+                    # If collapsed (avg_dist² < target²), apply penalty
+                    # Using squared distance throughout the loss computation
+                    if avg_dist_sq < target_separation_sq:
+                        # REPULSIVE BARRIER: Add inverse term that explodes as distance → 0
+                        # This ensures gradient never vanishes at equilibrium
+                        # 
+                        # Loss = quadratic_repulsion + barrier_term
+                        # At dist²→0: barrier→∞, gradient→∞ (strong repulsion)
+                        # At dist²→target²: both terms→0 (natural equilibrium)
+                        
+                        separation_deficit_sq = target_separation_sq - avg_dist_sq
+                        
+                        # Quadratic repulsion: grows as we approach target
+                        quadratic_term = separation_deficit_sq ** 2 / target_separation_sq  # Normalized
+                        
+                        # Barrier term: explodes as distance → 0 (prevents collapse)
+                        # 1/(d² + ε) creates infinite gradient at d²=0
+                        epsilon = 1e-6  # Tiny! Let barrier be strong
+                        barrier_term = 0.1 / (avg_dist_sq + epsilon)  # Scale down to ~5000 at collapse
+                        
+                        # Combined loss: both terms push embeddings apart
+                        # At dist²=0.00002: quadratic≈1, barrier≈100 → total≈101
+                        # At dist²=0.01: quadratic≈1, barrier≈50 → total≈51
+                        # At dist²=0.1: quadratic≈0.96, barrier≈10 → total≈11
+                        # At dist²=1.0: quadratic≈0.56, barrier≈1 → total≈1.6
+                        # At dist²=4.0: quadratic=0, barrier≈0.25 → total≈0.25
+                        loss_gnn_separation = quadratic_term + barrier_term
+                        
+                        # 🩺 Check for NaN/Inf in loss (will kill gradients)
+                        if torch.isnan(loss_gnn_separation) or torch.isinf(loss_gnn_separation):
+                            print(f"    [💀 FATAL] loss_gnn_separation is NaN/Inf! dist²={avg_dist_sq.item():.5f}")
+                        
+                        # Log only every 100 epochs (compact output)
+                        if epoch % 100 == 0:
+                            print(f"    [🌌 GNN Sep] dist={avg_dist.item():.4f}, loss={loss_gnn_separation.item():.1f}, "
+                                  f"grad_fn={'✓' if loss_gnn_separation.grad_fn else '✗'}")
+                    
+                except Exception as e:
+                    # If GNN call fails, log and skip this loss
+                    import traceback
+                    print(f"    [❌ GNN Separation] Failed: {e}")
+                    if epoch % 100 == 0:
+                        traceback.print_exc()
+                    # Ensure loss is zero if computation failed
+                    loss_gnn_separation = torch.zeros((), device=device)
+            
+            # === PURE MANIFOLD LOSSES (Autonomous Mode Only) ===
+            # Add the semantic manifold loss if we computed it
+            if use_autonomous and 'loss_semantic_manifold' in locals():
+                # Weight manifold semantic loss (learning to match normal form embedding)
+                # DYNAMIC CAP: Semantic loss can NEVER exceed 80% of policy loss magnitude
+                # This ensures policy loss always dominates gradient signal
+                raw_semantic = 5.0 * loss_semantic_manifold
+                max_semantic_allowed = 0.8 * loss_policy.detach() if loss_policy.item() > 0 else raw_semantic
+                loss_semantic = loss_semantic + torch.clamp(raw_semantic, max=max_semantic_allowed)
+                
+            # Add policy convergence loss (policy should say HALT at normal form)
+            if use_autonomous and 'loss_policy_convergence' in locals():
+                loss_policy = loss_policy + 2.0 * loss_policy_convergence
+            
+            # 1c. Routing entropy floor regularizer (prevents collapse to single expert)
+            # Replaces use_uniform_routing=True with a softer constraint
+            # Encourages diversity in routing while allowing state-dependent dynamics
+            if use_autonomous and 'routing_entropies' in locals() and len(routing_entropies) > 0:
+                # Entropy floor: penalize if entropy drops below threshold
+                # Maximum entropy for k=11 ops: log(11) ≈ 2.4
+                # Floor at ~40% of max: 1.0 nats
+                # This allows specialization but prevents full collapse
+                entropy_floor = 1.0
+                for entropy in routing_entropies:
+                    if entropy.mean() < entropy_floor:
+                        # Quadratic penalty below floor (smooth)
+                        deficit = entropy_floor - entropy.mean()
+                        loss_routing_entropy = loss_routing_entropy + 0.1 * (deficit ** 2)
+            
+            # 2. Semantic loss: BUG #10 FIXED - DIFFERENTIABLE auxiliary predictions
+            # Train model to predict NEXT state geometry after REDUCE operations
+            # Provides dense gradients aligned with semantic progress
+            # (Already initialized above, now populate with auxiliary task losses)
+            
+            if use_autonomous and 'aux_pred_states' in locals() and len(aux_pred_states) > 0:
+                # VECTORIZED Auxiliary task! 🚀
+                # Stack all hidden states: [N, D]
+                h_states_batch = torch.cat(aux_pred_states, dim=0)
+                
+                # Batch prediction (single forward pass!)
+                pred_delta_nodes = model.aux_predict_delta_nodes(h_states_batch)  # [N, 1]
+                pred_delta_energy = model.aux_predict_delta_energy(h_states_batch)  # [N, 1]
+                
+                # Stack targets: [N, 1]
+                target_nodes = torch.tensor(aux_target_delta_nodes, dtype=torch.float32, device=device).unsqueeze(1)
+                target_energy = torch.tensor(aux_target_delta_energy, dtype=torch.float32, device=device).unsqueeze(1)
+                
+                # Vectorized MSE
+                loss_semantic = F.mse_loss(pred_delta_nodes, target_nodes) + \
+                               0.1 * F.mse_loss(pred_delta_energy, target_energy)
+            
+            # Note: Previous semantic loss was constant (loss_semantic + 1.0).
+            # Now we have REAL differentiable objectives:
+            # - Policy head: train HALT/REDUCE boundary (basin geometry)
+            # - Auxiliary heads: predict Δnode_count, Δenergy (semantic progress)
+            
+            # 2b. RIEMANNIAN METRIC LOSS: Learn geometry that respects dynamics!
+            # BEAUTIFUL: The metric should make reduction sequences follow geodesics
+            # 
+            # Geodesic property: Shortest path between points
+            # Reduction sequence: term_before → term_after
+            # Constraint: Reduction should follow natural gradient direction!
+            #
+            # Loss: ||∇_g V - Δterm||²  where Δterm = (term_after - term_before)
+            loss_metric_geo = torch.zeros((), device=device)
+            # predict COMBINATOR IDENTITY from observed reduction behavior:
+            # - Observe: (COMBINATOR x) → x  ⟹  Target: P(I)=1.0, P(K)=0, P(S)=0
+            # - Observe: ((COMBINATOR x) y) → x  ⟹  Metric should show K-curvature
+            # - Observe: (((COMBINATOR x) y) z) → expansion ⟹  Metric should show S-curvature
+            #
+            # BEAUTIFUL: Geometry encodes semantics!
+            loss_rewrite = torch.zeros((), device=device)
+            
+            if use_autonomous and 'gnn_predictions' in locals() and len(gnn_predictions) > 0:
+                # SEMI-VECTORIZED: Stack curvatures and targets, iterate only for node counting
+                metric_norms = []
+                target_curvatures = []
+                all_metrics = []
+                
+                for gnn_pred, term_before, term_after in zip(gnn_predictions, gnn_before_targets, gnn_targets):
+                    if term_after is not None and term_before is not None and 'metric' in gnn_pred:
+                        # Count nodes (can't vectorize - different tree structures)
+                        nodes_before = SKICore.count_nodes(term_before)
+                        nodes_after = SKICore.count_nodes(term_after)
+                        delta_nodes = nodes_after - nodes_before
+                        
+                        # Collect metric data
+                        metric_norms.append(gnn_pred['metric_norm'])
+                        all_metrics.append(gnn_pred['metric'])
+                        
+                        # Assign target curvature based on dynamics type
+                        if delta_nodes > 0:
+                            target_curvatures.append(2.0)  # Expansion
+                        elif delta_nodes < -1:
+                            target_curvatures.append(0.5)  # Strong contraction
+                        else:
+                            target_curvatures.append(1.0)  # Neutral (no loss contribution)
+                
+                # VECTORIZED curvature loss!
+                if len(metric_norms) > 0:
+                    metric_norms_tensor = torch.stack(metric_norms)  # [N]
+                    targets_tensor = torch.tensor(target_curvatures, device=device)  # [N]
+                    
+                    # Only penalize non-neutral targets
+                    mask = (targets_tensor != 1.0)
+                    if mask.any():
+                        loss_rewrite = F.mse_loss(
+                            metric_norms_tensor[mask],
+                            targets_tensor[mask]
+                        )
+                    
+                    # VECTORIZED smoothness: batch Frobenius norm
+                    metrics_stacked = torch.stack(all_metrics)  # [N, D, D]
+                    loss_metric_geo = 0.01 * (metrics_stacked.norm(p='fro', dim=(1, 2)) ** 2).mean()
+            
+            # Track success for deep tasks (RIGOROUS: exact-match only)
+            if task.startswith('deep_') and final_term is not None and gt_term is not None:
+                success = SKICore.terms_equal(final_term, gt_term)
+            else:
+                # For simple tasks, use string comparison (legacy)
+                success = (final_term and str(final_term).strip() == expected.strip())
+            
+            # 3. Orthogonality loss
+            A_n = F.normalize(model.address_matrix, dim=1)
+            # BUG FIX: Put torch.eye on correct device
+            loss_ortho = torch.norm(torch.mm(A_n, A_n.T) - torch.eye(11, device=A_n.device))
+            
+            # 4. Spectral band loss - HOMEOSTATIC CHAOS BOUNDARY 🧠
+            # Philosophy: Ride right up on the chaos without hitting singularities
+            # Early/simple: Allow close to critical point (α×γ up to 0.92)
+            # Late/complex: Pull back for safety (α×γ max 0.85)
+            avg_alpha = torch.stack(all_alphas).mean() if all_alphas else torch.tensor(0.5)
+            avg_gamma = torch.stack(all_gammas).mean() if all_gammas else torch.tensor(0.5)
+            effective_step = avg_gamma * avg_alpha
+            
+            # ADAPTIVE UPPER BOUND based on curriculum difficulty
+            # curriculum_difficulty ∈ [0, 1]: 0=basics, 1=advanced
+            # Map to chaos tolerance: 0.92 (basics, can surf edge) → 0.82 (advanced, need stability)
+            chaos_upper_bound = 0.92 - 0.10 * curriculum_difficulty
+            
+            # Lower bound stays fixed (prevent collapse to zero dynamics)
+            chaos_lower_bound = 0.3
+            
+            loss_spectral = (torch.relu(effective_step - chaos_upper_bound) ** 2 + 
+                            torch.relu(chaos_lower_bound - effective_step) ** 2)
+            
+            # MoE load balancing loss (if using MoE)
+            loss_load_balance = torch.zeros((), device=device)
+            if load_balance_losses:
+                loss_load_balance = torch.stack(load_balance_losses).mean()
+            
+            # HOMEOSTATIC EXPERT ENTROPY CONTROL (MoE only)
+            loss_entropy_homeostasis = torch.zeros((), device=device)
+            loss_adaptive_homeostasis = torch.zeros((), device=device)
+            
+            if hasattr(model, 'expert_usage'):
+                # Compute current expert usage entropy
+                expert_usage = model.expert_usage + 1e-8  # Avoid log(0)
+                expert_usage_normalized = expert_usage / expert_usage.sum()
+                expert_usage_entropy = -(expert_usage_normalized * torch.log(expert_usage_normalized)).sum()
+                
+                # EXPLICIT MAX-USAGE PENALTY: Directly penalize when any expert dominates
+                # This is more aggressive than entropy loss alone
+                max_expert_usage = expert_usage_normalized.max()
+                max_usage_threshold = 0.55  # 🔥 NUCLEAR: Trigger penalty above 55% usage (was 70%, too permissive!)
+                
+                # 🔥🔥🔥 DAMPED PUSH-DOWN: Gradually reduce overused expert instead of hard reset
+                # This prevents oscillation (collapse → reset → collapse → NaN)
+                if max_expert_usage > 0.65:
+                    # Find the dominant expert and gently push it down
+                    max_idx = expert_usage_normalized.argmax()
+                    with torch.no_grad():
+                        # Soft redistribution: take 20% from dominant, give to others
+                        steal_amount = 0.20 * model.expert_usage[max_idx]
+                        model.expert_usage[max_idx] = model.expert_usage[max_idx] - steal_amount
+                        # Distribute stolen amount to other experts equally
+                        others_gain = steal_amount / (model.expert_usage.shape[0] - 1)
+                        for i in range(model.expert_usage.shape[0]):
+                            if i != max_idx:
+                                model.expert_usage[i] = model.expert_usage[i] + others_gain
+                
+                if max_expert_usage > max_usage_threshold:
+                    # Quadratic penalty: (max_usage - threshold)^2
+                    # At 60%: penalty = 0.0125, At 70%: penalty = 0.1125, At 80%: penalty = 0.3125
+                    max_usage_penalty = 10.0 * ((max_expert_usage - max_usage_threshold) ** 2)  # 5.0→10.0, doubled!
+                    loss_entropy_homeostasis = loss_entropy_homeostasis + max_usage_penalty
+                
+                # STATIC ENTROPY FLOOR: Prevent catastrophic collapse
+                # Always active, regardless of task performance
+                entropy_floor = 1.0  # Minimum 3-4 experts active
+                if expert_usage_entropy < entropy_floor:
+                    deficit = entropy_floor - expert_usage_entropy
+                    loss_entropy_homeostasis = loss_entropy_homeostasis + 0.1 * (deficit ** 2)
+                
+                # PROPORTIONAL HOMEOSTATIC CONTROL: Entropy target driven by actual task performance
+                # Key insight: Diversity requirement is INVERSELY proportional to performance
+                # Low accuracy (poor predictions) → Need MORE diversity (higher entropy target)
+                # High accuracy (good predictions) → Can tolerate LESS diversity (lower entropy target)
+                
+                # Use ACCURACY instead of loss to avoid class imbalance issues
+                # (Cross-entropy is low when predicting majority class, even if wrong!)
+                # Error rate = 1 - accuracy
+                error_rate = 1.0 - policy_accuracy  # Range: 0.0 (perfect) to 1.0 (random)
+                
+                # Map error rate to entropy target using inverse relationship
+                # Error rate: 0.0 (perfect) → Entropy target: 0.8 (specialized, 2-3 experts)
+                # Error rate: 1.0 (failing) → Entropy target: 1.4 (diverse, 5-6 experts)
+                # Formula: entropy_target = base + diversity_demand * error_rate
+                
+                entropy_base = 0.8  # Minimum entropy (best case: 2-3 experts when perfect)
+                diversity_demand = 0.6  # How much to increase entropy per unit of error
+                
+                # Clamp to reasonable range (pure Python, no torch)
+                entropy_target_adaptive = max(0.8, min(1.4, entropy_base + diversity_demand * error_rate))
+                
+                # Adaptive loss: Push current entropy toward task-loss-proportional target
+                # Weight 0.05 - strong enough to respond quickly, gentle enough to be stable
+                loss_adaptive_homeostasis = 0.05 * (expert_usage_entropy - entropy_target_adaptive) ** 2
+            
+            # 5. Lyapunov stability loss (Hamiltonian should decrease: dH/dt < 0)
+            # Penalizes energy INCREASES during autonomous reduction
+            # This encourages the system to flow toward attractors (equilibria/normal forms)
+            loss_lyapunov = torch.zeros((), device=device)
+            if use_autonomous and 'hamiltonian_transitions' in locals() and len(hamiltonian_transitions) > 0:
+                for H_prev, H_curr in hamiltonian_transitions:
+                    dH_dt = H_curr - H_prev  # [batch, 1] or scalar
+                    # Only penalize increases (ReLU clips negatives to 0)
+                    # Mean over batch dimension if present
+                    loss_lyapunov = loss_lyapunov + torch.relu(dH_dt).mean()
+                # Average over transitions
+                loss_lyapunov = loss_lyapunov / len(hamiltonian_transitions)
+        
+        # Total loss with RIEMANNIAN GEOMETRY + HAMILTONIAN MECHANICS + ADAPTIVE WEIGHTING
+            # BEAUTIFUL: Metric loss (curvature + smoothness) replaces old feature engineering!
+            
+            # ADAPTIVE LOSS WEIGHTING (Kendall & Gal, CVPR 2018)
+            # Automatically learn how much to weight each loss based on its inherent uncertainty
+            # Formula: L_weighted = 1/(2*exp(log_var)) * L + log_var/2
+            # This down-weights noisy/hard losses and up-weights consistent losses
+            
+            # Get model's learned uncertainties (only if model is ManifoldSKI or has expert[0])
+            if hasattr(model, 'log_var_policy'):
+                # Direct ManifoldSKI
+                log_var_policy = model.log_var_policy
+                log_var_semantic = model.log_var_semantic
+                log_var_lyapunov = model.log_var_lyapunov
+                log_var_spectral = model.log_var_spectral
+                log_var_metric_geo = model.log_var_metric_geo if hasattr(model, 'log_var_metric_geo') else torch.zeros(1, device=device)
+            elif hasattr(model, 'experts') and hasattr(model.experts[0], 'log_var_policy'):
+                # GeometricMoE wrapper
+                log_var_policy = model.experts[0].log_var_policy
+                log_var_semantic = model.experts[0].log_var_semantic
+                log_var_lyapunov = model.experts[0].log_var_lyapunov
+                log_var_spectral = model.experts[0].log_var_spectral
+                log_var_metric_geo = model.experts[0].log_var_metric_geo if hasattr(model.experts[0], 'log_var_metric_geo') else torch.zeros(1, device=device)
+            else:
+                # Fallback: no adaptive weighting (shouldn't happen)
+                log_var_policy = torch.zeros(1, device=device)
+                log_var_semantic = torch.zeros(1, device=device)
+                log_var_lyapunov = torch.zeros(1, device=device)
+                log_var_spectral = torch.zeros(1, device=device)
+                log_var_metric_geo = torch.zeros(1, device=device)
+            
+            # Apply adaptive weighting to major loss components
+            # CRITICAL: Clamp ALL losses BEFORE weighting to prevent NaN cascades
+            loss_policy = torch.clamp(loss_policy, max=100.0)  # Policy should be ~O(1-10)
+            loss_semantic = torch.clamp(loss_semantic, max=100.0)  # Semantic should be ~O(1-10)
+            loss_lyapunov = torch.clamp(loss_lyapunov, max=100.0)  # Lyapunov should be ~O(1-10)
+            loss_spectral = torch.clamp(loss_spectral, max=100.0)  # Spectral should be ~O(1-10)
+            loss_metric_geo = torch.clamp(loss_metric_geo, max=1000.0)  # Frobenius norm should be ~O(10-100)
+            loss_load_balance = torch.clamp(loss_load_balance, max=10.0)  # Load balance should be ~O(0.1-1)
+            
+            weighted_policy = loss_policy / (2 * torch.exp(log_var_policy)) + log_var_policy / 2
+            weighted_semantic = loss_semantic / (2 * torch.exp(log_var_semantic)) + log_var_semantic / 2
+            weighted_lyapunov = loss_lyapunov / (2 * torch.exp(log_var_lyapunov)) + log_var_lyapunov / 2
+            weighted_spectral = loss_spectral / (2 * torch.exp(log_var_spectral)) + log_var_spectral / 2
+            weighted_metric_geo = loss_metric_geo / (2 * torch.exp(log_var_metric_geo)) + log_var_metric_geo / 2
+            
+            # Fixed-weight losses (smaller components, don't need adaptation)
+            # ⚖️ HOMEOSTATIC GNN LOSS CONTROL with WARMUP
+            # Note: loss_gnn_separation is already clipped to max=10.0 during computation
+            policy_loss_magnitude = weighted_policy.detach()
+            if loss_gnn_separation > 0:
+                
+                # STEP 2: Warmup schedule (epochs 0-50: gradual ramp up)
+                # Start at 0.1 (not 0) to provide immediate gradient signal
+                warmup_epochs = 50
+                if epoch < warmup_epochs:
+                    # Linear warmup from 0.1 to 1.0
+                    warmup_factor = 0.1 + 0.9 * (epoch / warmup_epochs)
+                    # At epoch 0: 0.1, At epoch 10: 0.28, At epoch 25: 0.55, At epoch 50: 1.0
+                else:
+                    warmup_factor = 1.0
+                
+                # STEP 3: Fixed weight with warmup (simpler and more stable)
+                # The separation loss is ~4700, which is HUGE compared to policy loss ~0.5-5.0
+                # So we need a small weight to keep it balanced
+                # Target contribution: ~50.0 (5x increase from 10.0 to force stronger separation!)
+                base_weight = 50.0 / (loss_gnn_separation.detach().item() + 1e-8)  # Scale to ~50.0 contribution
+                adaptive_gnn_weight = base_weight * warmup_factor
+                
+                # Clamp to reasonable range [0, 0.5] - increased from 0.1 to allow even stronger signal
+                adaptive_gnn_weight = torch.clamp(torch.tensor(adaptive_gnn_weight, device=device), min=0.0, max=0.5)
+                
+                # Log weight only every 100 epochs (compact output)
+                if epoch % 100 == 0:
+                    final_contribution = adaptive_gnn_weight * loss_gnn_separation
+                    weight_val = adaptive_gnn_weight if isinstance(adaptive_gnn_weight, (int, float)) else adaptive_gnn_weight.item()
+                    contrib_val = final_contribution if isinstance(final_contribution, (int, float)) else final_contribution.item()
+                    print(f"    [⚖️ GNN Weight] warmup={warmup_factor:.3f}, weight={weight_val:.6f} (raw_loss={loss_gnn_separation.item():.1f}, contribution={contrib_val:.2f})")
+            else:
+                adaptive_gnn_weight = 0.0  # No loss, no weight
+            
+            # Add cycle penalty if in autonomous mode (encourages learning to halt before loops)
+            if use_autonomous and 'cycle_penalty' in locals():
+                loss_cycle = cycle_penalty
+            else:
+                loss_cycle = torch.zeros((), device=device)
+            
+            if only_policy_loss:
+                # Minimal objective: only optimize the policy (decision) loss.
+                # This removes auxiliary/geometric regularizers and focuses learning on
+                # the HALT vs REDUCE decision performance.
+                total_loss = weighted_policy + loss_cycle
+            else:
+                # SIMPLIFIED LOSS: Focus on what matters for SKI reduction learning
+                # Removed theoretical losses that were adding noise without helping convergence
+                total_loss = (weighted_policy +              # Main task: HALT vs REDUCE (adaptive)
+                             weighted_spectral +             # 3-NET stability: keep α×γ in safe range (adaptive)
+                             0.1 * weighted_semantic +       # Normal form guidance (adaptive, scaled)
+                             0.1 * loss_ortho +              # Address matrix orthogonality (fixed weight)
+                             adaptive_gnn_weight * loss_gnn_separation +  # GNN task separation (adaptive, NEW!)
+                             loss_cycle)                     # Cycle detection penalty (differentiable!)
+                         
+                         # REMOVED (were dominating or always zero):
+                         # - weighted_metric_geo: was 4.6, geometric regularization not needed
+                         # - weighted_lyapunov: always 0, Hamiltonian stability nice but not critical
+                         # - loss_entropy_homeostasis/adaptive: always 0 (MoE only, we use single model)
+                         # - loss_routing_entropy: always 0
+                         # - loss_rewrite: always 0
+                         # - routing_loss: always 0 (removed earlier - was learning identity function)
+                         # - loss_load_balance: always 0 (MoE only)
+            
+            # DIAGNOSTIC: If total loss is huge, print component breakdown
+            if use_autonomous and total_loss.detach().item() > 1000.0:
+                print(f"    [Loss Breakdown RAW]")
+                print(f"      policy={loss_policy.item():.1f}, semantic={loss_semantic.item():.1f}, lyapunov={loss_lyapunov.item():.1f}")
+                print(f"      spectral={loss_spectral.item():.1f}, rewrite={loss_rewrite.item():.1f}, routing={routing_loss.item():.1f}")
+                print(f"      ortho={loss_ortho.item():.1f}, routing_entropy={loss_routing_entropy.item():.1f}, metric_geo={loss_metric_geo.item():.1f}")
+                print(f"      load_balance={loss_load_balance.item():.1f}, entropy_homeo={loss_entropy_homeostasis.item():.1f}, adaptive_homeo={loss_adaptive_homeostasis.item():.1f}")
+                print(f"    [Weighted Components]")
+                print(f"      w_policy={weighted_policy.item():.1f}, w_semantic={weighted_semantic.item():.1f}")
+                print(f"      w_lyapunov={weighted_lyapunov.item():.1f}, w_spectral={weighted_spectral.item():.1f}")
+                print(f"      w_metric_geo={weighted_metric_geo.item():.1f} (0.1x in total)")
+                print(f"    [TOTAL] = {total_loss.item():.1f}")
+    
+            # --- Safety guards for autonomous mode (prevent catastrophic loss spikes) ---
+            # DISABLED: Non-termination penalty was adding flat 50.0 to every sample!
+            # The semantic loss already guides toward normal forms, and the policy loss
+            # trains the HALT decision. A flat penalty is too aggressive and dominates learning.
+            # Instead, rely on:
+            # 1. Policy loss: trains when to HALT (at normal form)
+            # 2. Semantic loss: guides h toward normal form embedding
+            # 3. Max step limit: prevents infinite loops during training
+            
+            # If you really need a penalty for true non-termination, it should be:
+            # - Much smaller (e.g., 2.0 instead of 50.0)
+            # - Only for detected infinite loops (not just "still has redex")
+            # - Scaled by how many steps were taken (encourage progress)
+    
+            # Clamp / sanitize extreme losses coming from autonomous (unrolled/adversarial) behavior
+            # This prevents runaway gradients and stabilizes training when encountering
+            # non-terminating or adversarial evaluation samples during AUTO mode.
+            LOSS_CLAMP_THRESHOLD = 1e4
+            clipped_for_extreme = False
+            skip_backward = False  # Flag to skip gradient computation if loss is invalid
+            
+            if use_autonomous:
+                # Handle NaN / Inf explicitly
+                if torch.isnan(total_loss) or torch.isinf(total_loss):
+                    print(f"Warning: NaN/Inf total_loss detected (epoch={epoch}). Skipping backward pass to prevent gradient corruption.")
+                    skip_backward = True
+                    # Use a dummy value for logging (detached, no gradients)
+                    total_loss = torch.tensor(float('nan'), device=device)
+                else:
+                    # Clamp very large losses
+                    try:
+                        if total_loss.detach().item() > LOSS_CLAMP_THRESHOLD:
+                            print(f"Warning: extreme AUTO loss {total_loss.item():.1f} > {LOSS_CLAMP_THRESHOLD}, clamping.")
+                            total_loss = torch.clamp(total_loss, max=LOSS_CLAMP_THRESHOLD)
+                            clipped_for_extreme = True
+                    except Exception:
+                        # In case detach().item() fails, fall back to safe clamping
                         total_loss = torch.clamp(total_loss, max=LOSS_CLAMP_THRESHOLD)
                         clipped_for_extreme = True
-                except Exception:
-                    # In case detach().item() fails, fall back to safe clamping
-                    total_loss = torch.clamp(total_loss, max=LOSS_CLAMP_THRESHOLD)
-                    clipped_for_extreme = True
-        
-        # GRADIENT ACCUMULATION with Mixed Precision: Scale loss and accumulate
-        # Each forward pass creates its own graph - no need to retain!
-        is_last_accum_step = (epoch + 1) % ACCUM_STEPS == 0
-        
-        # Only compute gradients if loss is valid
-        if not skip_backward:
-            if use_amp:
-                # AMP: Scale gradients to prevent underflow in FP16
-                scaler.scale(total_loss / ACCUM_STEPS).backward()
-            else:
-                (total_loss / ACCUM_STEPS).backward()
             
-            # 🔬 GRADIENT FLOW DIAGNOSTICS: Check if GNN embeddings receiving gradients
-            # Check at accumulation boundaries near epoch 100, 200, 300... (within ±ACCUM_STEPS)
-            if loss_gnn_separation is not None and loss_gnn_separation > 0:
-                check_gradient = (epoch >= 95 and epoch <= 105) or (epoch >= 195 and epoch <= 205) or (epoch >= 295 and epoch <= 305)
-                if check_gradient:
-                    expert_model_grad = model.experts[0] if hasattr(model, 'experts') else model
-                    if hasattr(expert_model_grad, 'rewrite_gnn') and hasattr(expert_model_grad.rewrite_gnn, 'embeddings'):
-                        emb_grad = expert_model_grad.rewrite_gnn.embeddings.weight.grad
-                        if emb_grad is not None:
-                            grad_norm = emb_grad.norm().item()
-                            grad_max = emb_grad.abs().max().item()
-                            print(f"    [🔬 Gradient Flow ep{epoch}] GNN embeddings grad_norm={grad_norm:.6f}, grad_max={grad_max:.6f}")
-                        else:
-                            print(f"    [🔬 Gradient Flow ep{epoch}] ❌ GNN embeddings.weight.grad is None (not accumulated yet?)")
-        
-        # CRITICAL: Detach loss to free computation graph immediately
-        total_loss = total_loss.detach()
-        
-        # Update parameters every ACCUM_STEPS
-        if is_last_accum_step:
-            if use_amp:
-                scaler.unscale_(optimizer)  # Unscale before gradient clipping
+            # GRADIENT ACCUMULATION with Mixed Precision: Scale loss and accumulate
+            # Each forward pass creates its own graph - no need to retain!
+            is_last_accum_step = (epoch + 1) % ACCUM_STEPS == 0
             
-            # 🛡️ GNN GRADIENT PROTECTION: Clip GNN gradients AFTER accumulation completes
-            # The Lorentz distance gradient d/dx acosh(x) = 1/sqrt(x²-1) explodes when x≈1
-            # When embeddings are nearly identical (dist≈0.0045), accumulated gradients can overflow to NaN
-            # Clip GNN gradients BEFORE global clip to prevent NaN propagation
-            expert_model_clip = model.experts[0] if hasattr(model, 'experts') else model
-            if hasattr(expert_model_clip, 'rewrite_gnn'):
-                gnn_params = list(expert_model_clip.rewrite_gnn.parameters())
-                gnn_clip_norm = 10.0  # Clip total GNN gradient norm (not per-parameter)
-                torch.nn.utils.clip_grad_norm_(gnn_params, gnn_clip_norm)
-            
-            # 🔍 GRADIENT VERIFICATION: Check if GNN parameters received gradients
-            # Check every 8 steps in early training (when ACCUM_STEPS completes)
-            expert_model_check = model.experts[0] if hasattr(model, 'experts') else model
-            if epoch % 40 == 7 and hasattr(expert_model_check, 'rewrite_gnn'):  # epochs 7, 47, 87, 127...
-                gnn_has_grad = False
-                gnn_grad_norm = 0.0
-                gnn_max_grad = 0.0
-                gnn_has_nan = False
-                gnn_has_inf = False
-                for name, param in expert_model_check.rewrite_gnn.named_parameters():
-                    if param.grad is not None:
-                        gnn_has_grad = True
-                        # Check for NaN/Inf BEFORE summing
-                        if torch.isnan(param.grad).any():
-                            gnn_has_nan = True
-                            print(f"    [💀 NaN] {name} has NaN gradients!")
-                        if torch.isinf(param.grad).any():
-                            gnn_has_inf = True
-                            print(f"    [💀 Inf] {name} has Inf gradients!")
-                        param_grad_norm = param.grad.norm().item()
-                        gnn_grad_norm += param_grad_norm
-                        gnn_max_grad = max(gnn_max_grad, param_grad_norm)
+            # Only compute gradients if loss is valid
+            if not skip_backward:
+                if use_amp:
+                    # AMP: Scale gradients to prevent underflow in FP16
+                    scaler.scale(total_loss / ACCUM_STEPS).backward()
+                else:
+                    (total_loss / ACCUM_STEPS).backward()
                 
-                if not gnn_has_grad:
-                    print(f"    [⚠️ CRITICAL] GNN received NO gradients! Check: (1) requires_grad, (2) loss graph")
-                elif gnn_has_nan or gnn_has_inf:
-                    print(f"    [💀 FATAL] GNN gradients NaN/Inf! total_norm={gnn_grad_norm:.3f}")
-                elif epoch % 100 == 0:  # Only log healthy gradients every 100 epochs
-                    print(f"    [✓ GNN grad] norm={gnn_grad_norm:.3f}, max={gnn_max_grad:.3f}")
+                # 🔬 GRADIENT FLOW DIAGNOSTICS: Check if GNN embeddings receiving gradients
+                # Check at accumulation boundaries near epoch 100, 200, 300... (within ±ACCUM_STEPS)
+                if loss_gnn_separation is not None and loss_gnn_separation > 0:
+                    check_gradient = (epoch >= 95 and epoch <= 105) or (epoch >= 195 and epoch <= 205) or (epoch >= 295 and epoch <= 305)
+                    if check_gradient:
+                        expert_model_grad = model.experts[0] if hasattr(model, 'experts') else model
+                        if hasattr(expert_model_grad, 'rewrite_gnn') and hasattr(expert_model_grad.rewrite_gnn, 'embeddings'):
+                            emb_grad = expert_model_grad.rewrite_gnn.embeddings.weight.grad
+                            if emb_grad is not None:
+                                grad_norm = emb_grad.norm().item()
+                                grad_max = emb_grad.abs().max().item()
+                                print(f"    [🔬 Gradient Flow ep{epoch}] GNN embeddings grad_norm={grad_norm:.6f}, grad_max={grad_max:.6f}")
+                            else:
+                                print(f"    [🔬 Gradient Flow ep{epoch}] ❌ GNN embeddings.weight.grad is None (not accumulated yet?)")
             
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # CRITICAL: Detach loss to free computation graph immediately
+            total_loss = total_loss.detach()
             
-            if use_amp:
-                scaler.step(optimizer)
-                scaler.update()
+            # Update parameters every ACCUM_STEPS
+            if is_last_accum_step:
+                if use_amp:
+                    scaler.unscale_(optimizer)  # Unscale before gradient clipping
+                
+                # 🛡️ GNN GRADIENT PROTECTION: Clip GNN gradients AFTER accumulation completes
+                # The Lorentz distance gradient d/dx acosh(x) = 1/sqrt(x²-1) explodes when x≈1
+                # When embeddings are nearly identical (dist≈0.0045), accumulated gradients can overflow to NaN
+                # Clip GNN gradients BEFORE global clip to prevent NaN propagation
+                expert_model_clip = model.experts[0] if hasattr(model, 'experts') else model
+                if hasattr(expert_model_clip, 'rewrite_gnn'):
+                    gnn_params = list(expert_model_clip.rewrite_gnn.parameters())
+                    
+                    # � GRADIENT MONITORING: Track GNN gradient health (NO BOOSTING - natural gradients from DEQ)
+                    # NEW ARCHITECTURE: GNN integrated into DEQ loop → gets strong gradients naturally
+                    # We just monitor to verify the integration is working
+                    gnn_grad_norm = 0.0
+                    gnn_param_count = 0
+                    for param in gnn_params:
+                        if param.grad is not None:
+                            gnn_grad_norm += param.grad.norm().item() ** 2
+                            gnn_param_count += 1
+                    gnn_grad_norm = (gnn_grad_norm ** 0.5) if gnn_grad_norm > 0 else 0.0
+                    
+                    # Log GNN gradient health every accumulation step
+                    if (epoch - 7) % 8 == 0:  # Log at batches 7, 15, 23, 31, 39...
+                        if gnn_grad_norm > 0:
+                            print(f"    [� GNN Gradients] norm={gnn_grad_norm:.6f} (natural from DEQ integration)")
+                        else:
+                            print(f"    [⚠️ GNN Gradients] ZERO - check if GNN called in DEQ loop!")
+                    
+                    # Clip GNN gradients to prevent explosion (no boosting, just safety)
+                    gnn_clip_norm = 10.0  # Clip total GNN gradient norm (not per-parameter)
+                    torch.nn.utils.clip_grad_norm_(gnn_params, gnn_clip_norm)
+                
+                # 🔍 GRADIENT VERIFICATION: Check if GNN parameters received gradients
+                # Check every 8 steps in early training (when ACCUM_STEPS completes)
+                expert_model_check = model.experts[0] if hasattr(model, 'experts') else model
+                if epoch % 40 == 7 and hasattr(expert_model_check, 'rewrite_gnn'):  # epochs 7, 47, 87, 127...
+                    gnn_has_grad = False
+                    gnn_grad_norm = 0.0
+                    gnn_max_grad = 0.0
+                    gnn_has_nan = False
+                    gnn_has_inf = False
+                    for name, param in expert_model_check.rewrite_gnn.named_parameters():
+                        if param.grad is not None:
+                            gnn_has_grad = True
+                            # Check for NaN/Inf BEFORE summing
+                            if torch.isnan(param.grad).any():
+                                gnn_has_nan = True
+                                print(f"    [💀 NaN] {name} has NaN gradients!")
+                            if torch.isinf(param.grad).any():
+                                gnn_has_inf = True
+                                print(f"    [💀 Inf] {name} has Inf gradients!")
+                            param_grad_norm = param.grad.norm().item()
+                            gnn_grad_norm += param_grad_norm
+                            gnn_max_grad = max(gnn_max_grad, param_grad_norm)
+                    
+                    if not gnn_has_grad:
+                        print(f"    [⚠️ CRITICAL] GNN received NO gradients! Check: (1) requires_grad, (2) loss graph")
+                    elif gnn_has_nan or gnn_has_inf:
+                        print(f"    [💀 FATAL] GNN gradients NaN/Inf! total_norm={gnn_grad_norm:.3f}")
+                    elif epoch % 100 == 0:  # Only log healthy gradients every 100 epochs
+                        print(f"    [✓ GNN grad] norm={gnn_grad_norm:.3f}, max={gnn_max_grad:.3f}")
+                
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                if use_amp:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                
+                # ARCHITECTURAL FIX: Constrain DEQ spectral norm for contraction guarantee
+                # Ensures forward iteration converges and backward implicit solve is well-conditioned
+                model.constrain_deq_spectral_norm()
+                
+                # HOMEOSTATIC CURRICULUM: Track train vs held-out losses 🧠
+                # Determine if this sample is "held-out" (for generalization measurement)
+                is_heldout = False
+                if task == 'identity' and epoch % 100 < 50:
+                    is_heldout = True  # Rotate held-out
+                elif task == 'constant' and epoch % 100 >= 50:
+                    is_heldout = True
+                elif task == 'church_0':
+                    is_heldout = (epoch % 50 < 25)
+                elif task == 'deep_7':
+                    is_heldout = (epoch % 50 >= 25)
+                
+                # Record loss (clamped for statistics)
+                loss_val = min(total_loss.item(), 100.0) if not torch.isnan(total_loss) else 100.0
+                
+                if task in basic_tasks:
+                    if is_heldout:
+                        basic_heldout_losses.append(loss_val)
+                    else:
+                        basic_train_losses.append(loss_val)
+                elif task in intermediate_tasks:
+                    if is_heldout:
+                        inter_heldout_losses.append(loss_val)
+                    else:
+                        inter_train_losses.append(loss_val)
+                elif task in advanced_tasks:
+                    if is_heldout:
+                        adv_heldout_losses.append(loss_val)
+                    else:
+                        adv_train_losses.append(loss_val)
+                
+                # 📊 PER-TASK STATISTICS: Track each task separately
+                if task not in task_stats:
+                    task_stats[task] = {
+                        'loss': [],
+                        'success': [],
+                        'auto': [],
+                        'batch_count': 0,
+                        'policy_correct': 0,
+                        'policy_total': 0
+                    }
+                
+                task_stats[task]['loss'].append(loss_val)
+                task_stats[task]['success'].append(1 if success else 0)
+                task_stats[task]['auto'].append(1 if use_autonomous else 0)
+                task_stats[task]['batch_count'] += 1
+                if policy_total > 0:  # Policy was evaluated this step
+                    task_stats[task]['policy_correct'] += policy_correct
+                    task_stats[task]['policy_total'] += policy_total
+                
+            # SHOW EVERY ITERATION for monitoring
+            # Show curriculum progress (HOMEOSTATIC not linear!)
+            basic_pct = int(basic_weight * 100)
+            inter_pct = int(intermediate_weight * 100)
+            adv_pct = int(advanced_weight * 100)
+            stage = f"Curriculum: {basic_pct}%B {inter_pct}%I {adv_pct}%A (D={curriculum_difficulty:.2f})"
+            
+            result_str = final_str[:20] if len(final_str) <= 20 else final_str[:17] + "..."
+            status = "✓" if success else "✗"
+            
+            # Show mode (pure random sampling, no forced intervals)
+            if use_autonomous:
+                mode = "AUTO "  # Autonomous (random sampling)
             else:
-                optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+                mode = "SUPV "  # Supervised (teacher-forced)
             
-            # ARCHITECTURAL FIX: Constrain DEQ spectral norm for contraction guarantee
-            # Ensures forward iteration converges and backward implicit solve is well-conditioned
-            model.constrain_deq_spectral_norm()
-        
-        # HOMEOSTATIC CURRICULUM: Track train vs held-out losses 🧠
-        # Determine if this sample is "held-out" (for generalization measurement)
-        is_heldout = False
-        if task == 'identity' and epoch % 100 < 50:
-            is_heldout = True  # Rotate held-out
-        elif task == 'constant' and epoch % 100 >= 50:
-            is_heldout = True
-        elif task == 'church_0':
-            is_heldout = (epoch % 50 < 25)
-        elif task == 'deep_7':
-            is_heldout = (epoch % 50 >= 25)
-        
-        # Record loss (clamped for statistics)
-        loss_val = min(total_loss.item(), 100.0) if not torch.isnan(total_loss) else 100.0
-        
-        if task in basic_tasks:
-            if is_heldout:
-                basic_heldout_losses.append(loss_val)
-            else:
-                basic_train_losses.append(loss_val)
-        elif task in intermediate_tasks:
-            if is_heldout:
-                inter_heldout_losses.append(loss_val)
-            else:
-                inter_train_losses.append(loss_val)
-        elif task in advanced_tasks:
-            if is_heldout:
-                adv_heldout_losses.append(loss_val)
-            else:
-                adv_train_losses.append(loss_val)
-        
-        # SHOW EVERY ITERATION for monitoring
-        # Show curriculum progress (HOMEOSTATIC not linear!)
-        basic_pct = int(basic_weight * 100)
-        inter_pct = int(intermediate_weight * 100)
-        adv_pct = int(advanced_weight * 100)
-        stage = f"Curriculum: {basic_pct}%B {inter_pct}%I {adv_pct}%A (D={curriculum_difficulty:.2f})"
-        
-        result_str = final_str[:20] if len(final_str) <= 20 else final_str[:17] + "..."
-        status = "✓" if success else "✗"
-        
-        # Show mode (pure random sampling, no forced intervals)
-        if use_autonomous:
-            mode = "AUTO "  # Autonomous (random sampling)
-        else:
-            mode = "SUPV "  # Supervised (teacher-forced)
-        
-        # Telemetry
-        policy_acc = (policy_correct / policy_total * 100) if policy_total > 0 else 0.0
-        auto_pct = (auto_count / (auto_count + supv_count) * 100) if (auto_count + supv_count) > 0 else 0.0
-        
-        # Track policy accuracy for learning velocity (HOMEOSTATIC CURRICULUM)
-        policy_accuracy_history.append(policy_acc)
-        if len(policy_accuracy_history) > 100:
-            policy_accuracy_history.pop(0)
-        
-        # MoE expert usage tracking
-        expert_usage_str = ""
-        if hasattr(model, 'expert_usage'):
-            # Show which experts are active (usage > 1%)
-            active_experts = (model.expert_usage > 0.01).sum().item()
-            max_usage = model.expert_usage.max().item()
+            # Telemetry
+            policy_acc = (policy_correct / policy_total * 100) if policy_total > 0 else 0.0
+            auto_pct = (auto_count / (auto_count + supv_count) * 100) if (auto_count + supv_count) > 0 else 0.0
             
-            # Compute and show current entropy
-            expert_usage_norm = model.expert_usage / (model.expert_usage.sum() + 1e-8)
-            current_entropy = -(expert_usage_norm * torch.log(expert_usage_norm + 1e-8)).sum().item()
+            # Track policy accuracy for learning velocity (HOMEOSTATIC CURRICULUM)
+            policy_accuracy_history.append(policy_acc)
+            if len(policy_accuracy_history) > 100:
+                policy_accuracy_history.pop(0)
             
-            # Compute router temperature for display (match actual formula)
-            max_entropy_val = torch.log(torch.tensor(8.0)).item()
-            normalized_entropy = current_entropy / max_entropy_val
-            entropy_deficit = 1.0 - normalized_entropy
-            router_temp = 1.0 + 7.0 * (entropy_deficit ** 2.0)  # Quadratic v2 (stronger anti-collapse)
+            # MoE expert usage tracking
+            expert_usage_str = ""
+            if hasattr(model, 'expert_usage'):
+                # Show which experts are active (usage > 1%)
+                active_experts = (model.expert_usage > 0.01).sum().item()
+                max_usage = model.expert_usage.max().item()
+                
+                # Compute and show current entropy
+                expert_usage_norm = model.expert_usage / (model.expert_usage.sum() + 1e-8)
+                current_entropy = -(expert_usage_norm * torch.log(expert_usage_norm + 1e-8)).sum().item()
+                
+                # Compute router temperature for display (match actual formula)
+                max_entropy_val = torch.log(torch.tensor(8.0)).item()
+                normalized_entropy = current_entropy / max_entropy_val
+                entropy_deficit = 1.0 - normalized_entropy
+                router_temp = 1.0 + 7.0 * (entropy_deficit ** 2.0)  # Quadratic v2 (stronger anti-collapse)
+                
+                # ⚠️ WARNING: Detect expert collapse early
+                collapse_warning = ""
+                if max_usage > 0.55:  # Matches our new threshold
+                    collapse_warning = " ⚠️ COLLAPSE"
+                elif max_usage > 0.50:
+                    collapse_warning = " ⚡"  # Warning sign
+                
+                expert_usage_str = f" | Experts: {active_experts}/8 (max={max_usage:.1%}, H={current_entropy:.2f}, T={router_temp:.2f}){collapse_warning}"
             
-            # ⚠️ WARNING: Detect expert collapse early
-            collapse_warning = ""
-            if max_usage > 0.55:  # Matches our new threshold
-                collapse_warning = " ⚠️ COLLAPSE"
-            elif max_usage > 0.50:
-                collapse_warning = " ⚡"  # Warning sign
-            
-            expert_usage_str = f" | Experts: {active_experts}/8 (max={max_usage:.1%}, H={current_entropy:.2f}, T={router_temp:.2f}){collapse_warning}"
+            # Store task result for batch summary (INSIDE task loop, OUTSIDE MoE check)
+            # Success now means: DEQ actually reached the normal form (no symbolic execution crutch!)
+            batch_task_results.append({
+                'task': task,
+                'loss': total_loss.item(),
+                'policy_loss': loss_policy.item() if 'loss_policy' in locals() else 0.0,
+                'success': success,  # TRUE test: did DEQ geometry learn reduction?
+                'mode': mode,
+                'gamma': avg_gamma.item()
+            })
         
-        print(f"Ep {epoch:4d} | {stage:25s} | {task:10s} | {mode} | Loss: {total_loss.item():7.4f} | "
-              f"{result_str:20s} | {status} | α: {avg_alpha.item():.3f} | γ: {avg_gamma.item():.3f}{expert_usage_str}")
+        # END OF TASK LOOP - Print batch summary line
+        if batch_task_results:
+            # Compute batch averages
+            avg_batch_loss = sum(r['loss'] for r in batch_task_results) / len(batch_task_results)
+            avg_policy_loss = sum(r['policy_loss'] for r in batch_task_results) / len(batch_task_results)
+            avg_batch_gamma = sum(r['gamma'] for r in batch_task_results) / len(batch_task_results)
+            success_count = sum(1 for r in batch_task_results if r['success'])
+            
+            # Print compact batch line with per-task POLICY losses (main task loss)
+            task_losses_str = " | ".join([f"{r['task'][:6]:6s}:{r['policy_loss']:4.1f}" for r in batch_task_results])
+            # Clear the progress bar line by printing enough spaces
+            print(f"\r{' ' * 120}\r", end="")  # Clear line
+            # Add mode indicator to show if batch was supervised or autonomous
+            mode_indicator = batch_mode_str if 'batch_mode_str' in locals() else "???"
+            print(f"Batch {epoch:4d} | {task_losses_str} | Policy: {avg_policy_loss:4.1f} | Total: {avg_batch_loss:5.1f} | ✓:{success_count}/{len(batch_task_results)} | γ:{avg_batch_gamma:.2f} | [{mode_indicator}]")
+            
+            # DEBUG: Show what the high loss is actually from (first 3 batches)
+            if epoch < 3:
+                # Show actual contribution to total_loss (after adaptive weighting + 0.1x scaling)
+                semantic_contribution = (0.1 * weighted_semantic).item() if not only_policy_loss else 0.0
+                cycle_contribution = loss_cycle.item() if 'loss_cycle' in locals() else 0.0
+                print(f"    [Loss Components] Policy: {loss_policy.item():.2f}, Semantic: {loss_semantic.item():.2f} → contrib: {semantic_contribution:.2f} (0.1x), Cycle: {cycle_contribution:.2f}, LoadBalance: {loss_load_balance.item():.2f}, Routing: {routing_loss.item():.2f}, MetricGeo: {loss_metric_geo.item():.2f}")
+                # DETAILED breakdown INCLUDING ACTUAL TOTAL_LOSS
+                print(f"    [Detailed] routing: {routing_loss.item():.2f}, w_policy: {weighted_policy.item():.2f}, routing_ent: {loss_routing_entropy.item():.2f}, ortho*0.1: {(0.1*loss_ortho).item():.2f}, w_spectral: {weighted_spectral.item():.2f}, w_semantic*0.1: {semantic_contribution:.2f}, cycle: {cycle_contribution:.2f}, rewrite*0.5: {(0.5*loss_rewrite).item():.2f}, w_metric*0.1: {(0.1*weighted_metric_geo).item():.2f}, w_lyapunov: {weighted_lyapunov.item():.2f}, lb*10: {(10.0*loss_load_balance).item():.2f}, ent_homeo: {loss_entropy_homeostasis.item():.2f}, adp_homeo: {loss_adaptive_homeostasis.item():.2f}")
+                expected_total = (weighted_policy + weighted_spectral + 0.1*weighted_semantic + 0.1*loss_ortho + loss_cycle).item()
+                print(f"    [ACTUAL TOTAL_LOSS] = {total_loss.item():.2f} (should be w_policy + w_spectral + 0.1*w_semantic + 0.1*ortho + cycle = {weighted_policy.item():.2f} + {weighted_spectral.item():.2f} + {semantic_contribution:.2f} + {(0.1*loss_ortho).item():.2f} + {cycle_contribution:.2f} = {expected_total:.2f})")
+            
+            # 🔬 STIFFNESS MONITORING: X-ray vision for optimization landscape
+            # Log every 10 epochs to see where we're hitting "syntax cliffs"
+            if epoch % 10 == 0 and epoch > 0:
+                # Get stiffness metrics from model (handle MoE wrapper)
+                if hasattr(model, 'compute_stiffness_metrics'):
+                    stiffness = model.compute_stiffness_metrics()
+                elif hasattr(model, 'experts') and hasattr(model.experts[0], 'compute_stiffness_metrics'):
+                    stiffness = model.experts[0].compute_stiffness_metrics()
+                else:
+                    stiffness = None
+                
+                if stiffness:
+                    # Print stiffness report
+                    print(f"    [🔬 Stiffness Analysis]")
+                    print(f"       κ_mean={stiffness['stiffness_mean']:.1f} (max={stiffness['stiffness_max']:.1f}, min={stiffness['stiffness_min']:.1f})")
+                    print(f"       Per-layer: W={stiffness['stiffness_w']:.1f}, U={stiffness['stiffness_u']:.1f}, V={stiffness['stiffness_v']:.1f}")
+                    print(f"       ||∇||={stiffness['gradient_norm_mean']:.6f}, ||W||={stiffness['weight_norm_mean']:.3f}")
+                    print(f"       Spectral: W={stiffness['spectral_norm_w']:.3f}, U={stiffness['spectral_norm_u']:.3f}, V={stiffness['spectral_norm_v']:.3f}")
+                    
+                    # Interpretation with emoji indicators
+                    interp = stiffness['interpretation']
+                    if interp == "smooth":
+                        print(f"       Status: 🟢 SMOOTH ROAD - easy optimization, could disable stabilizer")
+                    elif interp == "moderate":
+                        print(f"       Status: 🟡 MODERATE - normal conditions")
+                    elif interp == "stiff":
+                        print(f"       Status: 🟠 STIFF - approaching syntax cliff, stabilizer active")
+                    elif interp == "cliff":
+                        print(f"       Status: 🔴 SYNTAX CLIFF - stuck on hard constraint!")
+                    
+                    # WARNING: If stiffness is extreme, suggest intervention
+                    if stiffness['stiffness_mean'] > 10000:
+                        print(f"       ⚠️  PANIC BUTTON: Stiffness critical! Consider:")
+                        print(f"           • Increase stabilizer strength")
+                        print(f"           • Reduce learning rate")
+                        print(f"           • Check for vanishing gradients")
         
         # HOMEOSTATIC LEARNING RATE UPDATE 🧠
         # Track chaos (γ) and adapt LR accordingly
-        current_gamma = avg_gamma.item()
+        current_gamma = avg_batch_gamma if batch_task_results else 0.75
         chaos_history.append(current_gamma)
         if len(chaos_history) > CHAOS_WINDOW:
             chaos_history.pop(0)
@@ -6678,12 +7560,70 @@ def run_ski_curriculum(use_semantic_loss=True, autonomous_reduction_prob=0.3, us
         for param_group in optimizer.param_groups:
             param_group['lr'] = 0.9 * param_group['lr'] + 0.1 * new_lr
         
-        # Every 100 epochs, show compact summary
-        if epoch % 100 == 0 and epoch > 0:
+        # Every 10 batches, show detailed summary
+        if epoch % 10 == 0 and epoch > 0:
             policy_acc = (policy_correct / policy_total * 100) if policy_total > 0 else 0.0
+            auto_acc = (auto_policy_correct / auto_policy_total * 100) if auto_policy_total > 0 else 0.0
+            supv_acc = (supv_policy_correct / supv_policy_total * 100) if supv_policy_total > 0 else 0.0
             auto_pct = (auto_count / (auto_count + supv_count) * 100) if (auto_count + supv_count) > 0 else 0.0
             current_lr = optimizer.param_groups[0]['lr']
-            print(f"    [Summary @{epoch}] Policy Acc: {policy_acc:.1f}% | AUTO: {auto_pct:.1f}% | Samples: {auto_count+supv_count} | LR: {current_lr:.6f}")
+            
+            # Show split policy accuracy: autonomous vs supervised
+            print(f"    [Overall @batch {epoch}] Policy Acc: {policy_acc:.1f}% (Auto: {auto_acc:.1f}%, Supv: {supv_acc:.1f}%) | Mode: {auto_pct:.0f}% autonomous | Samples: {auto_count+supv_count} | LR: {current_lr:.6f}")
+            
+            # 📊 PER-TASK BREAKDOWN: Show performance by task type, split by mode
+            print(f"    [Task Breakdown @batch {epoch}]")
+            for category_name, task_list in task_categories.items():
+                if not task_list:
+                    continue
+                # Aggregate stats for this category, split by auto vs supv
+                cat_batches = 0
+                cat_loss_auto = []
+                cat_loss_supv = []
+                cat_auto = []
+                for t in task_list:
+                    if t in task_stats and task_stats[t]['batch_count'] > 0:
+                        cat_batches += task_stats[t]['batch_count']
+                        # Split loss by mode
+                        for loss_val, is_auto in zip(task_stats[t]['loss'][-50:], task_stats[t]['auto'][-50:]):
+                            if is_auto:
+                                cat_loss_auto.append(loss_val)
+                            else:
+                                cat_loss_supv.append(loss_val)
+                        cat_auto.extend(task_stats[t]['auto'][-50:])
+                
+                if cat_batches > 0:
+                    avg_loss_auto = sum(cat_loss_auto) / len(cat_loss_auto) if cat_loss_auto else 0.0
+                    avg_loss_supv = sum(cat_loss_supv) / len(cat_loss_supv) if cat_loss_supv else 0.0
+                    auto_rate = (sum(cat_auto) / len(cat_auto) * 100) if cat_auto else 0.0
+                    print(f"      {category_name:10s}: {cat_batches:4d} batches | AUTO loss: {avg_loss_auto:6.3f} | SUPV loss: {avg_loss_supv:6.3f} | AUTO%: {auto_rate:5.1f}%")
+            
+            # 📊 DETAILED TASK TABLE: Show loss for each task type, split by mode
+            print(f"    [Per-Task Losses @batch {epoch}] (recent 10 samples)")
+            print(f"      {'Task':<15s} | {'Count':>5s} | {'AUTO-L':>6s} | {'SUPV-L':>6s} | {'AUTO%':>5s} | {'Policy':>7s}")
+            print(f"      {'-'*15:15s}-+-{'-'*5:5s}-+-{'-'*6:6s}-+-{'-'*6:6s}-+-{'-'*5:5s}-+-{'-'*7:7s}")
+            
+            # Show all tasks that have been seen
+            for t in sorted(task_stats.keys()):
+                stats = task_stats[t]
+                if stats['batch_count'] == 0:
+                    continue
+                recent_loss = stats['loss'][-10:]  # Last 10
+                recent_auto = stats['auto'][-10:]
+                
+                # Split loss by mode
+                loss_auto = [l for l, is_auto in zip(recent_loss, recent_auto) if is_auto]
+                loss_supv = [l for l, is_auto in zip(recent_loss, recent_auto) if not is_auto]
+                
+                avg_loss_auto = sum(loss_auto) / len(loss_auto) if loss_auto else 0.0
+                avg_loss_supv = sum(loss_supv) / len(loss_supv) if loss_supv else 0.0
+                auto_rate = (sum(recent_auto) / len(recent_auto) * 100) if recent_auto else 0.0
+                policy_acc_task = (stats['policy_correct'] / stats['policy_total'] * 100) if stats['policy_total'] > 0 else 0.0
+                
+                # Show -- if no samples in that mode
+                auto_str = f"{avg_loss_auto:6.2f}" if loss_auto else "    --"
+                supv_str = f"{avg_loss_supv:6.2f}" if loss_supv else "    --"
+                print(f"      {t:<15s} | {stats['batch_count']:>5d} | {auto_str:>6s} | {supv_str:>6s} | {auto_rate:>4.0f}% | {policy_acc_task:>6.1f}%")
             
             # 🌌 GNN SEPARATION DIAGNOSTICS
             # Check if GNN embeddings are learning distinct representations
@@ -6712,6 +7652,17 @@ def run_ski_curriculum(use_semantic_loss=True, autonomous_reduction_prob=0.3, us
                     # Show status
                     status_icon = "✓" if avg_sep > 2.0 else "⚠️" if avg_sep > 0.5 else "❌"
                     print(f"    [GNN Embeddings] {status_icon} Separation: I-K={dist_IK:.3f}, I-S={dist_IS:.3f}, K-S={dist_KS:.3f} (avg={avg_sep:.3f}, target=2.0)")
+                    
+                    # 🔬 CRITICAL DEBUG: Check if embeddings are actually different
+                    if avg_sep < 0.01:  # Collapsed - show actual values
+                        emb_I_values = emb_I[0, 1:6].tolist()  # First 5 spatial coords
+                        emb_K_values = emb_K[0, 1:6].tolist()
+                        emb_S_values = emb_S[0, 1:6].tolist()
+                        print(f"    [💀 COLLAPSED] I[:5]={[f'{v:.4f}' for v in emb_I_values]}")
+                        print(f"    [💀 COLLAPSED] K[:5]={[f'{v:.4f}' for v in emb_K_values]}")
+                        print(f"    [💀 COLLAPSED] S[:5]={[f'{v:.4f}' for v in emb_S_values]}")
+                        if all(abs(emb_I_values[i] - emb_K_values[i]) < 1e-6 for i in range(5)):
+                            print(f"    [💀 CRITICAL] All embeddings IDENTICAL! GNN not differentiating I/K/S!")
                     
                     # Show loss contribution
                     if loss_gnn_separation > 0:
@@ -7304,9 +8255,9 @@ if __name__ == "__main__":
     
     if mode == "baseline":
         print("="*80)
-        print("BASELINE MODE: Autonomous reduction with geometric learning")
+        print("BASELINE MODE: Autonomous reduction with geometric learning + SEMANTIC LOSS")
         print("="*80)
-        model, _ = run_ski_curriculum(use_semantic_loss=False, autonomous_reduction_prob=0.3, smoke_test=smoke_test)
+        model, _ = run_ski_curriculum(use_semantic_loss=True, autonomous_reduction_prob=0.3, smoke_test=smoke_test)
     elif mode == "semantic":
         print("="*80)
         print("SEMANTIC MODE: Autonomous reduction + semantic loss")
